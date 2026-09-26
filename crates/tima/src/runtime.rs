@@ -1296,6 +1296,7 @@ impl IrInterpreter<'_> {
                 Terminator::Return(value) => {
                     return Ok(freeze_scalar(values[value.0 as usize].unwrap()));
                 }
+                Terminator::Jump(target) => current = target,
                 Terminator::Branch {
                     condition,
                     then_block,
@@ -2123,7 +2124,8 @@ mod tests {
              transform keep_i64(x: i64) -> i64 { return x }\n\
              transform keep_bool(x: bool) -> bool { return x }\n\
              transform choose(flag: bool, left: f32, right: f32) -> f32 {\n\
-                 if flag { return left } else { return right }\n\
+                 if flag { return left } else {}\n\
+                 return right\n\
              }\n\
              out = 8.0 | scale_twice(factor=0.25)\n\
              count = keep_i64(7)\n\
@@ -2233,10 +2235,9 @@ mod tests {
             "test.tima",
             "transform guarded(flag: bool) -> i64 {\n\
                  if flag {\n\
-                     return environment_i64(\"MODE\")\n\
-                 } else {\n\
-                     return 7\n\
-                 }\n\
+                     observed = environment_i64(\"MODE\")\n\
+                 } else {}\n\
+                 return 7\n\
              }\n\
              result = guarded(false)\n",
         )

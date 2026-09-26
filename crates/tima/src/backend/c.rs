@@ -9,7 +9,7 @@ use crate::ir::{Constant, RuntimeCall, Terminator, Transform, TypedModule, Value
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "4";
+pub const C_BACKEND_VERSION: &str = "5";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -64,6 +64,9 @@ impl NativeBackend for CBackend {
         for (index, transform) in module.transforms.iter().enumerate() {
             prototype(&mut source, index, transform);
             source.push_str(" {\n    (void)runtime;\n");
+            for parameter_index in 0..transform.parameters.len() {
+                writeln!(source, "    (void)p{parameter_index};").unwrap();
+            }
             for (value_index, value) in transform.values.iter().enumerate() {
                 if matches!(value.kind, ValueKind::Parameter { .. }) {
                     continue;
@@ -87,10 +90,14 @@ impl NativeBackend for CBackend {
                         expression(transform, index, *id)
                     )
                     .unwrap();
+                    writeln!(source, "    (void)v{};", id.0).unwrap();
                 }
                 match block.terminator {
                     Terminator::Return(value) => {
                         writeln!(source, "    return {};", value_name(transform, value)).unwrap();
+                    }
+                    Terminator::Jump(target) => {
+                        writeln!(source, "    goto tima_t{index}_b{};", target.0).unwrap();
                     }
                     Terminator::Branch {
                         condition,
@@ -264,7 +271,8 @@ mod tests {
         let compiled = crate::compile(
             "test.tima",
             "transform choose(flag: bool, left: f32, right: f32) -> f32 {\n\
-                 if flag { return left } else { return right }\n\
+                 if flag { return left } else {}\n\
+                 return right\n\
              }\n",
         )
         .unwrap();
@@ -277,6 +285,8 @@ mod tests {
         );
         assert!(artifact.source.contains("tima_t0_b1:"));
         assert!(artifact.source.contains("tima_t0_b2:"));
+        assert!(artifact.source.contains("goto tima_t0_b3;"));
+        assert!(artifact.source.contains("tima_t0_b3:"));
     }
 
     #[test]

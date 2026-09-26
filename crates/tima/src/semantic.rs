@@ -279,10 +279,9 @@ impl<'a> Lowerer<'a> {
                     condition,
                     then_body,
                     else_body,
-                    span,
+                    ..
                 } => {
-                    terminated = true;
-                    self.conditional(*condition, then_body, else_body, *span);
+                    terminated = self.conditional(*condition, then_body, else_body);
                 }
             }
         }
@@ -315,10 +314,9 @@ impl<'a> Lowerer<'a> {
         condition: ExprId,
         then_body: &[InnerStmt],
         else_body: &[InnerStmt],
-        span: crate::source::Span,
-    ) {
+    ) -> bool {
         let Some(condition) = self.expression(condition) else {
-            return;
+            return true;
         };
         let condition_type = self.values[condition.0 as usize].ty;
         if condition_type != Type::Bool {
@@ -329,7 +327,7 @@ impl<'a> Lowerer<'a> {
                 ),
                 self.values[condition.0 as usize].span,
             ));
-            return;
+            return true;
         }
 
         let then_block = self.new_block();
@@ -344,18 +342,29 @@ impl<'a> Lowerer<'a> {
         self.current_block = then_block;
         self.environment = outer_environment.clone();
         let then_returns = self.lower_statements(then_body);
+        let then_end = self.current_block;
 
         self.current_block = else_block;
         self.environment = outer_environment.clone();
         let else_returns = self.lower_statements(else_body);
+        let else_end = self.current_block;
         self.environment = outer_environment;
 
-        if !then_returns || !else_returns {
-            self.diagnostics.push(
-                Diagnostic::error("both inner `if` branches must return a value", span)
-                    .with_note("branch joins and value merging are not part of this slice"),
-            );
+        if then_returns && else_returns {
+            return true;
         }
+
+        let continuation = self.new_block();
+        if !then_returns {
+            self.current_block = then_end;
+            self.terminate(Terminator::Jump(continuation));
+        }
+        if !else_returns {
+            self.current_block = else_end;
+            self.terminate(Terminator::Jump(continuation));
+        }
+        self.current_block = continuation;
+        false
     }
 
     fn check_return_type(&mut self, value: ValueId) {
@@ -684,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_bool_conditions_and_non_returning_branches() {
+    fn rejects_non_bool_conditions_and_missing_function_returns() {
         let non_bool = compile(
             "test.tima",
             "transform bad(value: f32) -> f32 {\n\
@@ -705,10 +714,61 @@ mod tests {
              }\n",
         )
         .unwrap_err();
-        assert!(missing_return.iter().any(|diagnostic| {
+        assert!(
+            missing_return
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("must return a value"))
+        );
+    }
+
+    #[test]
+    fn lowers_early_return_and_fallthrough_to_a_cfg_join() {
+        let compiled = compile(
+            "test.tima",
+            "transform choose(flag: bool, left: f32, right: f32) -> f32 {\n\
+                 if flag { return left } else {}\n\
+                 return right\n\
+             }\n",
+        )
+        .unwrap();
+        let transform = &compiled.transforms.transforms[0];
+        assert_eq!(transform.blocks.len(), 4);
+        assert!(matches!(
+            transform.blocks[0].terminator,
+            ir::Terminator::Branch {
+                then_block: ir::BlockId(1),
+                else_block: ir::BlockId(2),
+                ..
+            }
+        ));
+        assert!(matches!(
+            transform.blocks[1].terminator,
+            ir::Terminator::Return(ir::ValueId(1))
+        ));
+        assert!(matches!(
+            transform.blocks[2].terminator,
+            ir::Terminator::Jump(ir::BlockId(3))
+        ));
+        assert!(matches!(
+            transform.blocks[3].terminator,
+            ir::Terminator::Return(ir::ValueId(2))
+        ));
+    }
+
+    #[test]
+    fn branch_local_bindings_do_not_escape_a_join() {
+        let diagnostics = compile(
+            "test.tima",
+            "transform bad(flag: bool, left: f32, right: f32) -> f32 {\n\
+                 if flag { selected = left } else { selected = right }\n\
+                 return selected\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("both inner `if` branches must return")
+                .contains("unknown inner value `selected`")
         }));
     }
 

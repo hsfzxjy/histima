@@ -233,6 +233,10 @@ impl TransformIdentityResolver<'_> {
                     hasher.u8(0);
                     hasher.u32(value.0);
                 }
+                Terminator::Jump(target) => {
+                    hasher.u8(2);
+                    hasher.u32(target.0);
+                }
                 Terminator::Branch {
                     condition,
                     then_block,
@@ -726,21 +730,24 @@ mod tests {
         let first = crate::compile(
             "first.tima",
             "transform choose(flag: bool, a: f32, b: f32) -> f32 {\n\
-                 if flag { selected = a; return selected } else { return b }\n\
+                 if flag { selected = a; return selected } else {}\n\
+                 return b\n\
              }\n",
         )
         .unwrap();
         let renamed = crate::compile(
             "renamed.tima",
             "transform renamed(test: bool, left: f32, right: f32) -> f32 {\n\
-                 if test { temporary = left; return temporary } else { return right }\n\
+                 if test { temporary = left; return temporary } else {}\n\
+                 return right\n\
              }\n",
         )
         .unwrap();
         let swapped = crate::compile(
             "swapped.tima",
             "transform choose(flag: bool, a: f32, b: f32) -> f32 {\n\
-                 if flag { return b } else { return a }\n\
+                 if flag { return b } else {}\n\
+                 return a\n\
              }\n",
         )
         .unwrap();

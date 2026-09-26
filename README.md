@@ -23,11 +23,12 @@ string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
 transform calls, and pipelines. `tima run` compiles checked scalar transforms
 to a temporary DLL with LLVM/Clang and invokes them through generated C ABI
 adapters; the IR interpreter remains available as a reference execution path.
-Transform bodies may contain inferred immutable local bindings and either a
-typed `return` or a terminating `if` whose required `else` arm also returns.
-The typed IR represents this as explicit basic-block branches consumed by both
-the reference interpreter and C backend. Branch joins, rebinding, and local
-mutation remain intentionally unsupported.
+Transform bodies may contain inferred immutable local bindings, typed returns,
+and `if` statements with required `else` arms. Either branch may return early
+or fall through to a continuation; branch-local bindings do not escape that
+join. The typed IR represents control flow as explicit basic-block branches and
+jumps consumed by both the reference interpreter and C backend. Merged branch
+values, rebinding, loops, and local mutation remain intentionally unsupported.
 Host-provided immutable images can cross the native boundary: `Image` acquires
 unique mutable storage by transfer or detach, multiple owned arguments cannot
 alias, `ImageView` shares storage zero-copy, and returned descriptors are frozen
