@@ -56,6 +56,7 @@ pub struct TypeRef {
 
 #[derive(Clone, Debug)]
 pub enum InnerStmt {
+    Binding(Binding),
     Return { value: ExprId, span: Span },
 }
 

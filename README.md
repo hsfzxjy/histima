@@ -23,7 +23,9 @@ string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
 transform calls, and pipelines. `tima run` compiles checked scalar transforms
 to a temporary DLL with LLVM/Clang and invokes them through generated C ABI
 adapters; the IR interpreter remains available as a reference execution path.
-Transform bodies currently contain exactly one typed `return` expression.
+Transform bodies may contain inferred immutable local bindings followed by one
+typed `return` expression; shadowing, rebinding, branches, and local mutation
+remain intentionally unsupported.
 Host-provided immutable images can cross the native boundary: `Image` acquires
 unique mutable storage by transfer or detach, multiple owned arguments cannot
 alias, `ImageView` shares storage zero-copy, and returned descriptors are frozen

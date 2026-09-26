@@ -163,7 +163,7 @@ struct Lowerer<'a> {
     program: &'a ast::Program,
     signatures: &'a BTreeMap<String, Signature>,
     declaration: &'a ast::TransformDecl,
-    environment: BTreeMap<String, ValueId>,
+    environment: BTreeMap<String, (ValueId, crate::source::Span)>,
     values: Vec<Value>,
     instructions: Vec<ValueId>,
     diagnostics: Vec<Diagnostic>,
@@ -204,7 +204,8 @@ impl<'a> Lowerer<'a> {
                 syntax.span,
                 false,
             );
-            self.environment.insert(syntax.name.clone(), value);
+            self.environment
+                .insert(syntax.name.clone(), (value, syntax.name_span));
             parameters.push(Parameter {
                 name: syntax.name.clone(),
                 ty: *ty,
@@ -213,31 +214,53 @@ impl<'a> Lowerer<'a> {
             });
         }
 
-        let return_value = match self.declaration.body.as_slice() {
-            [InnerStmt::Return { value, .. }] => self.expression(*value),
-            [] => {
-                self.diagnostics.push(Diagnostic::error(
-                    "transform body must return a value",
-                    self.declaration.span,
-                ));
-                None
-            }
-            [_, second, ..] => {
-                let span = match second {
+        let mut return_value = None;
+        let mut saw_return = false;
+        for statement in &self.declaration.body {
+            if saw_return {
+                let span = match statement {
+                    InnerStmt::Binding(binding) => binding.span,
                     InnerStmt::Return { span, .. } => *span,
                 };
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "the initial transform subset accepts exactly one return statement",
-                        span,
-                    )
-                    .with_note(
-                        "control flow and local statements will be added on top of the typed CFG",
-                    ),
-                );
-                None
+                self.diagnostics.push(Diagnostic::error(
+                    "inner statements cannot appear after `return`",
+                    span,
+                ));
+                continue;
             }
-        };
+            match statement {
+                InnerStmt::Binding(binding) => {
+                    if let Some((_, previous_span)) = self.environment.get(&binding.name) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!(
+                                    "inner value `{}` is already defined in this transform",
+                                    binding.name
+                                ),
+                                binding.name_span,
+                            )
+                            .with_label(*previous_span, "previous definition is here")
+                            .with_note("inner local bindings are immutable and cannot shadow"),
+                        );
+                        continue;
+                    }
+                    if let Some(value) = self.expression(binding.value) {
+                        self.environment
+                            .insert(binding.name.clone(), (value, binding.name_span));
+                    }
+                }
+                InnerStmt::Return { value, .. } => {
+                    saw_return = true;
+                    return_value = self.expression(*value);
+                }
+            }
+        }
+        if !saw_return {
+            self.diagnostics.push(
+                Diagnostic::error("transform body must return a value", self.declaration.span)
+                    .with_note("a transform body must end with `return <expression>`"),
+            );
+        }
 
         if let Some(return_value) = return_value {
             let actual = self.values[return_value.0 as usize].ty;
@@ -294,7 +317,7 @@ impl<'a> Lowerer<'a> {
                 true,
             )),
             ExprKind::Name(name) => match self.environment.get(name).copied() {
-                Some(value) => Some(value),
+                Some((value, _)) => Some(value),
                 None => {
                     self.diagnostics.push(Diagnostic::error(
                         format!("unknown inner value `{name}`"),
@@ -503,6 +526,58 @@ mod tests {
             transform.values[2].kind,
             ir::ValueKind::Binary { .. }
         ));
+    }
+
+    #[test]
+    fn infers_and_lowers_immutable_inner_local_bindings() {
+        let compiled = compile(
+            "test.tima",
+            "transform adjusted(x: f32) -> f32 {\n\
+                 doubled = x * 2.0\n\
+                 result = doubled + 1.0\n\
+                 return result\n\
+             }\n",
+        )
+        .unwrap();
+        let transform = &compiled.transforms.transforms[0];
+        assert_eq!(transform.blocks[0].instructions.len(), 4);
+        assert!(matches!(
+            transform.blocks[0].terminator,
+            ir::Terminator::Return(ir::ValueId(4))
+        ));
+    }
+
+    #[test]
+    fn rejects_inner_shadowing_and_statements_after_return() {
+        let diagnostics = compile(
+            "test.tima",
+            "transform bad(x: f32) -> f32 {\n\
+                 x = 2.0\n\
+                 return x\n\
+                 later = 3.0\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("already defined"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("after `return`"))
+        );
+    }
+
+    #[test]
+    fn requires_a_return_after_inner_local_bindings() {
+        let diagnostics = compile(
+            "test.tima",
+            "transform bad(x: f32) -> f32 {\n result = x * 2.0\n}\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics[0].message.contains("must return a value"));
     }
 
     #[test]

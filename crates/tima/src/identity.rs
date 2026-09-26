@@ -694,6 +694,24 @@ mod tests {
     }
 
     #[test]
+    fn transform_identity_ignores_inner_local_names() {
+        let first = crate::compile(
+            "first.tima",
+            "transform adjusted(x: f32) -> f32 {\n doubled = x * 2.0\n return doubled\n}\n",
+        )
+        .unwrap();
+        let second = crate::compile(
+            "second.tima",
+            "transform renamed(value: f32) -> f32 {\n temporary = value * 2.0\n return temporary\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first.identities.get(TransformId(0)),
+            second.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
     fn semantic_change_changes_transform_identity() {
         let multiply = crate::compile(
             "one.tima",

@@ -102,20 +102,24 @@ impl Parser {
         self.separators();
         let mut body = Vec::new();
         while !self.at(|kind| matches!(kind, TokenKind::RightBrace | TokenKind::Eof)) {
-            if !self.eat(|kind| matches!(kind, TokenKind::Return)) {
-                return Err(self.expected("`return` in this initial transform subset"));
-            }
-            let return_start = self.previous().span;
-            let value = self.expression()?;
-            let span = return_start.join(self.expr(value).span);
-            body.push(InnerStmt::Return { value, span });
+            let statement = if self.eat(|kind| matches!(kind, TokenKind::Return)) {
+                let return_start = self.previous().span;
+                let value = self.expression()?;
+                let span = return_start.join(self.expr(value).span);
+                InnerStmt::Return { value, span }
+            } else if self.at_binding() {
+                InnerStmt::Binding(self.binding()?)
+            } else {
+                return Err(self.expected("a local binding or `return` inside the transform"));
+            };
+            body.push(statement);
             if !self.at(|kind| {
                 matches!(
                     kind,
                     TokenKind::Newline | TokenKind::Semicolon | TokenKind::RightBrace
                 )
             }) {
-                return Err(self.expected("a newline, `;`, or `}` after `return`"));
+                return Err(self.expected("a newline, `;`, or `}` after the statement"));
             }
             self.separators();
         }
@@ -416,5 +420,19 @@ mod tests {
             program.expr(binding.value).kind,
             ExprKind::Record(_)
         ));
+    }
+
+    #[test]
+    fn parses_inner_local_bindings_in_the_shared_statement_tree() {
+        let source = SourceFile::new(
+            "test.tima",
+            "transform double(x: f32) -> f32 {\n doubled = x * 2.0\n return doubled\n}\n",
+        );
+        let program = parse(&source).unwrap();
+        let Item::Transform(transform) = &program.items[0] else {
+            panic!("expected transform")
+        };
+        assert!(matches!(transform.body[0], InnerStmt::Binding(_)));
+        assert!(matches!(transform.body[1], InnerStmt::Return { .. }));
     }
 }

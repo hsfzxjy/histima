@@ -5,7 +5,8 @@ input = {asset: source, tags: ["example", "first-pass"]}
 
 // The same frontend enters a statically checked context after `transform`.
 transform scale(value: f32, factor: f32) -> f32 {
-    return value * factor
+    scaled = value * factor
+    return scaled
 }
 
 result = 8.0 | scale(factor=0.25)

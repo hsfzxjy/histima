@@ -2098,7 +2098,7 @@ mod tests {
     fn compiles_loads_and_runs_nested_transforms_as_native_code() {
         let compiled = crate::compile(
             "test.tima",
-            "transform double(x: f32) -> f32 { return x * 2.0 }\n\
+            "transform double(x: f32) -> f32 {\n doubled = x * 2.0\n return doubled\n}\n\
              transform scale_twice(x: f32, factor: f32) -> f32 { return double(x * factor) }\n\
              transform keep_i64(x: i64) -> i64 { return x }\n\
              transform keep_bool(x: bool) -> bool { return x }\n\
