@@ -913,7 +913,7 @@ mod tests {
     use crate::backend::NativeBackend;
     use crate::backend::c::CBackend;
     use crate::backend::native::{ClangCompiler, NativeModule};
-    use crate::ir::Type;
+    use crate::ir::{TransformId, Type};
     use crate::runtime::{
         ImageValue, OuterValue, ValueData, execute, execute_native, execute_native_with_bindings,
         invoke_native_transform, lower_native_argument,
@@ -974,6 +974,12 @@ mod tests {
         let artifact = ClangCompiler::default()
             .compile(&generated, build_root)
             .unwrap();
+        assert!(artifact.compiler_version.contains("clang"));
+        assert!(!artifact.target.is_empty());
+        assert_ne!(
+            artifact.identity(compiled.identities.get(TransformId(0))),
+            artifact.identity(compiled.identities.get(TransformId(1)))
+        );
         let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
         let execution = execute_native(&compiled, &native).unwrap();
         assert_eq!(execution.bindings["out"].data, ValueData::Float(4.0));

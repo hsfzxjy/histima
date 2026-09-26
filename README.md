@@ -28,6 +28,13 @@ calls with owned images remain disabled until the IR has explicit move/detach
 lowering. Native `i64` arithmetic is also held back until its overflow and
 division-error semantics are specified.
 
+Every checked transform also receives a stable semantic identity derived from
+canonical typed IR and referenced transform identities. Source formatting,
+comments, local names, declaration order, backend, and target do not affect it.
+Content, invocation recipe, observed dependency, and native artifact identities
+use separate hash domains; artifact identity additionally includes the actual
+backend, Clang version, target, optimization mode, and native ABI version.
+
 Try the vertical slice:
 
 ```text

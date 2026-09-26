@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::TIMA_ABI_VERSION;
 use crate::backend::NativeArtifact;
+use crate::identity::{
+    ArtifactConfiguration, ArtifactIdentity, TransformIdentity, artifact_identity,
+};
 use crate::ir::{TransformId, TypedModule};
 
 const DEFAULT_CLANG: &str = "C:/Program Files/LLVM/bin/clang.exe";
@@ -37,6 +40,12 @@ impl ClangCompiler {
         generated: &NativeArtifact,
         build_root: impl AsRef<Path>,
     ) -> Result<CompiledNativeArtifact, NativeBuildError> {
+        let compiler_version = tool_output(&self.executable, "read clang version", &["--version"])?
+            .lines()
+            .next()
+            .unwrap_or("unknown clang version")
+            .to_owned();
+        let target = tool_output(&self.executable, "read clang target", &["-dumpmachine"])?;
         let sequence = NEXT_BUILD.fetch_add(1, Ordering::Relaxed);
         let build_dir = build_root
             .as_ref()
@@ -98,8 +107,12 @@ impl ClangCompiler {
 
         Ok(CompiledNativeArtifact {
             backend: generated.backend,
+            backend_version: generated.backend_version,
             abi_version: generated.abi_version,
             compiler: self.executable.clone(),
+            compiler_version,
+            target,
+            optimization: "O2",
             source_path,
             library_path,
             build_dir,
@@ -110,11 +123,32 @@ impl ClangCompiler {
 #[derive(Debug)]
 pub struct CompiledNativeArtifact {
     pub backend: &'static str,
+    pub backend_version: &'static str,
     pub abi_version: u32,
     pub compiler: PathBuf,
+    pub compiler_version: String,
+    pub target: String,
+    pub optimization: &'static str,
     pub source_path: PathBuf,
     pub library_path: PathBuf,
     build_dir: PathBuf,
+}
+
+impl CompiledNativeArtifact {
+    pub fn identity(&self, transform: TransformIdentity) -> ArtifactIdentity {
+        artifact_identity(
+            transform,
+            &ArtifactConfiguration {
+                backend: self.backend,
+                backend_version: self.backend_version,
+                compiler_version: &self.compiler_version,
+                target: &self.target,
+                cpu_features: &[],
+                optimization: self.optimization,
+                abi_version: self.abi_version,
+            },
+        )
+    }
 }
 
 impl Drop for CompiledNativeArtifact {
@@ -142,6 +176,26 @@ impl fmt::Display for NativeBuildError {
 }
 
 impl Error for NativeBuildError {}
+
+fn tool_output(
+    executable: &Path,
+    stage: &'static str,
+    arguments: &[&str],
+) -> Result<String, NativeBuildError> {
+    let output = Command::new(executable)
+        .args(arguments)
+        .output()
+        .map_err(|error| {
+            NativeBuildError::new(stage, format!("{}: {error}", executable.display()))
+        })?;
+    if !output.status.success() {
+        return Err(NativeBuildError::new(
+            stage,
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
 
 /// Owned mutable image descriptor used by the generated C ABI.
 #[repr(C)]

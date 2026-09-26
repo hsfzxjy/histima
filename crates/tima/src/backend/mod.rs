@@ -11,6 +11,7 @@ use crate::ir::TypedModule;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeArtifact {
     pub backend: &'static str,
+    pub backend_version: &'static str,
     pub abi_version: u32,
     pub source: String,
 }

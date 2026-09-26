@@ -43,6 +43,13 @@ fn run() -> Result<(), ()> {
     match command.as_str() {
         "check" => {
             println!("ok: {} transform(s)", compiled.transforms.transforms.len());
+            for (index, transform) in compiled.transforms.transforms.iter().enumerate() {
+                println!(
+                    "{} = {}",
+                    transform.name,
+                    compiled.identities.get(tima::ir::TransformId(index as u32))
+                );
+            }
         }
         "run" => {
             let generated = CBackend.emit(&compiled.transforms).map_err(|diagnostics| {

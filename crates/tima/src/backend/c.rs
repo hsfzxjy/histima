@@ -9,6 +9,8 @@ use crate::ir::{Constant, Terminator, Transform, TypedModule, ValueId, ValueKind
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
+pub const C_BACKEND_VERSION: &str = "1";
+
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
         let mut source = String::new();
@@ -69,6 +71,7 @@ impl NativeBackend for CBackend {
 
         Ok(NativeArtifact {
             backend: "c",
+            backend_version: C_BACKEND_VERSION,
             abi_version: TIMA_ABI_VERSION,
             source,
         })
