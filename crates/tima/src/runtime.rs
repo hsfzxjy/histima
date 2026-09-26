@@ -9,19 +9,17 @@ use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::native::{AbiImage, AbiImageView, AbiValue, NativeModule};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Constant, Terminator, TransformId, Type, ValueKind};
+use crate::lineage::{Lineage, LineageArgument};
 use crate::source::Span;
-
-/// Opaque hook for the future lineage graph. Keeping it outside `ValueData`
-/// ensures native payloads never acquire outer tracing metadata.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct LineageId(pub u32);
 
 /// An immutable outer value. Composite payloads use immutable `Arc` storage;
 /// there is no API that exposes mutable list, record, string, or asset data.
+/// Semantic lineage is stored beside the payload and never crosses the native
+/// ABI boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OuterValue {
     pub data: ValueData,
-    pub lineage: Option<LineageId>,
+    pub lineage: Option<Lineage>,
 }
 
 impl OuterValue {
@@ -34,6 +32,11 @@ impl OuterValue {
 
     pub fn image(image: ImageValue) -> Self {
         Self::plain(ValueData::Image(Arc::new(image)))
+    }
+
+    pub fn with_lineage(mut self, lineage: Lineage) -> Self {
+        self.lineage = Some(lineage);
+        self
     }
 }
 
@@ -49,12 +52,13 @@ pub enum ValueData {
     Asset(Arc<AssetValue>),
     Image(Arc<ImageValue>),
     Transform(TransformId),
+    Lineage(Lineage),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssetValue {
-    /// A locator is not a content identity. Asset observation/materialization
-    /// will record content identity and source lineage in a later milestone.
+    /// A locator is not a content identity. Its source lineage remains
+    /// unresolved until the host observes/materializes the asset.
     pub locator: Arc<str>,
 }
 
@@ -224,11 +228,11 @@ pub fn invoke_native_transform(
         .into_iter()
         .map(|value| (value, definition.span))
         .collect();
-    NativeEngine {
+    let engine = NativeEngine {
         module: &program.transforms,
         native,
-    }
-    .invoke(transform, arguments)
+    };
+    invoke_transform_with_lineage(program, &engine, transform, arguments)
 }
 
 fn execute_with(
@@ -253,7 +257,51 @@ trait TransformEngine {
         &self,
         id: TransformId,
         arguments: Vec<(OuterValue, Span)>,
-    ) -> Result<OuterValue, Diagnostic>;
+    ) -> Result<TransformOutcome, Diagnostic>;
+}
+
+struct TransformOutcome {
+    value: OuterValue,
+    observations: Vec<Lineage>,
+}
+
+fn invoke_transform_with_lineage(
+    program: &CompiledProgram,
+    engine: &dyn TransformEngine,
+    id: TransformId,
+    arguments: Vec<(OuterValue, Span)>,
+) -> Result<OuterValue, Diagnostic> {
+    let transform = program.transforms.get(id);
+    let recorded = transform
+        .parameters
+        .iter()
+        .zip(&arguments)
+        .map(|(parameter, (argument, span))| {
+            LineageArgument::record(parameter.name.as_str(), argument).map_err(|error| {
+                Diagnostic::error(
+                    format!(
+                        "cannot record argument `{}` for transform lineage: {error}",
+                        parameter.name
+                    ),
+                    *span,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let TransformOutcome {
+        mut value,
+        observations,
+    } = engine.invoke(id, arguments)?;
+    value.lineage = Some(
+        Lineage::invocation(
+            transform.name.as_str(),
+            program.identities.get(id),
+            recorded,
+            observations,
+        )
+        .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?,
+    );
+    Ok(value)
 }
 
 struct Interpreter<'program, 'engine> {
@@ -391,6 +439,9 @@ impl Interpreter<'_, '_> {
         if name == "asset" {
             return self.asset(evaluated, span);
         }
+        if name == "trace" {
+            return self.trace(evaluated, span);
+        }
         let Some((id, transform)) = self.program.transforms.find(name) else {
             return Err(Diagnostic::error(
                 format!("unknown outer callable `{name}`"),
@@ -449,7 +500,7 @@ impl Interpreter<'_, '_> {
             };
             values.push(value);
         }
-        self.engine.invoke(id, values)
+        invoke_transform_with_lineage(self.program, self.engine, id, values)
     }
 
     fn asset(
@@ -476,7 +527,33 @@ impl Interpreter<'_, '_> {
         };
         Ok(OuterValue::plain(ValueData::Asset(Arc::new(AssetValue {
             locator: locator.clone(),
-        }))))
+        })))
+        .with_lineage(Lineage::source(locator.clone(), None)))
+    }
+
+    fn trace(
+        &self,
+        arguments: Vec<(Option<String>, OuterValue, Span)>,
+        span: Span,
+    ) -> Result<OuterValue, Diagnostic> {
+        if arguments.len() != 1
+            || arguments[0]
+                .0
+                .as_deref()
+                .is_some_and(|name| name != "value")
+        {
+            return Err(Diagnostic::error(
+                "trace expects exactly one derived value",
+                span,
+            ));
+        }
+        let Some(lineage) = &arguments[0].1.lineage else {
+            return Err(Diagnostic::error(
+                "value has no semantic lineage to inspect",
+                arguments[0].2,
+            ));
+        };
+        Ok(OuterValue::plain(ValueData::Lineage(lineage.clone())))
     }
 }
 
@@ -591,8 +668,11 @@ impl TransformEngine for IrInterpreter<'_> {
         &self,
         id: TransformId,
         arguments: Vec<(OuterValue, Span)>,
-    ) -> Result<OuterValue, Diagnostic> {
-        self.invoke_at_depth(id, &arguments, 0)
+    ) -> Result<TransformOutcome, Diagnostic> {
+        Ok(TransformOutcome {
+            value: self.invoke_at_depth(id, &arguments, 0)?,
+            observations: vec![],
+        })
     }
 }
 
@@ -606,7 +686,7 @@ impl TransformEngine for NativeEngine<'_> {
         &self,
         id: TransformId,
         arguments: Vec<(OuterValue, Span)>,
-    ) -> Result<OuterValue, Diagnostic> {
+    ) -> Result<TransformOutcome, Diagnostic> {
         self.validate_path(id, &mut BTreeSet::new(), &mut BTreeSet::new())?;
         let transform = self.module.get(id);
         let mut lowered = Vec::with_capacity(arguments.len());
@@ -621,7 +701,15 @@ impl TransformEngine for NativeEngine<'_> {
             .native
             .invoke(id, &abi_arguments)
             .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
-        freeze_native_result(result, transform.return_type, &mut lowered, transform.span)
+        Ok(TransformOutcome {
+            value: freeze_native_result(
+                result,
+                transform.return_type,
+                &mut lowered,
+                transform.span,
+            )?,
+            observations: vec![],
+        })
     }
 }
 
@@ -913,7 +1001,9 @@ mod tests {
     use crate::backend::NativeBackend;
     use crate::backend::c::CBackend;
     use crate::backend::native::{ClangCompiler, NativeModule};
+    use crate::identity::content_identity;
     use crate::ir::{TransformId, Type};
+    use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
         ImageValue, OuterValue, ValueData, execute, execute_native, execute_native_with_bindings,
         invoke_native_transform, lower_native_argument,
@@ -929,6 +1019,43 @@ mod tests {
         .unwrap();
         let execution = execute(&compiled).unwrap();
         assert_eq!(execution.bindings["out"].data, ValueData::Float(2.0));
+    }
+
+    #[test]
+    fn transform_results_carry_stable_lineage_and_trace_is_first_class() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform scale(x: f32, factor: f32) -> f32 { return x * factor }\n\
+             out = 8.0 | scale(factor=0.25)\n\
+             trace(out)\n",
+        )
+        .unwrap();
+        let first = execute(&compiled).unwrap();
+        let lineage = first.bindings["out"].lineage.as_ref().unwrap();
+        let LineageNode::Invocation(invocation) = lineage.node() else {
+            panic!("expected invocation lineage")
+        };
+        assert_eq!(invocation.transform_name.as_ref(), "scale");
+        assert_eq!(
+            invocation.transform_id,
+            compiled.identities.get(TransformId(0))
+        );
+        assert_eq!(invocation.arguments.len(), 2);
+        assert_eq!(invocation.arguments[0].value, RecordedValue::Float(8.0));
+        assert_eq!(invocation.arguments[1].value, RecordedValue::Float(0.25));
+        let ValueData::Lineage(inspected) = &first.last_value.as_ref().unwrap().data else {
+            panic!("trace must return a first-class lineage value")
+        };
+        assert_eq!(inspected, lineage);
+        assert!(inspected.render().contains("invoke scale"));
+
+        let second = execute(&compiled).unwrap();
+        let LineageNode::Invocation(second) =
+            second.bindings["out"].lineage.as_ref().unwrap().node()
+        else {
+            unreachable!()
+        };
+        assert_eq!(invocation.recipe_id, second.recipe_id);
     }
 
     #[test]
@@ -952,6 +1079,13 @@ mod tests {
             panic!("expected asset")
         };
         assert_eq!(&*asset.locator, "cat.png");
+        let LineageNode::Source(source) =
+            execution.bindings["img"].lineage.as_ref().unwrap().node()
+        else {
+            panic!("asset must carry source lineage")
+        };
+        assert_eq!(source.locator.as_ref(), "cat.png");
+        assert_eq!(source.observed_content, None);
     }
 
     #[test]
@@ -967,6 +1101,12 @@ mod tests {
              flag = keep_bool(true)\n",
         )
         .unwrap();
+        let reference = execute(&compiled).unwrap();
+        let LineageNode::Invocation(reference_lineage) =
+            reference.bindings["out"].lineage.as_ref().unwrap().node()
+        else {
+            unreachable!()
+        };
         let generated = CBackend.emit(&compiled.transforms).unwrap();
         let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -985,6 +1125,12 @@ mod tests {
         assert_eq!(execution.bindings["out"].data, ValueData::Float(4.0));
         assert_eq!(execution.bindings["count"].data, ValueData::Integer(7));
         assert_eq!(execution.bindings["flag"].data, ValueData::Bool(true));
+        let LineageNode::Invocation(native_lineage) =
+            execution.bindings["out"].lineage.as_ref().unwrap().node()
+        else {
+            unreachable!()
+        };
+        assert_eq!(reference_lineage.recipe_id, native_lineage.recipe_id);
     }
 
     #[test]
@@ -1073,6 +1219,8 @@ mod tests {
             .unwrap();
         let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
         let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
+        let input_content = content_identity(&input).unwrap();
+        let input = input.with_lineage(Lineage::observed_source("cat.raw", input_content));
         let execution = execute_native_with_bindings(
             &compiled,
             &native,
@@ -1092,6 +1240,14 @@ mod tests {
         assert!(original.shares_storage_with(viewed));
         assert_eq!(original.bytes(), owned.bytes());
         assert_eq!(original.bytes(), viewed.bytes());
+        let owned_trace = execution.bindings["owned"]
+            .lineage
+            .as_ref()
+            .unwrap()
+            .render();
+        assert!(owned_trace.contains("source \"cat.raw\""));
+        assert!(owned_trace.contains("invoke own"));
+        assert!(owned_trace.contains("from=#0"));
     }
 
     #[test]

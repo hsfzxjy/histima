@@ -13,6 +13,7 @@ The Rust workspace has one `tima` crate with:
   dynamic loading behind IR/backend boundaries;
 - an explicit native ABI distinction between owned `Image` and read-only,
   aliasable `ImageView`.
+- immutable semantic lineage DAGs kept entirely outside native payloads.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
@@ -34,6 +35,12 @@ comments, local names, declaration order, backend, and target do not affect it.
 Content, invocation recipe, observed dependency, and native artifact identities
 use separate hash domains; artifact identity additionally includes the actual
 backend, Clang version, target, optimization mode, and native ABI version.
+Lazy `asset(...)` values now begin with source lineage, and every outer-to-inner
+transform call records a stable invocation recipe, semantic argument snapshots,
+and ancestor edges without retaining owned native storage. `trace(value)`
+returns the derivation as an inspectable outer value. External-observation nodes
+are represented for future runtime-mediated capabilities, but no ambient access
+is introduced by this milestone.
 
 Try the vertical slice:
 

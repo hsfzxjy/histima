@@ -11,6 +11,7 @@ pub mod diagnostic;
 pub mod identity;
 pub mod ir;
 pub mod lexer;
+pub mod lineage;
 pub mod parser;
 pub mod runtime;
 pub mod semantic;

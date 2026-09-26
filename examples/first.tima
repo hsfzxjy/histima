@@ -1,5 +1,7 @@
 // Outer values are immutable and may be shared.
-input = {asset: asset("cat.png"), tags: ["example", "first-pass"]}
+source = asset("cat.png")
+source_lineage = trace(source)
+input = {asset: source, tags: ["example", "first-pass"]}
 
 // The same frontend enters a statically checked context after `transform`.
 transform scale(value: f32, factor: f32) -> f32 {
@@ -8,3 +10,4 @@ transform scale(value: f32, factor: f32) -> f32 {
 
 result = 8.0 | scale(factor=0.25)
 
+trace(result)

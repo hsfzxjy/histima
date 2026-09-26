@@ -71,8 +71,17 @@ fn run() -> Result<(), ()> {
                         eprint!("{}", diagnostic.render(&compiled.source));
                     }
                 })?;
-            for (name, value) in execution.bindings {
-                println!("{name} = {}", display(&value));
+            let unbound_trace = execution.last_value.as_ref().and_then(|last| {
+                let ValueData::Lineage(lineage) = &last.data else {
+                    return None;
+                };
+                (!execution.bindings.values().any(|value| value == last)).then_some(lineage)
+            });
+            for (name, value) in &execution.bindings {
+                println!("{name} = {}", display(value));
+            }
+            if let Some(lineage) = unbound_trace {
+                println!("{}", lineage.render());
             }
         }
         "emit-c" => {
@@ -120,5 +129,6 @@ fn display(value: &OuterValue) -> String {
             image.bytes().len()
         ),
         ValueData::Transform(id) => format!("<transform {}>", id.0),
+        ValueData::Lineage(lineage) => lineage.render(),
     }
 }

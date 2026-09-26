@@ -90,6 +90,16 @@ impl From<RecipeIdentity> for SemanticValueIdentity {
     }
 }
 
+impl fmt::Display for SemanticValueIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Content(identity) => write!(formatter, "content:{identity}"),
+            Self::Source(identity) => write!(formatter, "source:{identity}"),
+            Self::Recipe(identity) => write!(formatter, "recipe:{identity}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TransformIdentities {
     values: Vec<TransformIdentity>,
@@ -276,9 +286,9 @@ fn encode_outer_value(
                 asset.locator
             )));
         }
-        ValueData::Transform(_) => {
+        ValueData::Transform(_) | ValueData::Lineage(_) => {
             return Err(IdentityError::unavailable(
-                "callable transform values do not have content identity",
+                "callable transform and lineage values do not have content identity",
             ));
         }
     }
@@ -393,7 +403,7 @@ pub struct IdentityError {
 }
 
 impl IdentityError {
-    fn unavailable(message: impl Into<String>) -> Self {
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
