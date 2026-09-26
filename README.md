@@ -20,9 +20,10 @@ The Rust workspace has one `tima` crate with:
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
-transform calls, and pipelines. `tima run` compiles checked scalar transforms
-to a temporary DLL with LLVM/Clang and invokes them through generated C ABI
-adapters; the IR interpreter remains available as a reference execution path.
+comparisons, transform calls, and pipelines. `tima run` compiles checked scalar
+transforms to a temporary DLL with LLVM/Clang and invokes them through generated
+C ABI adapters; the IR interpreter remains available as a reference execution
+path.
 Transform bodies may contain inferred immutable local bindings, typed returns,
 and `if` statements with required `else` arms. Either branch may return early
 or fall through to a continuation; branch-local bindings do not escape that

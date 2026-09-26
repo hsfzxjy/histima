@@ -170,7 +170,7 @@ impl Parser {
     }
 
     fn pipeline(&mut self) -> Result<ExprId, Diagnostic> {
-        let mut input = self.additive()?;
+        let mut input = self.comparison()?;
         loop {
             let checkpoint = self.position;
             self.inline_newlines();
@@ -179,11 +179,33 @@ impl Parser {
                 break;
             }
             self.inline_newlines();
-            let stage = self.additive()?;
+            let stage = self.comparison()?;
             let span = self.expr(input).span.join(self.expr(stage).span);
             input = self.alloc(ExprKind::Pipeline { input, stage }, span);
         }
         Ok(input)
+    }
+
+    fn comparison(&mut self) -> Result<ExprId, Diagnostic> {
+        let left = self.additive()?;
+        let op = if self.eat(|kind| matches!(kind, TokenKind::EqualEqual)) {
+            BinaryOp::Equal
+        } else if self.eat(|kind| matches!(kind, TokenKind::BangEqual)) {
+            BinaryOp::NotEqual
+        } else if self.eat(|kind| matches!(kind, TokenKind::Less)) {
+            BinaryOp::Less
+        } else if self.eat(|kind| matches!(kind, TokenKind::LessEqual)) {
+            BinaryOp::LessEqual
+        } else if self.eat(|kind| matches!(kind, TokenKind::Greater)) {
+            BinaryOp::Greater
+        } else if self.eat(|kind| matches!(kind, TokenKind::GreaterEqual)) {
+            BinaryOp::GreaterEqual
+        } else {
+            return Ok(left);
+        };
+        let right = self.additive()?;
+        let span = self.expr(left).span.join(self.expr(right).span);
+        Ok(self.alloc(ExprKind::Binary { op, left, right }, span))
     }
 
     fn additive(&mut self) -> Result<ExprId, Diagnostic> {
@@ -488,5 +510,36 @@ mod tests {
         assert!(matches!(then_body[0], InnerStmt::Binding(_)));
         assert!(matches!(then_body[1], InnerStmt::Return { .. }));
         assert!(matches!(else_body[0], InnerStmt::Return { .. }));
+    }
+
+    #[test]
+    fn parses_comparisons_below_arithmetic_precedence() {
+        let source = SourceFile::new("test.tima", "result = 1 + 2 < 3 * 4\n");
+        let program = parse(&source).unwrap();
+        let Item::Binding(binding) = &program.items[0] else {
+            panic!("expected binding")
+        };
+        let ExprKind::Binary {
+            op: BinaryOp::Less,
+            left,
+            right,
+        } = program.expr(binding.value).kind
+        else {
+            panic!("expected comparison")
+        };
+        assert!(matches!(
+            program.expr(left).kind,
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+        assert!(matches!(
+            program.expr(right).kind,
+            ExprKind::Binary {
+                op: BinaryOp::Multiply,
+                ..
+            }
+        ));
     }
 }

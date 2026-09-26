@@ -1186,21 +1186,50 @@ fn outer_binary(
     right: OuterValue,
     span: Span,
 ) -> Result<OuterValue, Diagnostic> {
-    let data = match (left.data, right.data) {
-        (ValueData::Integer(left), ValueData::Integer(right)) => {
-            ValueData::Integer(integer_binary(op, left, right, span)?)
+    let data = if op.is_arithmetic() {
+        match (left.data, right.data) {
+            (ValueData::Integer(left), ValueData::Integer(right)) => {
+                ValueData::Integer(integer_binary(op, left, right, span)?)
+            }
+            (ValueData::Float(left), ValueData::Float(right)) => {
+                ValueData::Float(float_arithmetic(op, left, right))
+            }
+            _ => {
+                return Err(Diagnostic::error(
+                    "outer arithmetic requires two integers or two floats",
+                    span,
+                ));
+            }
         }
-        (ValueData::Float(left), ValueData::Float(right)) => ValueData::Float(match op {
-            BinaryOp::Add => left + right,
-            BinaryOp::Subtract => left - right,
-            BinaryOp::Multiply => left * right,
-            BinaryOp::Divide => left / right,
-        }),
-        _ => {
-            return Err(Diagnostic::error(
-                "outer arithmetic requires two integers or two floats",
-                span,
-            ));
+    } else if op.is_equality() {
+        let equal = match (left.data, right.data) {
+            (ValueData::Null, ValueData::Null) => true,
+            (ValueData::Bool(left), ValueData::Bool(right)) => left == right,
+            (ValueData::Integer(left), ValueData::Integer(right)) => left == right,
+            (ValueData::Float(left), ValueData::Float(right)) => left == right,
+            (ValueData::String(left), ValueData::String(right)) => left == right,
+            _ => {
+                return Err(Diagnostic::error(
+                    "outer equality requires two values of the same scalar type",
+                    span,
+                ));
+            }
+        };
+        ValueData::Bool(if op == BinaryOp::Equal { equal } else { !equal })
+    } else {
+        match (left.data, right.data) {
+            (ValueData::Integer(left), ValueData::Integer(right)) => {
+                ValueData::Bool(integer_comparison(op, left, right))
+            }
+            (ValueData::Float(left), ValueData::Float(right)) => {
+                ValueData::Bool(float_comparison(op, left, right))
+            }
+            _ => {
+                return Err(Diagnostic::error(
+                    "outer ordering requires two integers or two floats",
+                    span,
+                ));
+            }
         }
     };
     Ok(OuterValue::plain(data))
@@ -1212,8 +1241,43 @@ fn integer_binary(op: BinaryOp, left: i64, right: i64, span: Span) -> Result<i64
         BinaryOp::Subtract => left.checked_sub(right),
         BinaryOp::Multiply => left.checked_mul(right),
         BinaryOp::Divide => left.checked_div(right),
+        _ => unreachable!("integer_binary is called only for arithmetic"),
     };
     result.ok_or_else(|| Diagnostic::error("integer arithmetic overflow or division by zero", span))
+}
+
+fn float_arithmetic(op: BinaryOp, left: f32, right: f32) -> f32 {
+    match op {
+        BinaryOp::Add => left + right,
+        BinaryOp::Subtract => left - right,
+        BinaryOp::Multiply => left * right,
+        BinaryOp::Divide => left / right,
+        _ => unreachable!("float_arithmetic is called only for arithmetic"),
+    }
+}
+
+fn integer_comparison(op: BinaryOp, left: i64, right: i64) -> bool {
+    match op {
+        BinaryOp::Equal => left == right,
+        BinaryOp::NotEqual => left != right,
+        BinaryOp::Less => left < right,
+        BinaryOp::LessEqual => left <= right,
+        BinaryOp::Greater => left > right,
+        BinaryOp::GreaterEqual => left >= right,
+        _ => unreachable!("integer_comparison is called only for comparisons"),
+    }
+}
+
+fn float_comparison(op: BinaryOp, left: f32, right: f32) -> bool {
+    match op {
+        BinaryOp::Equal => left == right,
+        BinaryOp::NotEqual => left != right,
+        BinaryOp::Less => left < right,
+        BinaryOp::LessEqual => left <= right,
+        BinaryOp::Greater => left > right,
+        BinaryOp::GreaterEqual => left >= right,
+        _ => unreachable!("float_comparison is called only for comparisons"),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1737,17 +1801,38 @@ fn native_binary(
     right: NativeScalar,
     span: Span,
 ) -> Result<NativeScalar, Diagnostic> {
-    match (left, right) {
-        (NativeScalar::I64(left), NativeScalar::I64(right)) => {
-            Ok(NativeScalar::I64(integer_binary(op, left, right, span)?))
+    if op.is_arithmetic() {
+        match (left, right) {
+            (NativeScalar::I64(left), NativeScalar::I64(right)) => {
+                Ok(NativeScalar::I64(integer_binary(op, left, right, span)?))
+            }
+            (NativeScalar::F32(left), NativeScalar::F32(right)) => {
+                Ok(NativeScalar::F32(float_arithmetic(op, left, right)))
+            }
+            _ => unreachable!("typed arithmetic operands are matching numeric values"),
         }
-        (NativeScalar::F32(left), NativeScalar::F32(right)) => Ok(NativeScalar::F32(match op {
-            BinaryOp::Add => left + right,
-            BinaryOp::Subtract => left - right,
-            BinaryOp::Multiply => left * right,
-            BinaryOp::Divide => left / right,
-        })),
-        _ => unreachable!("typed IR guarantees matching numeric operands"),
+    } else if op.is_equality() {
+        let equal = match (left, right) {
+            (NativeScalar::Bool(left), NativeScalar::Bool(right)) => left == right,
+            (NativeScalar::I64(left), NativeScalar::I64(right)) => left == right,
+            (NativeScalar::F32(left), NativeScalar::F32(right)) => left == right,
+            _ => unreachable!("typed equality operands are matching scalar values"),
+        };
+        Ok(NativeScalar::Bool(if op == BinaryOp::Equal {
+            equal
+        } else {
+            !equal
+        }))
+    } else {
+        match (left, right) {
+            (NativeScalar::I64(left), NativeScalar::I64(right)) => {
+                Ok(NativeScalar::Bool(integer_comparison(op, left, right)))
+            }
+            (NativeScalar::F32(left), NativeScalar::F32(right)) => {
+                Ok(NativeScalar::Bool(float_comparison(op, left, right)))
+            }
+            _ => unreachable!("typed ordering operands are matching numeric values"),
+        }
     }
 }
 
@@ -2099,6 +2184,25 @@ mod tests {
     }
 
     #[test]
+    fn outer_scalar_comparisons_follow_shared_expression_precedence() {
+        let compiled = crate::compile(
+            "test.tima",
+            "ordered = 1 + 2 < 4\n\
+             same = \"cat\" == \"cat\"\n\
+             different = true != false\n",
+        )
+        .unwrap();
+        let execution = execute(&compiled).unwrap();
+        assert_eq!(execution.bindings["ordered"].data, ValueData::Bool(true));
+        assert_eq!(execution.bindings["same"].data, ValueData::Bool(true));
+        assert_eq!(execution.bindings["different"].data, ValueData::Bool(true));
+
+        let unsupported = crate::compile("bad.tima", "result = [1] == [1]\n").unwrap();
+        let diagnostics = execute(&unsupported).unwrap_err();
+        assert!(diagnostics[0].message.contains("same scalar type"));
+    }
+
+    #[test]
     fn asset_is_a_logical_locator_not_eager_io() {
         let compiled = crate::compile("test.tima", "img = asset(\"cat.png\")\n").unwrap();
         let execution = execute(&compiled).unwrap();
@@ -2127,11 +2231,17 @@ mod tests {
                  if flag { return left } else {}\n\
                  return right\n\
              }\n\
+             transform minimum(left: f32, right: f32) -> f32 {\n\
+                 if left < right { return left } else { return right }\n\
+             }\n\
+             transform less_i64(left: i64, right: i64) -> bool { return left < right }\n\
              out = 8.0 | scale_twice(factor=0.25)\n\
              count = keep_i64(7)\n\
              flag = keep_bool(true)\n\
              chosen = choose(false, 3.0, 7.0)\n\
-             chosen_true = choose(true, 3.0, 7.0)\n",
+             chosen_true = choose(true, 3.0, 7.0)\n\
+             smaller = minimum(7.0, 3.0)\n\
+             ordered = less_i64(3, 7)\n",
         )
         .unwrap();
         let reference = execute(&compiled).unwrap();
@@ -2164,6 +2274,8 @@ mod tests {
             execution.bindings["chosen_true"].data,
             ValueData::Float(3.0)
         );
+        assert_eq!(execution.bindings["smaller"].data, ValueData::Float(3.0));
+        assert_eq!(execution.bindings["ordered"].data, ValueData::Bool(true));
         let LineageNode::Invocation(native_lineage) =
             execution.bindings["out"].lineage.as_ref().unwrap().node()
         else {

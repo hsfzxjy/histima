@@ -491,6 +491,12 @@ fn encode_binary_op(hasher: &mut CanonicalHasher, op: BinaryOp) {
         BinaryOp::Subtract => 1,
         BinaryOp::Multiply => 2,
         BinaryOp::Divide => 3,
+        BinaryOp::Equal => 4,
+        BinaryOp::NotEqual => 5,
+        BinaryOp::Less => 6,
+        BinaryOp::LessEqual => 7,
+        BinaryOp::Greater => 8,
+        BinaryOp::GreaterEqual => 9,
     });
 }
 
@@ -776,6 +782,24 @@ mod tests {
         assert_ne!(
             multiply.identities.get(TransformId(0)),
             add.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
+    fn comparison_operator_is_part_of_transform_identity() {
+        let less = crate::compile(
+            "less.tima",
+            "transform compare(a: f32, b: f32) -> bool { return a < b }\n",
+        )
+        .unwrap();
+        let less_equal = crate::compile(
+            "less_equal.tima",
+            "transform compare(a: f32, b: f32) -> bool { return a <= b }\n",
+        )
+        .unwrap();
+        assert_ne!(
+            less.identities.get(TransformId(0)),
+            less_equal.identities.get(TransformId(0))
         );
     }
 

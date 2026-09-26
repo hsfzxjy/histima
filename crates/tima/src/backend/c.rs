@@ -9,7 +9,7 @@ use crate::ir::{Constant, RuntimeCall, Terminator, Transform, TypedModule, Value
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "5";
+pub const C_BACKEND_VERSION: &str = "6";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -196,6 +196,12 @@ fn expression(transform: &Transform, transform_index: usize, id: ValueId) -> Str
                 BinaryOp::Subtract => "-",
                 BinaryOp::Multiply => "*",
                 BinaryOp::Divide => "/",
+                BinaryOp::Equal => "==",
+                BinaryOp::NotEqual => "!=",
+                BinaryOp::Less => "<",
+                BinaryOp::LessEqual => "<=",
+                BinaryOp::Greater => ">",
+                BinaryOp::GreaterEqual => ">=",
             };
             format!(
                 "({} {operator} {})",
@@ -287,6 +293,19 @@ mod tests {
         assert!(artifact.source.contains("tima_t0_b2:"));
         assert!(artifact.source.contains("goto tima_t0_b3;"));
         assert!(artifact.source.contains("tima_t0_b3:"));
+    }
+
+    #[test]
+    fn emits_typed_scalar_comparisons() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform less(left: f32, right: f32) -> bool { return left < right }\n",
+        )
+        .unwrap();
+        let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(artifact.source.contains("bool v2;"));
+        assert!(artifact.source.contains("v2 = (p0 < p1);"));
+        assert!(artifact.source.contains("return v2;"));
     }
 
     #[test]

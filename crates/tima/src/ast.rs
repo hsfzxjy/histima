@@ -120,4 +120,23 @@ pub enum BinaryOp {
     Subtract,
     Multiply,
     Divide,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+impl BinaryOp {
+    pub fn is_arithmetic(self) -> bool {
+        matches!(
+            self,
+            Self::Add | Self::Subtract | Self::Multiply | Self::Divide
+        )
+    }
+
+    pub fn is_equality(self) -> bool {
+        matches!(self, Self::Equal | Self::NotEqual)
+    }
 }

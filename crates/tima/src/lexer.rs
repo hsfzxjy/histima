@@ -30,6 +30,12 @@ pub enum TokenKind {
     Colon,
     Semicolon,
     Equal,
+    EqualEqual,
+    BangEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
     Arrow,
     Pipe,
     Plus,
@@ -85,7 +91,13 @@ impl Lexer<'_> {
                 b',' => self.single(TokenKind::Comma, start),
                 b':' => self.single(TokenKind::Colon, start),
                 b';' => self.single(TokenKind::Semicolon, start),
+                b'=' if self.peek() == Some(b'=') => self.double(TokenKind::EqualEqual, start),
                 b'=' => self.single(TokenKind::Equal, start),
+                b'!' if self.peek() == Some(b'=') => self.double(TokenKind::BangEqual, start),
+                b'<' if self.peek() == Some(b'=') => self.double(TokenKind::LessEqual, start),
+                b'<' => self.single(TokenKind::Less, start),
+                b'>' if self.peek() == Some(b'=') => self.double(TokenKind::GreaterEqual, start),
+                b'>' => self.single(TokenKind::Greater, start),
                 b'|' => self.single(TokenKind::Pipe, start),
                 b'+' => self.single(TokenKind::Plus, start),
                 b'*' => self.single(TokenKind::Star, start),
@@ -126,6 +138,11 @@ impl Lexer<'_> {
 
     fn single(&mut self, kind: TokenKind, start: usize) {
         self.position += 1;
+        self.push(kind, start);
+    }
+
+    fn double(&mut self, kind: TokenKind, start: usize) {
+        self.position += 2;
         self.push(kind, start);
     }
 
@@ -241,7 +258,8 @@ mod tests {
     fn recognizes_transform_and_pipeline_tokens() {
         let source = SourceFile::new(
             "test",
-            "transform f(flag: bool, x: f32) -> f32 { if flag { return x } else { return x } }\ny = 1 | f",
+            "transform f(flag: bool, x: f32) -> f32 { if flag { return x } else { return x } }\n\
+             y = 1 | f\n comparisons = a == b != c < d <= e > f >= g",
         );
         let tokens = lex(&source).unwrap();
         assert!(
@@ -253,5 +271,27 @@ mod tests {
         assert!(tokens.iter().any(|token| token.kind == TokenKind::Arrow));
         assert!(tokens.iter().any(|token| token.kind == TokenKind::If));
         assert!(tokens.iter().any(|token| token.kind == TokenKind::Else));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::EqualEqual)
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::BangEqual)
+        );
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Less));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::LessEqual)
+        );
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Greater));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::GreaterEqual)
+        );
     }
 }

@@ -432,10 +432,48 @@ impl<'a> Lowerer<'a> {
                 let right = self.expression(*right)?;
                 let left_type = self.values[left.0 as usize].ty;
                 let right_type = self.values[right.0 as usize].ty;
-                if left_type != right_type || !left_type.is_numeric() {
+                let result_type = if op.is_arithmetic() {
+                    if left_type == right_type && left_type.is_numeric() {
+                        left_type
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "inner arithmetic requires operands of the same numeric type",
+                                expression.span,
+                            )
+                            .with_note(format!(
+                                "left is {}, right is {}",
+                                left_type.name(),
+                                right_type.name()
+                            )),
+                        );
+                        return None;
+                    }
+                } else if op.is_equality() {
+                    if left_type == right_type
+                        && matches!(left_type, Type::Bool | Type::I64 | Type::F32)
+                    {
+                        Type::Bool
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "inner equality requires operands of the same scalar type",
+                                expression.span,
+                            )
+                            .with_note(format!(
+                                "left is {}, right is {}",
+                                left_type.name(),
+                                right_type.name()
+                            )),
+                        );
+                        return None;
+                    }
+                } else if left_type == right_type && left_type.is_numeric() {
+                    Type::Bool
+                } else {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "inner arithmetic requires operands of the same numeric type",
+                            "inner ordering requires operands of the same numeric type",
                             expression.span,
                         )
                         .with_note(format!(
@@ -445,9 +483,9 @@ impl<'a> Lowerer<'a> {
                         )),
                     );
                     return None;
-                }
+                };
                 Some(self.alloc(
-                    left_type,
+                    result_type,
                     ValueKind::Binary {
                         op: *op,
                         left,
@@ -770,6 +808,48 @@ mod tests {
                 .message
                 .contains("unknown inner value `selected`")
         }));
+    }
+
+    #[test]
+    fn checks_scalar_comparisons_and_lowers_bool_results() {
+        let compiled = compile(
+            "test.tima",
+            "transform less(left: f32, right: f32) -> bool { return left < right }\n\
+             transform same(left: bool, right: bool) -> bool { return left == right }\n",
+        )
+        .unwrap();
+        let less = &compiled.transforms.transforms[0];
+        assert_eq!(less.return_type, ir::Type::Bool);
+        assert_eq!(less.values[2].ty, ir::Type::Bool);
+        assert!(matches!(
+            less.values[2].kind,
+            ir::ValueKind::Binary {
+                op: crate::ast::BinaryOp::Less,
+                ..
+            }
+        ));
+
+        let diagnostics = compile(
+            "bad.tima",
+            "transform bad(left: bool, right: bool) -> bool { return left < right }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("inner ordering"))
+        );
+
+        let diagnostics = compile(
+            "bad_image.tima",
+            "transform bad(left: ImageView, right: ImageView) -> bool { return left == right }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("inner equality"))
+        );
     }
 
     #[test]
