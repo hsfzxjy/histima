@@ -397,8 +397,27 @@ pub(crate) union AbiValue {
     pub(crate) image_view: AbiImageView,
 }
 
+pub(crate) type EnvironmentI64Fn = unsafe extern "C" fn(
+    context: *mut c_void,
+    transform: u32,
+    callsite: u32,
+    name: *const u8,
+    name_len: usize,
+    result: *mut i64,
+) -> i32;
+
+/// Per-invocation runtime context shared with generated C. The pointed-to
+/// context remains owned by the Rust runtime and is valid only for the
+/// synchronous invocation.
+#[repr(C)]
+pub(crate) struct AbiRuntime {
+    pub(crate) context: *mut c_void,
+    pub(crate) environment_i64: EnvironmentI64Fn,
+    pub(crate) status: i32,
+}
+
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
-type InvokeFn = unsafe extern "C" fn(*const AbiValue, *mut AbiValue) -> i32;
+type InvokeFn = unsafe extern "C" fn(*mut AbiRuntime, *const AbiValue, *mut AbiValue) -> i32;
 
 #[derive(Debug)]
 pub struct NativeModule {
@@ -449,6 +468,7 @@ impl NativeModule {
     pub(crate) fn invoke(
         &self,
         transform: TransformId,
+        runtime: &mut AbiRuntime,
         arguments: &[AbiValue],
     ) -> Result<AbiValue, NativeLoadError> {
         let Some(function) = self.invocations.get(transform.0 as usize) else {
@@ -458,9 +478,9 @@ impl NativeModule {
             )));
         };
         let mut result = AbiValue { i64_value: 0 };
-        // SAFETY: the adapter symbol was loaded with `InvokeFn`; `arguments`
-        // and `result` remain valid for the duration of the synchronous call.
-        let status = unsafe { function(arguments.as_ptr(), &mut result) };
+        // SAFETY: the adapter symbol was loaded with `InvokeFn`; `runtime`,
+        // `arguments`, and `result` remain valid for the synchronous call.
+        let status = unsafe { function(runtime, arguments.as_ptr(), &mut result) };
         match status {
             0 => Ok(result),
             other => Err(NativeLoadError::new(format!(

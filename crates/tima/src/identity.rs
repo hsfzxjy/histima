@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::ast::BinaryOp;
 use crate::diagnostic::Diagnostic;
-use crate::ir::{Constant, Terminator, TransformId, Type, TypedModule, ValueKind};
+use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, TypedModule, ValueKind};
 use crate::runtime::{OuterValue, ValueData};
 
 /// Version of Tima's canonical semantic encoding. Incrementing this does not
@@ -213,6 +213,11 @@ impl TransformIdentityResolver<'_> {
                     for argument in arguments {
                         hasher.u32(argument.0);
                     }
+                }
+                ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
+                    hasher.u8(4);
+                    hasher.u8(0);
+                    hasher.bytes(name.as_bytes());
                 }
             }
         }
@@ -703,6 +708,24 @@ mod tests {
         assert_ne!(
             multiply.identities.get(TransformId(0)),
             add.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
+    fn capability_operation_and_key_are_part_of_transform_identity() {
+        let first = crate::compile(
+            "one.tima",
+            "transform configured() -> i64 { return environment_i64(\"MODE\") }\n",
+        )
+        .unwrap();
+        let second = crate::compile(
+            "two.tima",
+            "transform configured() -> i64 { return environment_i64(\"QUALITY\") }\n",
+        )
+        .unwrap();
+        assert_ne!(
+            first.identities.get(TransformId(0)),
+            second.identities.get(TransformId(0))
         );
     }
 

@@ -104,6 +104,13 @@ pub enum ValueKind {
         transform: TransformId,
         arguments: Vec<ValueId>,
     },
+    RuntimeCall(RuntimeCall),
+}
+
+/// Backend-neutral calls into the narrow Histima runtime capability boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RuntimeCall {
+    EnvironmentI64 { name: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -12,9 +12,11 @@ The Rust workspace has one `tima` crate with:
 - an inspectable generated-C backend, LLVM/Clang artifact compilation, and
   dynamic loading behind IR/backend boundaries;
 - an explicit native ABI distinction between owned `Image` and read-only,
-  aliasable `ImageView`.
-- immutable semantic lineage DAGs kept entirely outside native payloads.
-- separate native-artifact and transform-result caches keyed by semantic IDs.
+  aliasable `ImageView`;
+- immutable semantic lineage DAGs kept entirely outside native payloads;
+- separate native-artifact and transform-result caches keyed by semantic IDs;
+- host-mediated environment observations shared by the reference interpreter
+  and generated-C runtime ABI.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
@@ -39,9 +41,16 @@ backend, Clang version, target, optimization mode, and native ABI version.
 Lazy `asset(...)` values now begin with source lineage, and every outer-to-inner
 transform call records a stable invocation recipe, semantic argument snapshots,
 and ancestor edges without retaining owned native storage. `trace(value)`
-returns the derivation as an inspectable outer value. External-observation nodes
-are represented for future runtime-mediated capabilities, but no ambient access
-is introduced by this milestone.
+returns the derivation as an inspectable outer value.
+
+The first tracked capability is the literal-key inner call
+`environment_i64("NAME")`. A Histima host must explicitly implement
+`RuntimeCapabilities`; Tima never falls back to ambient process state. The
+reference interpreter and generated C both parse the supplied bytes as an
+`i64`, record the raw bytes as an external observation, and include that
+dependency in Recipe identity. Different observed bytes therefore produce
+different recipes, while replay validates the recorded observation before
+cache reuse or re-execution.
 
 Native C bundles are cached persistently under `build/cache` using the ordered
 Artifact IDs of their transforms and are validated against the generated source

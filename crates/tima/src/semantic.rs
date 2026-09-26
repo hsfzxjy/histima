@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::ast::{self, ExprId, ExprKind, InnerStmt, Item};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    BasicBlock, BlockId, Constant, Parameter, Terminator, Transform, TransformId, Type,
-    TypedModule, Value, ValueId, ValueKind,
+    BasicBlock, BlockId, Constant, Parameter, RuntimeCall, Terminator, Transform, TransformId,
+    Type, TypedModule, Value, ValueId, ValueKind,
 };
 
 pub fn check(program: &ast::Program) -> Result<TypedModule, Vec<Diagnostic>> {
@@ -60,6 +60,16 @@ impl<'a> Checker<'a> {
             let Item::Transform(declaration) = item else {
                 continue;
             };
+            if declaration.name == "environment_i64" {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "`environment_i64` is reserved for the runtime capability call",
+                        declaration.name_span,
+                    )
+                    .with_note("runtime capability builtins cannot be redefined as transforms"),
+                );
+                continue;
+            }
             if let Some(previous) = self.signatures.get(&declaration.name) {
                 let earlier = self
                     .program
@@ -331,6 +341,9 @@ impl<'a> Lowerer<'a> {
                     ));
                     return None;
                 };
+                if name == "environment_i64" {
+                    return self.environment_i64(arguments, expression.span);
+                }
                 let Some(signature) = self.signatures.get(name) else {
                     self.diagnostics.push(Diagnostic::error(
                         format!("unknown inner transform `{name}`"),
@@ -430,6 +443,47 @@ impl<'a> Lowerer<'a> {
         }
         id
     }
+
+    fn environment_i64(
+        &mut self,
+        arguments: &[ast::Argument],
+        span: crate::source::Span,
+    ) -> Option<ValueId> {
+        if arguments.len() != 1 || arguments[0].name.is_some() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "environment_i64 expects one positional string-literal name",
+                    span,
+                )
+                .with_note("example: environment_i64(\"HISTIMA_SCALE\")"),
+            );
+            return None;
+        }
+        let argument = &arguments[0];
+        let ExprKind::String(name) = &self.program.expr(argument.value).kind else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "environment_i64 requires a string-literal name",
+                    argument.span,
+                )
+                .with_note("dynamic capability keys are intentionally not part of this slice"),
+            );
+            return None;
+        };
+        if name.is_empty() {
+            self.diagnostics.push(Diagnostic::error(
+                "environment_i64 requires a non-empty environment name",
+                argument.span,
+            ));
+            return None;
+        }
+        Some(self.alloc(
+            Type::I64,
+            ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name: name.clone() }),
+            span,
+            true,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +510,29 @@ mod tests {
         let diagnostics =
             compile("test.tima", "transform bad(x: f32) -> f32 { return [x] }\n").unwrap_err();
         assert!(diagnostics[0].message.contains("outer-only"));
+    }
+
+    #[test]
+    fn lowers_literal_environment_reads_to_typed_runtime_calls() {
+        let compiled = compile(
+            "test.tima",
+            "transform configured() -> i64 { return environment_i64(\"MODE\") }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            &compiled.transforms.transforms[0].values[0].kind,
+            ir::ValueKind::RuntimeCall(ir::RuntimeCall::EnvironmentI64 { name }) if name == "MODE"
+        ));
+    }
+
+    #[test]
+    fn rejects_dynamic_environment_keys() {
+        let diagnostics = compile(
+            "test.tima",
+            "transform configured(key: i64) -> i64 { return environment_i64(key) }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics[0].message.contains("string-literal name"));
     }
 
     #[test]

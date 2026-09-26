@@ -1,16 +1,19 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::ffi::c_void;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
-use crate::backend::native::{AbiImage, AbiImageView, AbiValue, NativeModule};
+use crate::backend::native::{AbiImage, AbiImageView, AbiRuntime, AbiValue, NativeModule};
 use crate::cache::TransformResultCache;
+use crate::capability::{CapabilitySession, RuntimeCapabilities, observe_dependency};
 use crate::diagnostic::Diagnostic;
 use crate::identity::{ContentIdentity, content_identity};
-use crate::ir::{Constant, Terminator, TransformId, Type, ValueKind};
+use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueKind};
 use crate::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
 use crate::source::Span;
 
@@ -172,6 +175,7 @@ pub struct Execution {
 pub fn execute(program: &CompiledProgram) -> Result<Execution, Vec<Diagnostic>> {
     let engine = IrInterpreter {
         module: &program.transforms,
+        capabilities: None,
     };
     execute_with(program, &engine, BTreeMap::new(), None)
 }
@@ -182,6 +186,30 @@ pub fn execute_cached(
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = IrInterpreter {
         module: &program.transforms,
+        capabilities: None,
+    };
+    execute_with(program, &engine, BTreeMap::new(), Some(cache))
+}
+
+pub fn execute_with_capabilities(
+    program: &CompiledProgram,
+    capabilities: &dyn RuntimeCapabilities,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = IrInterpreter {
+        module: &program.transforms,
+        capabilities: Some(capabilities),
+    };
+    execute_with(program, &engine, BTreeMap::new(), None)
+}
+
+pub fn execute_cached_with_capabilities(
+    program: &CompiledProgram,
+    cache: &mut TransformResultCache,
+    capabilities: &dyn RuntimeCapabilities,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = IrInterpreter {
+        module: &program.transforms,
+        capabilities: Some(capabilities),
     };
     execute_with(program, &engine, BTreeMap::new(), Some(cache))
 }
@@ -196,6 +224,7 @@ pub fn execute_native(
     let engine = NativeEngine {
         module: &program.transforms,
         native,
+        capabilities: None,
     };
     execute_with(program, &engine, BTreeMap::new(), None)
 }
@@ -208,6 +237,34 @@ pub fn execute_native_cached(
     let engine = NativeEngine {
         module: &program.transforms,
         native,
+        capabilities: None,
+    };
+    execute_with(program, &engine, BTreeMap::new(), Some(cache))
+}
+
+pub fn execute_native_with_capabilities(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    capabilities: &dyn RuntimeCapabilities,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = NativeEngine {
+        module: &program.transforms,
+        native,
+        capabilities: Some(capabilities),
+    };
+    execute_with(program, &engine, BTreeMap::new(), None)
+}
+
+pub fn execute_native_cached_with_capabilities(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    cache: &mut TransformResultCache,
+    capabilities: &dyn RuntimeCapabilities,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = NativeEngine {
+        module: &program.transforms,
+        native,
+        capabilities: Some(capabilities),
     };
     execute_with(program, &engine, BTreeMap::new(), Some(cache))
 }
@@ -223,6 +280,7 @@ pub fn execute_native_with_bindings(
     let engine = NativeEngine {
         module: &program.transforms,
         native,
+        capabilities: None,
     };
     execute_with(program, &engine, bindings, None)
 }
@@ -236,6 +294,7 @@ pub fn execute_native_with_bindings_cached(
     let engine = NativeEngine {
         module: &program.transforms,
         native,
+        capabilities: None,
     };
     execute_with(program, &engine, bindings, Some(cache))
 }
@@ -268,6 +327,7 @@ pub fn invoke_native_transform(
     let engine = NativeEngine {
         module: &program.transforms,
         native,
+        capabilities: None,
     };
     invoke_transform_with_lineage(program, &engine, transform, arguments, None)
 }
@@ -298,15 +358,23 @@ pub fn invoke_native_transform_cached(
     let engine = NativeEngine {
         module: &program.transforms,
         native,
+        capabilities: None,
     };
     invoke_transform_with_lineage(program, &engine, transform, arguments, Some(cache))
 }
 
 /// Host hook used to validate precise external observations before replay.
-/// Phase 8 capabilities will provide concrete implementations. Replay without
-/// external observations does not require a resolver.
+/// Replay without external observations does not require a resolver.
 pub trait ReplayDependencyResolver {
     fn observe(&self, capability: &str, key: &[u8]) -> Result<ContentIdentity, String>;
+}
+
+struct CapabilityReplayResolver<'a>(&'a dyn RuntimeCapabilities);
+
+impl ReplayDependencyResolver for CapabilityReplayResolver<'_> {
+    fn observe(&self, capability: &str, key: &[u8]) -> Result<ContentIdentity, String> {
+        observe_dependency(self.0, capability, key)
+    }
 }
 
 pub fn replay(
@@ -325,6 +393,7 @@ pub fn replay_with_dependencies(
 ) -> Result<OuterValue, Diagnostic> {
     let engine = IrInterpreter {
         module: &program.transforms,
+        capabilities: None,
     };
     replay_with(
         program,
@@ -332,6 +401,27 @@ pub fn replay_with_dependencies(
         target,
         cache,
         dependencies,
+        Span::default(),
+    )
+}
+
+pub fn replay_with_capabilities(
+    program: &CompiledProgram,
+    target: &OuterValue,
+    cache: &mut TransformResultCache,
+    capabilities: &dyn RuntimeCapabilities,
+) -> Result<OuterValue, Diagnostic> {
+    let engine = IrInterpreter {
+        module: &program.transforms,
+        capabilities: Some(capabilities),
+    };
+    let resolver = CapabilityReplayResolver(capabilities);
+    replay_with(
+        program,
+        &engine,
+        target,
+        cache,
+        Some(&resolver),
         Span::default(),
     )
 }
@@ -355,6 +445,7 @@ pub fn replay_native_with_dependencies(
     let engine = NativeEngine {
         module: &program.transforms,
         native,
+        capabilities: None,
     };
     replay_with(
         program,
@@ -362,6 +453,29 @@ pub fn replay_native_with_dependencies(
         target,
         cache,
         dependencies,
+        Span::default(),
+    )
+}
+
+pub fn replay_native_with_capabilities(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    target: &OuterValue,
+    cache: &mut TransformResultCache,
+    capabilities: &dyn RuntimeCapabilities,
+) -> Result<OuterValue, Diagnostic> {
+    let engine = NativeEngine {
+        module: &program.transforms,
+        native,
+        capabilities: Some(capabilities),
+    };
+    let resolver = CapabilityReplayResolver(capabilities);
+    replay_with(
+        program,
+        &engine,
+        target,
+        cache,
+        Some(&resolver),
         Span::default(),
     )
 }
@@ -1111,6 +1225,7 @@ enum NativeScalar {
 
 struct IrInterpreter<'a> {
     module: &'a crate::ir::TypedModule,
+    capabilities: Option<&'a dyn RuntimeCapabilities>,
 }
 
 impl IrInterpreter<'_> {
@@ -1119,6 +1234,7 @@ impl IrInterpreter<'_> {
         id: TransformId,
         arguments: &[(OuterValue, Span)],
         depth: usize,
+        capabilities: &mut CapabilitySession<'_>,
     ) -> Result<OuterValue, Diagnostic> {
         let transform = self.module.get(id);
         if depth >= 256 {
@@ -1160,8 +1276,12 @@ impl IrInterpreter<'_> {
                             (freeze_scalar(scalar), value.span)
                         })
                         .collect::<Vec<_>>();
-                    let result = self.invoke_at_depth(*callee, &call_arguments, depth + 1)?;
+                    let result =
+                        self.invoke_at_depth(*callee, &call_arguments, depth + 1, capabilities)?;
                     lower_scalar(&result, callee_transform.return_type, value.span)?
+                }
+                ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
+                    NativeScalar::I64(capabilities.environment_i64(name, value.span)?)
                 }
             };
             values[id.0 as usize] = Some(evaluated);
@@ -1178,16 +1298,23 @@ impl TransformEngine for IrInterpreter<'_> {
         id: TransformId,
         arguments: Vec<(OuterValue, Span)>,
     ) -> Result<TransformOutcome, Diagnostic> {
+        let mut capabilities = CapabilitySession::new(self.capabilities);
+        let value = self.invoke_at_depth(id, &arguments, 0, &mut capabilities)?;
         Ok(TransformOutcome {
-            value: self.invoke_at_depth(id, &arguments, 0)?,
-            observations: vec![],
+            value,
+            observations: capabilities.finish(),
         })
+    }
+
+    fn may_observe_dependencies(&self, id: TransformId) -> bool {
+        transform_may_observe_dependencies(self.module, id)
     }
 }
 
 struct NativeEngine<'a> {
     module: &'a crate::ir::TypedModule,
     native: &'a NativeModule,
+    capabilities: Option<&'a dyn RuntimeCapabilities>,
 }
 
 impl TransformEngine for NativeEngine<'_> {
@@ -1206,10 +1333,26 @@ impl TransformEngine for NativeEngine<'_> {
             .iter()
             .map(|argument| argument.abi)
             .collect::<Vec<_>>();
-        let result = self
-            .native
-            .invoke(id, &abi_arguments)
-            .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
+        let mut capability_context = NativeCapabilityContext {
+            session: CapabilitySession::new(self.capabilities),
+            module: self.module,
+            error: None,
+        };
+        let mut abi_runtime = AbiRuntime {
+            context: (&mut capability_context as *mut NativeCapabilityContext<'_>).cast(),
+            environment_i64: native_environment_i64,
+            status: 0,
+        };
+        let result = match self.native.invoke(id, &mut abi_runtime, &abi_arguments) {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(capability_context
+                    .error
+                    .take()
+                    .unwrap_or_else(|| Diagnostic::error(error.to_string(), transform.span)));
+            }
+        };
+        let observations = capability_context.session.finish();
         Ok(TransformOutcome {
             value: freeze_native_result(
                 result,
@@ -1217,9 +1360,95 @@ impl TransformEngine for NativeEngine<'_> {
                 &mut lowered,
                 transform.span,
             )?,
-            observations: vec![],
+            observations,
         })
     }
+
+    fn may_observe_dependencies(&self, id: TransformId) -> bool {
+        transform_may_observe_dependencies(self.module, id)
+    }
+}
+
+struct NativeCapabilityContext<'a> {
+    session: CapabilitySession<'a>,
+    module: &'a crate::ir::TypedModule,
+    error: Option<Diagnostic>,
+}
+
+unsafe extern "C" fn native_environment_i64(
+    context: *mut c_void,
+    transform: u32,
+    callsite: u32,
+    name: *const u8,
+    name_len: usize,
+    result: *mut i64,
+) -> i32 {
+    if context.is_null() || name.is_null() || result.is_null() {
+        return -3;
+    }
+    // SAFETY: generated C passes back the invocation-local context pointer and
+    // a name byte slice that remains live for the synchronous callback.
+    let context = unsafe { &mut *context.cast::<NativeCapabilityContext<'_>>() };
+    let span = context
+        .module
+        .transforms
+        .get(transform as usize)
+        .and_then(|transform| transform.values.get(callsite as usize))
+        .map_or(Span::default(), |value| value.span);
+    let name = unsafe { std::slice::from_raw_parts(name, name_len) };
+    let name = match std::str::from_utf8(name) {
+        Ok(name) => name,
+        Err(_) => {
+            context.error = Some(Diagnostic::error(
+                "native transform requested an invalid UTF-8 environment name",
+                span,
+            ));
+            return -4;
+        }
+    };
+    match catch_unwind(AssertUnwindSafe(|| {
+        context.session.environment_i64(name, span)
+    })) {
+        Ok(Ok(value)) => {
+            unsafe { *result = value };
+            0
+        }
+        Ok(Err(error)) => {
+            context.error = Some(error);
+            -5
+        }
+        Err(_) => {
+            context.error = Some(
+                Diagnostic::error(
+                    format!("environment capability panicked while reading `{name}`"),
+                    span,
+                )
+                .with_note("runtime capability providers must not unwind across the native ABI"),
+            );
+            -6
+        }
+    }
+}
+
+fn transform_may_observe_dependencies(module: &crate::ir::TypedModule, root: TransformId) -> bool {
+    fn visit(
+        module: &crate::ir::TypedModule,
+        id: TransformId,
+        visited: &mut BTreeSet<u32>,
+    ) -> bool {
+        if !visited.insert(id.0) {
+            return false;
+        }
+        module.get(id).values.iter().any(|value| match &value.kind {
+            ValueKind::RuntimeCall(_) => true,
+            ValueKind::Call {
+                transform: callee, ..
+            } => visit(module, *callee, visited),
+            _ => false,
+        })
+    }
+
+    visit(module, root, &mut BTreeSet::new())
 }
 
 impl NativeEngine<'_> {
@@ -1511,15 +1740,34 @@ mod tests {
     use crate::backend::c::CBackend;
     use crate::backend::native::{ClangCompiler, NativeModule};
     use crate::cache::TransformResultCache;
+    use crate::capability::RuntimeCapabilities;
     use crate::identity::{ContentIdentity, byte_content_identity, content_identity};
     use crate::ir::{TransformId, Type};
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
         ImageValue, OuterValue, ReplayDependencyResolver, ValueData, execute, execute_cached,
-        execute_native, execute_native_with_bindings_cached, invoke_native_transform,
-        lower_native_argument, replay, replay_native, replay_with_dependencies,
+        execute_cached_with_capabilities, execute_native, execute_native_cached_with_capabilities,
+        execute_native_with_bindings_cached, invoke_native_transform, lower_native_argument,
+        replay, replay_native, replay_with_capabilities, replay_with_dependencies,
     };
     use crate::source::Span;
+
+    struct FixedEnvironment(BTreeMap<String, Vec<u8>>);
+
+    impl FixedEnvironment {
+        fn one(name: &str, value: &[u8]) -> Self {
+            Self(BTreeMap::from([(name.to_owned(), value.to_vec())]))
+        }
+    }
+
+    impl RuntimeCapabilities for FixedEnvironment {
+        fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
+            self.0
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("environment value `{name}` is unavailable"))
+        }
+    }
 
     #[test]
     fn runs_a_scalar_transform_through_a_pipeline() {
@@ -1530,6 +1778,90 @@ mod tests {
         .unwrap();
         let execution = execute(&compiled).unwrap();
         assert_eq!(execution.bindings["out"].data, ValueData::Float(2.0));
+    }
+
+    #[test]
+    fn environment_capability_is_explicit_and_part_of_the_recipe() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform read_mode() -> i64 { return environment_i64(\"MODE\") }\n\
+             transform configured() -> i64 { return read_mode() }\n\
+             result = configured()\n",
+        )
+        .unwrap();
+
+        let diagnostic = execute(&compiled).unwrap_err();
+        assert!(
+            diagnostic[0]
+                .message
+                .contains("environment access is unavailable")
+        );
+
+        let invalid_environment = FixedEnvironment::one("MODE", b"not-a-number");
+        let mut invalid_cache = TransformResultCache::default();
+        let diagnostic =
+            execute_cached_with_capabilities(&compiled, &mut invalid_cache, &invalid_environment)
+                .unwrap_err();
+        assert!(diagnostic[0].message.contains("is not an i64"));
+        assert_eq!(invalid_cache.stats().stores, 0);
+
+        let first_environment = FixedEnvironment::one("MODE", b"41");
+        let mut cache = TransformResultCache::default();
+        let first =
+            execute_cached_with_capabilities(&compiled, &mut cache, &first_environment).unwrap();
+        assert_eq!(first.bindings["result"].data, ValueData::Integer(41));
+        let first_lineage = first.bindings["result"].lineage.as_ref().unwrap();
+        let LineageNode::Invocation(first_invocation) = first_lineage.node() else {
+            panic!("expected invocation lineage")
+        };
+        assert_eq!(first_invocation.observations.len(), 1);
+        let LineageNode::ExternalObservation(observation) = first_invocation.observations[0].node()
+        else {
+            panic!("expected external observation")
+        };
+        assert_eq!(observation.capability.as_ref(), "environment");
+        assert_eq!(observation.key.as_ref(), b"MODE");
+        assert_eq!(observation.observed_content, byte_content_identity(b"41"));
+
+        let second_environment = FixedEnvironment::one("MODE", b"42");
+        let second =
+            execute_cached_with_capabilities(&compiled, &mut cache, &second_environment).unwrap();
+        assert_eq!(second.bindings["result"].data, ValueData::Integer(42));
+        assert_ne!(
+            first_lineage.recipe_id(),
+            second.bindings["result"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id()
+        );
+        assert_eq!(cache.stats().stores, 2);
+    }
+
+    #[test]
+    fn replay_revalidates_and_reexecutes_environment_dependencies() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform configured() -> i64 { return environment_i64(\"MODE\") }\n\
+             result = configured()\n",
+        )
+        .unwrap();
+        let environment = FixedEnvironment::one("MODE", b"41");
+        let mut cache = TransformResultCache::default();
+        let execution =
+            execute_cached_with_capabilities(&compiled, &mut cache, &environment).unwrap();
+        let target = execution.bindings["result"].clone();
+        cache.invalidate_recipe(target.lineage.as_ref().unwrap().recipe_id().unwrap());
+
+        let replayed =
+            replay_with_capabilities(&compiled, &target, &mut cache, &environment).unwrap();
+        assert_eq!(replayed.data, ValueData::Integer(41));
+        assert_eq!(replayed.lineage, target.lineage);
+
+        let changed = FixedEnvironment::one("MODE", b"42");
+        let diagnostic =
+            replay_with_capabilities(&compiled, &target, &mut cache, &changed).unwrap_err();
+        assert!(diagnostic.message.contains("expected external"));
     }
 
     #[test]
@@ -1805,6 +2137,63 @@ mod tests {
             unreachable!()
         };
         assert_eq!(reference_lineage.recipe_id, native_lineage.recipe_id);
+    }
+
+    #[test]
+    fn generated_c_reads_environment_through_the_host_capability() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform read_mode() -> i64 { return environment_i64(\"MODE\") }\n\
+             transform configured() -> i64 { return read_mode() }\n\
+             result = configured()\n",
+        )
+        .unwrap();
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+
+        let diagnostic = execute_native(&compiled, &native).unwrap_err();
+        assert!(
+            diagnostic[0]
+                .message
+                .contains("environment access is unavailable")
+        );
+        assert_eq!(
+            diagnostic[0].labels[0].span,
+            compiled.transforms.transforms[0].values[0].span
+        );
+
+        let environment = FixedEnvironment::one("MODE", b"73");
+        let mut reference_cache = TransformResultCache::default();
+        let reference =
+            execute_cached_with_capabilities(&compiled, &mut reference_cache, &environment)
+                .unwrap();
+        let mut native_cache = TransformResultCache::default();
+        let execution = execute_native_cached_with_capabilities(
+            &compiled,
+            &native,
+            &mut native_cache,
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(execution.bindings["result"].data, ValueData::Integer(73));
+        assert_eq!(
+            execution.bindings["result"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id(),
+            reference.bindings["result"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id()
+        );
     }
 
     #[test]

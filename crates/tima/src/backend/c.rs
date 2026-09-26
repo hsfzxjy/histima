@@ -4,12 +4,12 @@ use crate::abi::{self, TIMA_ABI_VERSION};
 use crate::ast::BinaryOp;
 use crate::backend::{NativeArtifact, NativeBackend};
 use crate::diagnostic::Diagnostic;
-use crate::ir::{Constant, Terminator, Transform, TypedModule, ValueId, ValueKind};
+use crate::ir::{Constant, RuntimeCall, Terminator, Transform, TypedModule, ValueId, ValueKind};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "2";
+pub const C_BACKEND_VERSION: &str = "3";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -22,7 +22,9 @@ impl NativeBackend for CBackend {
         source.push_str(
             "typedef struct { unsigned char *data; size_t width; size_t height; size_t stride; } TimaImage;\n\
              typedef struct { const unsigned char *data; size_t width; size_t height; size_t stride; } TimaImageView;\n\
-             typedef union { bool boolean; int64_t i64_value; float f32_value; TimaImage image; TimaImageView image_view; } TimaValue;\n\n\
+             typedef union { bool boolean; int64_t i64_value; float f32_value; TimaImage image; TimaImageView image_view; } TimaValue;\n\
+             typedef int32_t (*TimaEnvironmentI64Fn)(void *context, uint32_t transform, uint32_t callsite, const unsigned char *name, size_t name_len, int64_t *result);\n\
+             typedef struct { void *context; TimaEnvironmentI64Fn environment_i64; int32_t status; } TimaRuntime;\n\n\
              #if defined(_WIN32)\n\
              #define TIMA_EXPORT __declspec(dllexport)\n\
              int _fltused = 0;\n\
@@ -30,6 +32,23 @@ impl NativeBackend for CBackend {
              #define TIMA_EXPORT __attribute__((visibility(\"default\")))\n\
              #endif\n\n",
         );
+
+        if module.transforms.iter().any(|transform| {
+            transform
+                .values
+                .iter()
+                .any(|value| matches!(value.kind, ValueKind::RuntimeCall(_)))
+        }) {
+            source.push_str(
+                "static int64_t tima_environment_i64(TimaRuntime *runtime, uint32_t transform, uint32_t callsite, const unsigned char *name, size_t name_len) {\n\
+                 int64_t result = 0;\n\
+                 if (runtime->status != 0) return 0;\n\
+                 if (runtime->environment_i64 == NULL) { runtime->status = -2; return 0; }\n\
+                 runtime->status = runtime->environment_i64(runtime->context, transform, callsite, name, name_len, &result);\n\
+                 return runtime->status == 0 ? result : 0;\n\
+                 }\n\n",
+            );
+        }
 
         writeln!(
             source,
@@ -44,7 +63,7 @@ impl NativeBackend for CBackend {
         source.push('\n');
         for (index, transform) in module.transforms.iter().enumerate() {
             prototype(&mut source, index, transform);
-            source.push_str(" {\n");
+            source.push_str(" {\n    (void)runtime;\n");
             let block = &transform.blocks[transform.entry.0 as usize];
             for id in &block.instructions {
                 let value = transform.value(*id);
@@ -53,7 +72,7 @@ impl NativeBackend for CBackend {
                     "    {} v{} = {};",
                     abi::lower_type(value.ty).c_name,
                     id.0,
-                    expression(transform, *id)
+                    expression(transform, index, *id)
                 )
                 .unwrap();
             }
@@ -81,25 +100,25 @@ impl NativeBackend for CBackend {
 fn abi_adapter(output: &mut String, index: usize, transform: &Transform) {
     writeln!(
         output,
-        "TIMA_EXPORT int32_t tima_invoke_{index}(const TimaValue *args, TimaValue *result) {{"
+        "TIMA_EXPORT int32_t tima_invoke_{index}(TimaRuntime *runtime, const TimaValue *args, TimaValue *result) {{"
     )
     .unwrap();
+    output.push_str("    if (runtime == NULL) return -1;\n    runtime->status = 0;\n");
     if transform.parameters.is_empty() {
         output.push_str("    (void)args;\n");
     }
     write!(
         output,
-        "    result->{} = tima_transform_{index}(",
+        "    TimaValue output = {{0}};\n    output.{} = tima_transform_{index}(runtime",
         abi_field(transform.return_type),
     )
     .unwrap();
     for (argument, parameter) in transform.parameters.iter().enumerate() {
-        if argument != 0 {
-            output.push_str(", ");
-        }
-        write!(output, "args[{argument}].{}", abi_field(parameter.ty)).unwrap();
+        write!(output, ", args[{argument}].{}", abi_field(parameter.ty)).unwrap();
     }
-    output.push_str(");\n    return 0;\n}\n\n");
+    output.push_str(
+        ");\n    if (runtime->status != 0) return runtime->status;\n    *result = output;\n    return 0;\n}\n\n",
+    );
 }
 
 fn abi_field(ty: crate::ir::Type) -> &'static str {
@@ -115,29 +134,23 @@ fn abi_field(ty: crate::ir::Type) -> &'static str {
 fn prototype(output: &mut String, index: usize, transform: &Transform) {
     write!(
         output,
-        "{} tima_transform_{index}(",
+        "{} tima_transform_{index}(TimaRuntime *runtime",
         abi::lower_type(transform.return_type).c_name,
     )
     .unwrap();
     for (index, parameter) in transform.parameters.iter().enumerate() {
-        if index != 0 {
-            output.push_str(", ");
-        }
         write!(
             output,
-            "{} p{}",
+            ", {} p{}",
             abi::lower_type(parameter.ty).c_name,
             index
         )
         .unwrap();
     }
-    if transform.parameters.is_empty() {
-        output.push_str("void");
-    }
     output.push(')');
 }
 
-fn expression(transform: &Transform, id: ValueId) -> String {
+fn expression(transform: &Transform, transform_index: usize, id: ValueId) -> String {
     match &transform.value(id).kind {
         ValueKind::Parameter { index } => format!("p{index}"),
         ValueKind::Constant(Constant::Bool(value)) => value.to_string(),
@@ -165,7 +178,24 @@ fn expression(transform: &Transform, id: ValueId) -> String {
                 .map(|argument| value_name(transform, *argument))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("tima_transform_{}({arguments})", callee.0)
+            if arguments.is_empty() {
+                format!("tima_transform_{}(runtime)", callee.0)
+            } else {
+                format!("tima_transform_{}(runtime, {arguments})", callee.0)
+            }
+        }
+        ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
+            let bytes = name
+                .as_bytes()
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "tima_environment_i64(runtime, {transform_index}, {}, (const unsigned char[]){{{bytes}}}, {})",
+                id.0,
+                name.len(),
+            )
         }
     }
 }
@@ -192,12 +222,12 @@ mod tests {
         assert!(
             artifact
                 .source
-                .contains("float tima_transform_0(float p0, float p1)")
+                .contains("float tima_transform_0(TimaRuntime *runtime, float p0, float p1)")
         );
         assert!(artifact.source.contains("float v2 = (p0 * p1);"));
         assert!(artifact.source.contains("return v2;"));
         assert!(artifact.source.contains(
-            "result->f32_value = tima_transform_0(args[0].f32_value, args[1].f32_value);"
+            "output.f32_value = tima_transform_0(runtime, args[0].f32_value, args[1].f32_value);"
         ));
     }
 
@@ -213,23 +243,44 @@ mod tests {
         assert!(
             artifact
                 .source
-                .contains("TimaImage tima_transform_0(TimaImage p0)")
+                .contains("TimaImage tima_transform_0(TimaRuntime *runtime, TimaImage p0)")
         );
         assert!(
             artifact
                 .source
-                .contains("TimaImageView tima_transform_1(TimaImageView p0)")
+                .contains("TimaImageView tima_transform_1(TimaRuntime *runtime, TimaImageView p0)")
         );
         assert!(
             artifact
                 .source
-                .contains("result->image = tima_transform_0(args[0].image);")
+                .contains("output.image = tima_transform_0(runtime, args[0].image);")
         );
         assert!(
             artifact
                 .source
-                .contains("result->image_view = tima_transform_1(args[0].image_view);")
+                .contains("output.image_view = tima_transform_1(runtime, args[0].image_view);")
         );
+    }
+
+    #[test]
+    fn emits_environment_reads_through_the_runtime_context() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform configured() -> i64 { return environment_i64(\"MODE\") }\n",
+        )
+        .unwrap();
+        let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(
+            artifact
+                .source
+                .contains("int64_t tima_transform_0(TimaRuntime *runtime)")
+        );
+        assert!(artifact.source.contains(
+            "tima_environment_i64(runtime, 0, 0, (const unsigned char[]){77, 79, 68, 69}, 4)"
+        ));
+        assert!(artifact.source.contains(
+            "TIMA_EXPORT int32_t tima_invoke_0(TimaRuntime *runtime, const TimaValue *args, TimaValue *result)"
+        ));
     }
 
     #[test]
