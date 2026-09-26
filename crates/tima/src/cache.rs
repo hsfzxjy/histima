@@ -47,6 +47,10 @@ pub struct TransformResultCache {
 }
 
 impl TransformResultCache {
+    pub fn remember(&mut self, value: &OuterValue) -> Result<ContentIdentity, CacheError> {
+        self.content.insert(value)
+    }
+
     pub fn lookup(&mut self, recipe: RecipeIdentity) -> Result<Option<OuterValue>, CacheError> {
         let Some(expected_content) = self.recipes.get(&recipe).copied() else {
             self.stats.misses += 1;
@@ -90,6 +94,10 @@ impl TransformResultCache {
 
     pub fn content(&self) -> &ContentStore {
         &self.content
+    }
+
+    pub fn invalidate_recipe(&mut self, recipe: RecipeIdentity) -> Option<ContentIdentity> {
+        self.recipes.remove(&recipe)
     }
 
     pub fn stats(&self) -> CacheStats {

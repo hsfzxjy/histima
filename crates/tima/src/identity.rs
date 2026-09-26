@@ -118,6 +118,13 @@ impl TransformIdentities {
     pub fn iter(&self) -> impl Iterator<Item = TransformIdentity> + '_ {
         self.values.iter().copied()
     }
+
+    pub fn find_id(&self, identity: TransformIdentity) -> Option<TransformId> {
+        self.values
+            .iter()
+            .position(|candidate| *candidate == identity)
+            .map(|index| TransformId(index as u32))
+    }
 }
 
 pub fn transform_identities(module: &TypedModule) -> Result<TransformIdentities, Vec<Diagnostic>> {

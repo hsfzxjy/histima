@@ -9,5 +9,6 @@ transform scale(value: f32, factor: f32) -> f32 {
 }
 
 result = 8.0 | scale(factor=0.25)
+replayed = replay(result)
 
 trace(result)

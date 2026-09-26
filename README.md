@@ -51,6 +51,12 @@ lineage from the current semantic invocation rather than recording cache
 execution history; conflicting content for one recipe is rejected as a
 reproducibility failure.
 
+`replay(value)` now resolves the recorded transform by semantic identity,
+validates recorded external observations, restores exact scalar arguments and
+CAS-backed materialized arguments, and either reuses the recorded Recipe ID or
+re-executes it. Re-execution must reproduce both the Recipe ID and expected
+Content ID; arbitrary ancestor substitution remains intentionally unsupported.
+
 Try the vertical slice:
 
 ```text

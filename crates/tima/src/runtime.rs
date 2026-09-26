@@ -9,8 +9,9 @@ use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::native::{AbiImage, AbiImageView, AbiValue, NativeModule};
 use crate::cache::TransformResultCache;
 use crate::diagnostic::Diagnostic;
+use crate::identity::{ContentIdentity, content_identity};
 use crate::ir::{Constant, Terminator, TransformId, Type, ValueKind};
-use crate::lineage::{Lineage, LineageArgument};
+use crate::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
 use crate::source::Span;
 
 /// An immutable outer value. Composite payloads use immutable `Arc` storage;
@@ -301,6 +302,70 @@ pub fn invoke_native_transform_cached(
     invoke_transform_with_lineage(program, &engine, transform, arguments, Some(cache))
 }
 
+/// Host hook used to validate precise external observations before replay.
+/// Phase 8 capabilities will provide concrete implementations. Replay without
+/// external observations does not require a resolver.
+pub trait ReplayDependencyResolver {
+    fn observe(&self, capability: &str, key: &[u8]) -> Result<ContentIdentity, String>;
+}
+
+pub fn replay(
+    program: &CompiledProgram,
+    target: &OuterValue,
+    cache: &mut TransformResultCache,
+) -> Result<OuterValue, Diagnostic> {
+    replay_with_dependencies(program, target, cache, None)
+}
+
+pub fn replay_with_dependencies(
+    program: &CompiledProgram,
+    target: &OuterValue,
+    cache: &mut TransformResultCache,
+    dependencies: Option<&dyn ReplayDependencyResolver>,
+) -> Result<OuterValue, Diagnostic> {
+    let engine = IrInterpreter {
+        module: &program.transforms,
+    };
+    replay_with(
+        program,
+        &engine,
+        target,
+        cache,
+        dependencies,
+        Span::default(),
+    )
+}
+
+pub fn replay_native(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    target: &OuterValue,
+    cache: &mut TransformResultCache,
+) -> Result<OuterValue, Diagnostic> {
+    replay_native_with_dependencies(program, native, target, cache, None)
+}
+
+pub fn replay_native_with_dependencies(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    target: &OuterValue,
+    cache: &mut TransformResultCache,
+    dependencies: Option<&dyn ReplayDependencyResolver>,
+) -> Result<OuterValue, Diagnostic> {
+    let engine = NativeEngine {
+        module: &program.transforms,
+        native,
+    };
+    replay_with(
+        program,
+        &engine,
+        target,
+        cache,
+        dependencies,
+        Span::default(),
+    )
+}
+
 fn execute_with(
     program: &CompiledProgram,
     engine: &dyn TransformEngine,
@@ -361,6 +426,24 @@ fn invoke_transform_with_lineage(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if let Some(cache) = cache.as_deref_mut() {
+        for (recorded, (argument, span)) in recorded.iter().zip(&arguments) {
+            let RecordedValue::Materialized { content_id, .. } = recorded.value else {
+                continue;
+            };
+            let remembered = cache
+                .remember(argument)
+                .map_err(|error| Diagnostic::error(error.to_string(), *span))?;
+            if remembered != content_id {
+                return Err(Diagnostic::error(
+                    format!(
+                        "recorded argument content identity {content_id} does not match stored content {remembered}"
+                    ),
+                    *span,
+                ));
+            }
+        }
+    }
     if !engine.may_observe_dependencies(id) {
         let lineage = Lineage::invocation(
             transform.name.as_str(),
@@ -404,6 +487,282 @@ fn invoke_transform_with_lineage(
     }
     value.lineage = Some(lineage);
     Ok(value)
+}
+
+fn replay_with(
+    program: &CompiledProgram,
+    engine: &dyn TransformEngine,
+    target: &OuterValue,
+    cache: &mut TransformResultCache,
+    dependencies: Option<&dyn ReplayDependencyResolver>,
+    span: Span,
+) -> Result<OuterValue, Diagnostic> {
+    let Some(lineage) = &target.lineage else {
+        return Err(Diagnostic::error(
+            "replay expects a value produced by a recorded transform invocation",
+            span,
+        ));
+    };
+    let expected_content = content_identity(target).map_err(|error| {
+        Diagnostic::error(
+            format!("replay target has no materialized content identity: {error}"),
+            span,
+        )
+    })?;
+    replay_lineage(
+        program,
+        engine,
+        lineage,
+        Some(expected_content),
+        cache,
+        dependencies,
+        span,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_lineage(
+    program: &CompiledProgram,
+    engine: &dyn TransformEngine,
+    lineage: &Lineage,
+    expected_content: Option<ContentIdentity>,
+    cache: &mut TransformResultCache,
+    dependencies: Option<&dyn ReplayDependencyResolver>,
+    span: Span,
+    depth: usize,
+) -> Result<OuterValue, Diagnostic> {
+    if depth >= 256 {
+        return Err(Diagnostic::error(
+            "replay lineage depth exceeded the runtime limit",
+            span,
+        ));
+    }
+    let LineageNode::Invocation(invocation) = lineage.node() else {
+        return Err(Diagnostic::error(
+            "replay expects transform invocation lineage",
+            span,
+        ));
+    };
+    let Some(transform_id) = program.identities.find_id(invocation.transform_id) else {
+        return Err(Diagnostic::error(
+            format!(
+                "recorded transform definition {} is unavailable or has changed",
+                invocation.transform_id
+            ),
+            span,
+        ));
+    };
+    let transform = program.transforms.get(transform_id);
+    if transform.parameters.len() != invocation.arguments.len() {
+        return Err(Diagnostic::error(
+            format!(
+                "recorded invocation has {} arguments, but transform `{}` now expects {}",
+                invocation.arguments.len(),
+                transform.name,
+                transform.parameters.len()
+            ),
+            span,
+        ));
+    }
+    validate_replay_dependencies(invocation, dependencies, span)?;
+
+    if let Some(mut value) = cache
+        .lookup(invocation.recipe_id)
+        .map_err(|error| Diagnostic::error(error.to_string(), span))?
+    {
+        validate_replay_content(&value, expected_content, span)?;
+        value.lineage = Some(lineage.clone());
+        return Ok(value);
+    }
+
+    let mut arguments = Vec::with_capacity(invocation.arguments.len());
+    for argument in invocation.arguments.iter() {
+        arguments.push(replay_argument(
+            program,
+            engine,
+            argument,
+            cache,
+            dependencies,
+            span,
+            depth + 1,
+        )?);
+    }
+    let runtime_arguments = arguments
+        .into_iter()
+        .map(|argument| (argument, span))
+        .collect::<Vec<_>>();
+    let TransformOutcome {
+        mut value,
+        observations,
+    } = engine.invoke(transform_id, runtime_arguments)?;
+    let observed_lineage = Lineage::invocation(
+        transform.name.as_str(),
+        program.identities.get(transform_id),
+        invocation.arguments.to_vec(),
+        observations,
+    )
+    .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+    let observed_recipe = observed_lineage
+        .recipe_id()
+        .expect("invocation lineage always has a recipe identity");
+    if observed_recipe != invocation.recipe_id {
+        return Err(Diagnostic::error(
+            format!(
+                "replay expected recipe {} but execution observed {}",
+                invocation.recipe_id, observed_recipe
+            ),
+            span,
+        )
+        .with_note("recorded external dependencies or semantic arguments no longer match"));
+    }
+    validate_replay_content(&value, expected_content, span)?;
+    cache
+        .store(invocation.recipe_id, &value)
+        .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+    value.lineage = Some(lineage.clone());
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_argument(
+    program: &CompiledProgram,
+    engine: &dyn TransformEngine,
+    argument: &LineageArgument,
+    cache: &mut TransformResultCache,
+    dependencies: Option<&dyn ReplayDependencyResolver>,
+    span: Span,
+    depth: usize,
+) -> Result<OuterValue, Diagnostic> {
+    let mut value = match &argument.value {
+        RecordedValue::Null => OuterValue::plain(ValueData::Null),
+        RecordedValue::Bool(value) => OuterValue::plain(ValueData::Bool(*value)),
+        RecordedValue::Integer(value) => OuterValue::plain(ValueData::Integer(*value)),
+        RecordedValue::Float(value) => OuterValue::plain(ValueData::Float(*value)),
+        RecordedValue::String(value) => OuterValue::plain(ValueData::String(value.clone())),
+        RecordedValue::Materialized { content_id, .. } => {
+            if let Some(value) = cache.content().get(*content_id) {
+                value
+            } else if let Some(parent) = &argument.lineage {
+                replay_lineage(
+                    program,
+                    engine,
+                    parent,
+                    Some(*content_id),
+                    cache,
+                    dependencies,
+                    span,
+                    depth,
+                )?
+            } else {
+                return Err(Diagnostic::error(
+                    format!(
+                        "replay requires materialized argument content {content_id}, but it is unavailable"
+                    ),
+                    span,
+                )
+                .with_note("restore the content-addressed input before replaying this recipe"));
+            }
+        }
+        RecordedValue::Source { locator, .. } => {
+            OuterValue::plain(ValueData::Asset(Arc::new(AssetValue {
+                locator: locator.clone(),
+            })))
+        }
+    };
+    value.lineage = argument.lineage.clone();
+    let restored = LineageArgument::record(argument.name.clone(), &value).map_err(|error| {
+        Diagnostic::error(
+            format!(
+                "cannot restore replay argument `{}`: {error}",
+                argument.name
+            ),
+            span,
+        )
+    })?;
+    if restored.semantic_identity != argument.semantic_identity {
+        return Err(Diagnostic::error(
+            format!(
+                "replay argument `{}` expected semantic identity {} but restored {}",
+                argument.name, argument.semantic_identity, restored.semantic_identity
+            ),
+            span,
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_replay_dependencies(
+    invocation: &crate::lineage::InvocationLineage,
+    resolver: Option<&dyn ReplayDependencyResolver>,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    for observation in invocation.observations.iter() {
+        let LineageNode::ExternalObservation(observation) = observation.node() else {
+            return Err(Diagnostic::error(
+                "recorded invocation contains invalid dependency lineage",
+                span,
+            ));
+        };
+        let Some(resolver) = resolver else {
+            return Err(Diagnostic::error(
+                format!(
+                    "replay requires a resolver for external `{}` dependency {:?}",
+                    observation.capability,
+                    String::from_utf8_lossy(&observation.key)
+                ),
+                span,
+            ));
+        };
+        let observed = resolver
+            .observe(&observation.capability, &observation.key)
+            .map_err(|error| {
+                Diagnostic::error(
+                    format!(
+                        "could not validate external `{}` dependency {:?}: {error}",
+                        observation.capability,
+                        String::from_utf8_lossy(&observation.key)
+                    ),
+                    span,
+                )
+            })?;
+        if observed != observation.observed_content {
+            return Err(Diagnostic::error(
+                format!(
+                    "replay expected external `{}` dependency {:?} content {} but observed {}",
+                    observation.capability,
+                    String::from_utf8_lossy(&observation.key),
+                    observation.observed_content,
+                    observed
+                ),
+                span,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_replay_content(
+    value: &OuterValue,
+    expected: Option<ContentIdentity>,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let observed = content_identity(value).map_err(|error| {
+        Diagnostic::error(
+            format!("replayed value has no materialized content identity: {error}"),
+            span,
+        )
+    })?;
+    if observed != expected {
+        return Err(Diagnostic::error(
+            format!("replay expected content hash {expected} but observed {observed}"),
+            span,
+        ));
+    }
+    Ok(())
 }
 
 struct Interpreter<'program, 'engine, 'cache> {
@@ -545,6 +904,9 @@ impl Interpreter<'_, '_, '_> {
         if name == "trace" {
             return self.trace(evaluated, span);
         }
+        if name == "replay" {
+            return self.replay_call(evaluated, span);
+        }
         let Some((id, transform)) = self.program.transforms.find(name) else {
             return Err(Diagnostic::error(
                 format!("unknown outer callable `{name}`"),
@@ -663,6 +1025,44 @@ impl Interpreter<'_, '_, '_> {
             ));
         };
         Ok(OuterValue::plain(ValueData::Lineage(lineage.clone())))
+    }
+
+    fn replay_call(
+        &mut self,
+        arguments: Vec<(Option<String>, OuterValue, Span)>,
+        span: Span,
+    ) -> Result<OuterValue, Diagnostic> {
+        if arguments.len() != 1
+            || arguments[0]
+                .0
+                .as_deref()
+                .is_some_and(|name| name != "value")
+        {
+            return Err(Diagnostic::error(
+                "replay expects exactly one derived value",
+                span,
+            ));
+        }
+        if let Some(cache) = self.cache.as_deref_mut() {
+            replay_with(
+                self.program,
+                self.engine,
+                &arguments[0].1,
+                cache,
+                None,
+                span,
+            )
+        } else {
+            let mut cache = TransformResultCache::default();
+            replay_with(
+                self.program,
+                self.engine,
+                &arguments[0].1,
+                &mut cache,
+                None,
+                span,
+            )
+        }
     }
 }
 
@@ -1111,12 +1511,13 @@ mod tests {
     use crate::backend::c::CBackend;
     use crate::backend::native::{ClangCompiler, NativeModule};
     use crate::cache::TransformResultCache;
-    use crate::identity::content_identity;
+    use crate::identity::{ContentIdentity, byte_content_identity, content_identity};
     use crate::ir::{TransformId, Type};
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
-        ImageValue, OuterValue, ValueData, execute, execute_cached, execute_native,
-        execute_native_with_bindings, invoke_native_transform, lower_native_argument,
+        ImageValue, OuterValue, ReplayDependencyResolver, ValueData, execute, execute_cached,
+        execute_native, execute_native_with_bindings_cached, invoke_native_transform,
+        lower_native_argument, replay, replay_native, replay_with_dependencies,
     };
     use crate::source::Span;
 
@@ -1216,6 +1617,119 @@ mod tests {
             unreachable!()
         };
         assert_eq!(first_lineage.recipe_id, cached_lineage.recipe_id);
+    }
+
+    #[test]
+    fn replay_builtin_reuses_the_recorded_recipe() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform scale(x: f32, factor: f32) -> f32 { return x * factor }\n\
+             result = scale(8.0, 0.25)\n\
+             replayed = replay(result)\n",
+        )
+        .unwrap();
+        let mut cache = TransformResultCache::default();
+        let execution = execute_cached(&compiled, &mut cache).unwrap();
+        assert_eq!(execution.bindings["replayed"].data, ValueData::Float(2.0));
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(
+            execution.bindings["result"].lineage,
+            execution.bindings["replayed"].lineage
+        );
+    }
+
+    #[test]
+    fn replay_reexecutes_invalidated_recipes_and_checks_content() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform scale(x: f32, factor: f32) -> f32 { return x * factor }\n\
+             result = scale(8.0, 0.25)\n",
+        )
+        .unwrap();
+        let mut cache = TransformResultCache::default();
+        let execution = execute_cached(&compiled, &mut cache).unwrap();
+        let target = execution.bindings["result"].clone();
+        let recipe = target.lineage.as_ref().unwrap().recipe_id().unwrap();
+        cache.invalidate_recipe(recipe);
+        let replayed = replay(&compiled, &target, &mut cache).unwrap();
+        assert_eq!(replayed.data, ValueData::Float(2.0));
+        assert_eq!(cache.stats().misses, 2);
+        assert_eq!(cache.stats().stores, 2);
+
+        cache.invalidate_recipe(recipe);
+        let mut incorrect_recording = target;
+        incorrect_recording.data = ValueData::Float(9.0);
+        let diagnostic = replay(&compiled, &incorrect_recording, &mut cache).unwrap_err();
+        assert!(diagnostic.message.contains("expected content hash"));
+    }
+
+    #[test]
+    fn replay_rejects_changed_transform_definitions() {
+        let original = crate::compile(
+            "old.tima",
+            "transform change(x: f32) -> f32 { return x * 2.0 }\nresult = change(4.0)\n",
+        )
+        .unwrap();
+        let mut cache = TransformResultCache::default();
+        let execution = execute_cached(&original, &mut cache).unwrap();
+        let changed = crate::compile(
+            "new.tima",
+            "transform change(x: f32) -> f32 { return x * 3.0 }\n",
+        )
+        .unwrap();
+        let diagnostic = replay(&changed, &execution.bindings["result"], &mut cache).unwrap_err();
+        assert!(diagnostic.message.contains("unavailable or has changed"));
+    }
+
+    #[test]
+    fn replay_validates_recorded_external_dependencies() {
+        struct FixedDependency(ContentIdentity);
+
+        impl ReplayDependencyResolver for FixedDependency {
+            fn observe(&self, _capability: &str, _key: &[u8]) -> Result<ContentIdentity, String> {
+                Ok(self.0)
+            }
+        }
+
+        let compiled = crate::compile(
+            "test.tima",
+            "transform keep(x: f32) -> f32 { return x }\nresult = keep(4.0)\n",
+        )
+        .unwrap();
+        let mut cache = TransformResultCache::default();
+        let execution = execute_cached(&compiled, &mut cache).unwrap();
+        let mut target = execution.bindings["result"].clone();
+        let LineageNode::Invocation(invocation) = target.lineage.as_ref().unwrap().node() else {
+            unreachable!()
+        };
+        let expected = byte_content_identity(b"font bytes");
+        let observation =
+            Lineage::external_observation("filesystem", b"font.ttf".as_slice(), expected);
+        target.lineage = Some(
+            Lineage::invocation(
+                invocation.transform_name.clone(),
+                invocation.transform_id,
+                invocation.arguments.to_vec(),
+                vec![observation],
+            )
+            .unwrap(),
+        );
+        let diagnostic = replay(&compiled, &target, &mut cache).unwrap_err();
+        assert!(diagnostic.message.contains("requires a resolver"));
+
+        let wrong = FixedDependency(byte_content_identity(b"changed font"));
+        let diagnostic =
+            replay_with_dependencies(&compiled, &target, &mut cache, Some(&wrong)).unwrap_err();
+        assert!(diagnostic.message.contains("expected external"));
+
+        let recipe = target.lineage.as_ref().unwrap().recipe_id().unwrap();
+        cache.store(recipe, &target).unwrap();
+        let matching = FixedDependency(expected);
+        let replayed =
+            replay_with_dependencies(&compiled, &target, &mut cache, Some(&matching)).unwrap();
+        assert_eq!(replayed.data, ValueData::Float(4.0));
+        assert_eq!(replayed.lineage, target.lineage);
     }
 
     #[test]
@@ -1381,10 +1895,12 @@ mod tests {
         let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
         let input_content = content_identity(&input).unwrap();
         let input = input.with_lineage(Lineage::observed_source("cat.raw", input_content));
-        let execution = execute_native_with_bindings(
+        let mut cache = TransformResultCache::default();
+        let execution = execute_native_with_bindings_cached(
             &compiled,
             &native,
             BTreeMap::from([("img".to_owned(), input)]),
+            &mut cache,
         )
         .unwrap();
         let ValueData::Image(original) = &execution.bindings["img"].data else {
@@ -1408,6 +1924,14 @@ mod tests {
         assert!(owned_trace.contains("source \"cat.raw\""));
         assert!(owned_trace.contains("invoke own"));
         assert!(owned_trace.contains("from=#0"));
+        let owned_value = execution.bindings["owned"].clone();
+        let recipe = owned_value.lineage.as_ref().unwrap().recipe_id().unwrap();
+        cache.invalidate_recipe(recipe);
+        let replayed = replay_native(&compiled, &native, &owned_value, &mut cache).unwrap();
+        let ValueData::Image(replayed) = replayed.data else {
+            panic!("expected replayed image")
+        };
+        assert_eq!(replayed.bytes(), original.bytes());
     }
 
     #[test]
