@@ -165,8 +165,14 @@ struct Lowerer<'a> {
     declaration: &'a ast::TransformDecl,
     environment: BTreeMap<String, (ValueId, crate::source::Span)>,
     values: Vec<Value>,
-    instructions: Vec<ValueId>,
+    blocks: Vec<PendingBlock>,
+    current_block: BlockId,
     diagnostics: Vec<Diagnostic>,
+}
+
+struct PendingBlock {
+    instructions: Vec<ValueId>,
+    terminator: Option<Terminator>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -181,13 +187,17 @@ impl<'a> Lowerer<'a> {
             declaration,
             environment: BTreeMap::new(),
             values: Vec::new(),
-            instructions: Vec::new(),
+            blocks: vec![PendingBlock {
+                instructions: Vec::new(),
+                terminator: None,
+            }],
+            current_block: BlockId(0),
             diagnostics: Vec::new(),
         }
     }
 
     fn lower(mut self) -> Result<Transform, Vec<Diagnostic>> {
-        let signature = &self.signatures[&self.declaration.name];
+        let signature = self.signatures[&self.declaration.name].clone();
         let mut parameters = Vec::new();
         for (index, (syntax, (_, ty))) in self
             .declaration
@@ -214,85 +224,167 @@ impl<'a> Lowerer<'a> {
             });
         }
 
-        let mut return_value = None;
-        let mut saw_return = false;
-        for statement in &self.declaration.body {
-            if saw_return {
-                let span = match statement {
-                    InnerStmt::Binding(binding) => binding.span,
-                    InnerStmt::Return { span, .. } => *span,
-                };
-                self.diagnostics.push(Diagnostic::error(
-                    "inner statements cannot appear after `return`",
-                    span,
-                ));
-                continue;
-            }
-            match statement {
-                InnerStmt::Binding(binding) => {
-                    if let Some((_, previous_span)) = self.environment.get(&binding.name) {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                format!(
-                                    "inner value `{}` is already defined in this transform",
-                                    binding.name
-                                ),
-                                binding.name_span,
-                            )
-                            .with_label(*previous_span, "previous definition is here")
-                            .with_note("inner local bindings are immutable and cannot shadow"),
-                        );
-                        continue;
-                    }
-                    if let Some(value) = self.expression(binding.value) {
-                        self.environment
-                            .insert(binding.name.clone(), (value, binding.name_span));
-                    }
-                }
-                InnerStmt::Return { value, .. } => {
-                    saw_return = true;
-                    return_value = self.expression(*value);
-                }
-            }
-        }
-        if !saw_return {
+        let body = self.declaration.body.clone();
+        if !self.lower_statements(&body) {
             self.diagnostics.push(
                 Diagnostic::error("transform body must return a value", self.declaration.span)
-                    .with_note("a transform body must end with `return <expression>`"),
+                    .with_note("a transform body must end with `return` or a fully returning `if`"),
             );
-        }
-
-        if let Some(return_value) = return_value {
-            let actual = self.values[return_value.0 as usize].ty;
-            if actual != signature.return_type {
-                self.diagnostics.push(Diagnostic::error(
-                    format!(
-                        "transform `{}` returns {}, but its declared result is {}",
-                        self.declaration.name,
-                        actual.name(),
-                        signature.return_type.name()
-                    ),
-                    self.values[return_value.0 as usize].span,
-                ));
-            }
         }
 
         if !self.diagnostics.is_empty() {
             return Err(self.diagnostics);
         }
-        let return_value = return_value.expect("no diagnostics implies return value");
+        let blocks = self
+            .blocks
+            .into_iter()
+            .map(|block| BasicBlock {
+                instructions: block.instructions,
+                terminator: block
+                    .terminator
+                    .expect("valid lowered blocks are terminated"),
+            })
+            .collect();
         Ok(Transform {
             name: self.declaration.name.clone(),
             parameters,
             return_type: signature.return_type,
             values: self.values,
-            blocks: vec![BasicBlock {
-                instructions: self.instructions,
-                terminator: Terminator::Return(return_value),
-            }],
+            blocks,
             entry: BlockId(0),
             span: self.declaration.span,
         })
+    }
+
+    fn lower_statements(&mut self, statements: &[InnerStmt]) -> bool {
+        let mut terminated = false;
+        for statement in statements {
+            if terminated {
+                self.diagnostics.push(Diagnostic::error(
+                    "inner statements cannot appear after `return` or a terminating `if`",
+                    inner_statement_span(statement),
+                ));
+                continue;
+            }
+            match statement {
+                InnerStmt::Binding(binding) => self.local_binding(binding),
+                InnerStmt::Return { value, .. } => {
+                    terminated = true;
+                    if let Some(value) = self.expression(*value) {
+                        self.check_return_type(value);
+                        self.terminate(Terminator::Return(value));
+                    }
+                }
+                InnerStmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                    span,
+                } => {
+                    terminated = true;
+                    self.conditional(*condition, then_body, else_body, *span);
+                }
+            }
+        }
+        terminated
+    }
+
+    fn local_binding(&mut self, binding: &ast::Binding) {
+        if let Some((_, previous_span)) = self.environment.get(&binding.name) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "inner value `{}` is already defined in this transform",
+                        binding.name
+                    ),
+                    binding.name_span,
+                )
+                .with_label(*previous_span, "previous definition is here")
+                .with_note("inner local bindings are immutable and cannot shadow"),
+            );
+            return;
+        }
+        if let Some(value) = self.expression(binding.value) {
+            self.environment
+                .insert(binding.name.clone(), (value, binding.name_span));
+        }
+    }
+
+    fn conditional(
+        &mut self,
+        condition: ExprId,
+        then_body: &[InnerStmt],
+        else_body: &[InnerStmt],
+        span: crate::source::Span,
+    ) {
+        let Some(condition) = self.expression(condition) else {
+            return;
+        };
+        let condition_type = self.values[condition.0 as usize].ty;
+        if condition_type != Type::Bool {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "inner `if` condition must be bool, not {}",
+                    condition_type.name()
+                ),
+                self.values[condition.0 as usize].span,
+            ));
+            return;
+        }
+
+        let then_block = self.new_block();
+        let else_block = self.new_block();
+        self.terminate(Terminator::Branch {
+            condition,
+            then_block,
+            else_block,
+        });
+
+        let outer_environment = self.environment.clone();
+        self.current_block = then_block;
+        self.environment = outer_environment.clone();
+        let then_returns = self.lower_statements(then_body);
+
+        self.current_block = else_block;
+        self.environment = outer_environment.clone();
+        let else_returns = self.lower_statements(else_body);
+        self.environment = outer_environment;
+
+        if !then_returns || !else_returns {
+            self.diagnostics.push(
+                Diagnostic::error("both inner `if` branches must return a value", span)
+                    .with_note("branch joins and value merging are not part of this slice"),
+            );
+        }
+    }
+
+    fn check_return_type(&mut self, value: ValueId) {
+        let actual = self.values[value.0 as usize].ty;
+        let expected = self.signatures[&self.declaration.name].return_type;
+        if actual != expected {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "transform `{}` returns {}, but its declared result is {}",
+                    self.declaration.name,
+                    actual.name(),
+                    expected.name()
+                ),
+                self.values[value.0 as usize].span,
+            ));
+        }
+    }
+
+    fn new_block(&mut self) -> BlockId {
+        let id = BlockId(self.blocks.len() as u32);
+        self.blocks.push(PendingBlock {
+            instructions: Vec::new(),
+            terminator: None,
+        });
+        id
+    }
+
+    fn terminate(&mut self, terminator: Terminator) {
+        self.blocks[self.current_block.0 as usize].terminator = Some(terminator);
     }
 
     fn expression(&mut self, id: ExprId) -> Option<ValueId> {
@@ -462,7 +554,9 @@ impl<'a> Lowerer<'a> {
         let id = ValueId(self.values.len() as u32);
         self.values.push(Value { ty, kind, span });
         if instruction {
-            self.instructions.push(id);
+            self.blocks[self.current_block.0 as usize]
+                .instructions
+                .push(id);
         }
         id
     }
@@ -509,6 +603,13 @@ impl<'a> Lowerer<'a> {
     }
 }
 
+fn inner_statement_span(statement: &InnerStmt) -> crate::source::Span {
+    match statement {
+        InnerStmt::Binding(binding) => binding.span,
+        InnerStmt::Return { span, .. } | InnerStmt::If { span, .. } => *span,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{compile, ir};
@@ -545,6 +646,70 @@ mod tests {
             transform.blocks[0].terminator,
             ir::Terminator::Return(ir::ValueId(4))
         ));
+    }
+
+    #[test]
+    fn lowers_terminating_conditionals_to_backend_neutral_cfg() {
+        let compiled = compile(
+            "test.tima",
+            "transform choose(flag: bool, left: f32, right: f32) -> f32 {\n\
+                 if flag {\n\
+                     selected = left\n\
+                     return selected\n\
+                 } else {\n\
+                     selected = right\n\
+                     return selected\n\
+                 }\n\
+             }\n",
+        )
+        .unwrap();
+        let transform = &compiled.transforms.transforms[0];
+        assert_eq!(transform.blocks.len(), 3);
+        assert!(matches!(
+            transform.blocks[0].terminator,
+            ir::Terminator::Branch {
+                condition: ir::ValueId(0),
+                then_block: ir::BlockId(1),
+                else_block: ir::BlockId(2),
+            }
+        ));
+        assert!(matches!(
+            transform.blocks[1].terminator,
+            ir::Terminator::Return(ir::ValueId(1))
+        ));
+        assert!(matches!(
+            transform.blocks[2].terminator,
+            ir::Terminator::Return(ir::ValueId(2))
+        ));
+    }
+
+    #[test]
+    fn rejects_non_bool_conditions_and_non_returning_branches() {
+        let non_bool = compile(
+            "test.tima",
+            "transform bad(value: f32) -> f32 {\n\
+                 if value { return value } else { return value }\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            non_bool
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("condition must be bool"))
+        );
+
+        let missing_return = compile(
+            "test.tima",
+            "transform bad(flag: bool, value: f32) -> f32 {\n\
+                 if flag { selected = value } else { return value }\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(missing_return.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("both inner `if` branches must return")
+        }));
     }
 
     #[test]

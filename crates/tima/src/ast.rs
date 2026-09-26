@@ -57,7 +57,16 @@ pub struct TypeRef {
 #[derive(Clone, Debug)]
 pub enum InnerStmt {
     Binding(Binding),
-    Return { value: ExprId, span: Span },
+    Return {
+        value: ExprId,
+        span: Span,
+    },
+    If {
+        condition: ExprId,
+        then_body: Vec<InnerStmt>,
+        else_body: Vec<InnerStmt>,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug)]

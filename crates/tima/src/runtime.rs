@@ -1247,47 +1247,67 @@ impl IrInterpreter<'_> {
         for (parameter, (argument, span)) in transform.parameters.iter().zip(arguments) {
             values[parameter.value.0 as usize] = Some(lower_scalar(argument, parameter.ty, *span)?);
         }
-        let block = &transform.blocks[transform.entry.0 as usize];
-        for id in &block.instructions {
-            let value = transform.value(*id);
-            let evaluated = match &value.kind {
-                ValueKind::Parameter { .. } => unreachable!(),
-                ValueKind::Constant(constant) => match constant {
-                    Constant::Bool(value) => NativeScalar::Bool(*value),
-                    Constant::I64(value) => NativeScalar::I64(*value),
-                    Constant::F32(value) => NativeScalar::F32(*value),
-                },
-                ValueKind::Binary { op, left, right } => native_binary(
-                    *op,
-                    values[left.0 as usize].unwrap(),
-                    values[right.0 as usize].unwrap(),
-                    value.span,
-                )?,
-                ValueKind::Call {
-                    transform: callee,
-                    arguments,
+        let mut current = transform.entry;
+        loop {
+            let block = &transform.blocks[current.0 as usize];
+            for id in &block.instructions {
+                let value = transform.value(*id);
+                let evaluated = match &value.kind {
+                    ValueKind::Parameter { .. } => unreachable!(),
+                    ValueKind::Constant(constant) => match constant {
+                        Constant::Bool(value) => NativeScalar::Bool(*value),
+                        Constant::I64(value) => NativeScalar::I64(*value),
+                        Constant::F32(value) => NativeScalar::F32(*value),
+                    },
+                    ValueKind::Binary { op, left, right } => native_binary(
+                        *op,
+                        values[left.0 as usize].unwrap(),
+                        values[right.0 as usize].unwrap(),
+                        value.span,
+                    )?,
+                    ValueKind::Call {
+                        transform: callee,
+                        arguments,
+                    } => {
+                        let callee_transform = self.module.get(*callee);
+                        let call_arguments = arguments
+                            .iter()
+                            .zip(&callee_transform.parameters)
+                            .map(|(argument, _)| {
+                                let scalar = values[argument.0 as usize].unwrap();
+                                (freeze_scalar(scalar), value.span)
+                            })
+                            .collect::<Vec<_>>();
+                        let result = self.invoke_at_depth(
+                            *callee,
+                            &call_arguments,
+                            depth + 1,
+                            capabilities,
+                        )?;
+                        lower_scalar(&result, callee_transform.return_type, value.span)?
+                    }
+                    ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
+                        NativeScalar::I64(capabilities.environment_i64(name, value.span)?)
+                    }
+                };
+                values[id.0 as usize] = Some(evaluated);
+            }
+            match block.terminator {
+                Terminator::Return(value) => {
+                    return Ok(freeze_scalar(values[value.0 as usize].unwrap()));
+                }
+                Terminator::Branch {
+                    condition,
+                    then_block,
+                    else_block,
                 } => {
-                    let callee_transform = self.module.get(*callee);
-                    let call_arguments = arguments
-                        .iter()
-                        .zip(&callee_transform.parameters)
-                        .map(|(argument, _)| {
-                            let scalar = values[argument.0 as usize].unwrap();
-                            (freeze_scalar(scalar), value.span)
-                        })
-                        .collect::<Vec<_>>();
-                    let result =
-                        self.invoke_at_depth(*callee, &call_arguments, depth + 1, capabilities)?;
-                    lower_scalar(&result, callee_transform.return_type, value.span)?
+                    current = match values[condition.0 as usize].unwrap() {
+                        NativeScalar::Bool(true) => then_block,
+                        NativeScalar::Bool(false) => else_block,
+                        _ => unreachable!("typed branch conditions are bool"),
+                    };
                 }
-                ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
-                    NativeScalar::I64(capabilities.environment_i64(name, value.span)?)
-                }
-            };
-            values[id.0 as usize] = Some(evaluated);
-        }
-        match block.terminator {
-            Terminator::Return(value) => Ok(freeze_scalar(values[value.0 as usize].unwrap())),
+            }
         }
     }
 }
@@ -2102,9 +2122,14 @@ mod tests {
              transform scale_twice(x: f32, factor: f32) -> f32 { return double(x * factor) }\n\
              transform keep_i64(x: i64) -> i64 { return x }\n\
              transform keep_bool(x: bool) -> bool { return x }\n\
+             transform choose(flag: bool, left: f32, right: f32) -> f32 {\n\
+                 if flag { return left } else { return right }\n\
+             }\n\
              out = 8.0 | scale_twice(factor=0.25)\n\
              count = keep_i64(7)\n\
-             flag = keep_bool(true)\n",
+             flag = keep_bool(true)\n\
+             chosen = choose(false, 3.0, 7.0)\n\
+             chosen_true = choose(true, 3.0, 7.0)\n",
         )
         .unwrap();
         let reference = execute(&compiled).unwrap();
@@ -2131,6 +2156,12 @@ mod tests {
         assert_eq!(execution.bindings["out"].data, ValueData::Float(4.0));
         assert_eq!(execution.bindings["count"].data, ValueData::Integer(7));
         assert_eq!(execution.bindings["flag"].data, ValueData::Bool(true));
+        assert_eq!(reference.bindings["chosen"].data, ValueData::Float(7.0));
+        assert_eq!(execution.bindings["chosen"].data, ValueData::Float(7.0));
+        assert_eq!(
+            execution.bindings["chosen_true"].data,
+            ValueData::Float(3.0)
+        );
         let LineageNode::Invocation(native_lineage) =
             execution.bindings["out"].lineage.as_ref().unwrap().node()
         else {
@@ -2194,6 +2225,35 @@ mod tests {
                 .unwrap()
                 .recipe_id()
         );
+    }
+
+    #[test]
+    fn untaken_branches_do_not_observe_runtime_capabilities() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform guarded(flag: bool) -> i64 {\n\
+                 if flag {\n\
+                     return environment_i64(\"MODE\")\n\
+                 } else {\n\
+                     return 7\n\
+                 }\n\
+             }\n\
+             result = guarded(false)\n",
+        )
+        .unwrap();
+        let reference = execute(&compiled).unwrap();
+        assert_eq!(reference.bindings["result"].data, ValueData::Integer(7));
+
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let execution = execute_native(&compiled, &native).unwrap();
+        assert_eq!(execution.bindings["result"].data, ValueData::Integer(7));
     }
 
     #[test]

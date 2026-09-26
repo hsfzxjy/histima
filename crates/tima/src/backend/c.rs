@@ -9,7 +9,7 @@ use crate::ir::{Constant, RuntimeCall, Terminator, Transform, TypedModule, Value
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "3";
+pub const C_BACKEND_VERSION: &str = "4";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -64,21 +64,48 @@ impl NativeBackend for CBackend {
         for (index, transform) in module.transforms.iter().enumerate() {
             prototype(&mut source, index, transform);
             source.push_str(" {\n    (void)runtime;\n");
-            let block = &transform.blocks[transform.entry.0 as usize];
-            for id in &block.instructions {
-                let value = transform.value(*id);
+            for (value_index, value) in transform.values.iter().enumerate() {
+                if matches!(value.kind, ValueKind::Parameter { .. }) {
+                    continue;
+                }
                 writeln!(
                     source,
-                    "    {} v{} = {};",
+                    "    {} v{};",
                     abi::lower_type(value.ty).c_name,
-                    id.0,
-                    expression(transform, index, *id)
+                    value_index,
                 )
                 .unwrap();
             }
-            match block.terminator {
-                Terminator::Return(value) => {
-                    writeln!(source, "    return {};", value_name(transform, value)).unwrap();
+            writeln!(source, "    goto tima_t{index}_b{};", transform.entry.0).unwrap();
+            for (block_index, block) in transform.blocks.iter().enumerate() {
+                writeln!(source, "tima_t{index}_b{block_index}:").unwrap();
+                for id in &block.instructions {
+                    writeln!(
+                        source,
+                        "    v{} = {};",
+                        id.0,
+                        expression(transform, index, *id)
+                    )
+                    .unwrap();
+                }
+                match block.terminator {
+                    Terminator::Return(value) => {
+                        writeln!(source, "    return {};", value_name(transform, value)).unwrap();
+                    }
+                    Terminator::Branch {
+                        condition,
+                        then_block,
+                        else_block,
+                    } => {
+                        writeln!(
+                            source,
+                            "    if ({}) goto tima_t{index}_b{}; else goto tima_t{index}_b{};",
+                            value_name(transform, condition),
+                            then_block.0,
+                            else_block.0,
+                        )
+                        .unwrap();
+                    }
                 }
             }
             source.push_str("}\n\n");
@@ -224,11 +251,32 @@ mod tests {
                 .source
                 .contains("float tima_transform_0(TimaRuntime *runtime, float p0, float p1)")
         );
-        assert!(artifact.source.contains("float v2 = (p0 * p1);"));
+        assert!(artifact.source.contains("float v2;"));
+        assert!(artifact.source.contains("v2 = (p0 * p1);"));
         assert!(artifact.source.contains("return v2;"));
         assert!(artifact.source.contains(
             "output.f32_value = tima_transform_0(runtime, args[0].f32_value, args[1].f32_value);"
         ));
+    }
+
+    #[test]
+    fn emits_cfg_branches_as_c_labels_and_gotos() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform choose(flag: bool, left: f32, right: f32) -> f32 {\n\
+                 if flag { return left } else { return right }\n\
+             }\n",
+        )
+        .unwrap();
+        let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(artifact.source.contains("goto tima_t0_b0;"));
+        assert!(
+            artifact
+                .source
+                .contains("if (p0) goto tima_t0_b1; else goto tima_t0_b2;")
+        );
+        assert!(artifact.source.contains("tima_t0_b1:"));
+        assert!(artifact.source.contains("tima_t0_b2:"));
     }
 
     #[test]

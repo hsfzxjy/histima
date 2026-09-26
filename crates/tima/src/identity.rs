@@ -233,6 +233,16 @@ impl TransformIdentityResolver<'_> {
                     hasher.u8(0);
                     hasher.u32(value.0);
                 }
+                Terminator::Branch {
+                    condition,
+                    then_block,
+                    else_block,
+                } => {
+                    hasher.u8(1);
+                    hasher.u32(condition.0);
+                    hasher.u32(then_block.0);
+                    hasher.u32(else_block.0);
+                }
             }
         }
         let identity = TransformIdentity(Digest::from_hasher(hasher));
@@ -708,6 +718,39 @@ mod tests {
         assert_eq!(
             first.identities.get(TransformId(0)),
             second.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
+    fn transform_identity_canonicalizes_branch_locals_but_not_branch_meaning() {
+        let first = crate::compile(
+            "first.tima",
+            "transform choose(flag: bool, a: f32, b: f32) -> f32 {\n\
+                 if flag { selected = a; return selected } else { return b }\n\
+             }\n",
+        )
+        .unwrap();
+        let renamed = crate::compile(
+            "renamed.tima",
+            "transform renamed(test: bool, left: f32, right: f32) -> f32 {\n\
+                 if test { temporary = left; return temporary } else { return right }\n\
+             }\n",
+        )
+        .unwrap();
+        let swapped = crate::compile(
+            "swapped.tima",
+            "transform choose(flag: bool, a: f32, b: f32) -> f32 {\n\
+                 if flag { return b } else { return a }\n\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first.identities.get(TransformId(0)),
+            renamed.identities.get(TransformId(0))
+        );
+        assert_ne!(
+            first.identities.get(TransformId(0)),
+            swapped.identities.get(TransformId(0))
         );
     }
 

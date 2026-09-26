@@ -99,20 +99,22 @@ impl Parser {
         self.expect(|kind| matches!(kind, TokenKind::Arrow), "`->`")?;
         let return_type = self.type_ref()?;
         self.expect(|kind| matches!(kind, TokenKind::LeftBrace), "`{`")?;
+        let (body, end) = self.inner_block()?;
+        Ok(TransformDecl {
+            name,
+            name_span,
+            parameters,
+            return_type,
+            body,
+            span: start.join(end),
+        })
+    }
+
+    fn inner_block(&mut self) -> Result<(Vec<InnerStmt>, Span), Diagnostic> {
         self.separators();
         let mut body = Vec::new();
         while !self.at(|kind| matches!(kind, TokenKind::RightBrace | TokenKind::Eof)) {
-            let statement = if self.eat(|kind| matches!(kind, TokenKind::Return)) {
-                let return_start = self.previous().span;
-                let value = self.expression()?;
-                let span = return_start.join(self.expr(value).span);
-                InnerStmt::Return { value, span }
-            } else if self.at_binding() {
-                InnerStmt::Binding(self.binding()?)
-            } else {
-                return Err(self.expected("a local binding or `return` inside the transform"));
-            };
-            body.push(statement);
+            body.push(self.inner_statement()?);
             if !self.at(|kind| {
                 matches!(
                     kind,
@@ -126,14 +128,36 @@ impl Parser {
         let end = self
             .expect(|kind| matches!(kind, TokenKind::RightBrace), "`}`")?
             .span;
-        Ok(TransformDecl {
-            name,
-            name_span,
-            parameters,
-            return_type,
-            body,
-            span: start.join(end),
-        })
+        Ok((body, end))
+    }
+
+    fn inner_statement(&mut self) -> Result<InnerStmt, Diagnostic> {
+        if self.eat(|kind| matches!(kind, TokenKind::Return)) {
+            let return_start = self.previous().span;
+            let value = self.expression()?;
+            let span = return_start.join(self.expr(value).span);
+            return Ok(InnerStmt::Return { value, span });
+        }
+        if self.eat(|kind| matches!(kind, TokenKind::If)) {
+            let start = self.previous().span;
+            let condition = self.expression()?;
+            self.expect(|kind| matches!(kind, TokenKind::LeftBrace), "`{`")?;
+            let (then_body, _) = self.inner_block()?;
+            self.inline_newlines();
+            self.expect(|kind| matches!(kind, TokenKind::Else), "`else`")?;
+            self.expect(|kind| matches!(kind, TokenKind::LeftBrace), "`{`")?;
+            let (else_body, end) = self.inner_block()?;
+            return Ok(InnerStmt::If {
+                condition,
+                then_body,
+                else_body,
+                span: start.join(end),
+            });
+        }
+        if self.at_binding() {
+            return self.binding().map(InnerStmt::Binding);
+        }
+        Err(self.expected("a local binding, `if`, or `return` inside the transform"))
     }
 
     fn type_ref(&mut self) -> Result<TypeRef, Diagnostic> {
@@ -434,5 +458,35 @@ mod tests {
         };
         assert!(matches!(transform.body[0], InnerStmt::Binding(_)));
         assert!(matches!(transform.body[1], InnerStmt::Return { .. }));
+    }
+
+    #[test]
+    fn parses_terminating_inner_conditionals_in_the_shared_statement_tree() {
+        let source = SourceFile::new(
+            "test.tima",
+            "transform choose(flag: bool, left: f32, right: f32) -> f32 {\n\
+                 if flag {\n\
+                     selected = left\n\
+                     return selected\n\
+                 } else {\n\
+                     return right\n\
+                 }\n\
+             }\n",
+        );
+        let program = parse(&source).unwrap();
+        let Item::Transform(transform) = &program.items[0] else {
+            panic!("expected transform")
+        };
+        let InnerStmt::If {
+            then_body,
+            else_body,
+            ..
+        } = &transform.body[0]
+        else {
+            panic!("expected conditional")
+        };
+        assert!(matches!(then_body[0], InnerStmt::Binding(_)));
+        assert!(matches!(then_body[1], InnerStmt::Return { .. }));
+        assert!(matches!(else_body[0], InnerStmt::Return { .. }));
     }
 }

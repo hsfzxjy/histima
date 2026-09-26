@@ -131,4 +131,9 @@ pub struct BasicBlock {
 #[derive(Clone, Debug)]
 pub enum Terminator {
     Return(ValueId),
+    Branch {
+        condition: ValueId,
+        then_block: BlockId,
+        else_block: BlockId,
+    },
 }

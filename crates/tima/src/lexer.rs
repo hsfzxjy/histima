@@ -15,6 +15,8 @@ pub enum TokenKind {
     String(String),
     Transform,
     Return,
+    If,
+    Else,
     True,
     False,
     Null,
@@ -145,6 +147,8 @@ impl Lexer<'_> {
         let kind = match text {
             "transform" => TokenKind::Transform,
             "return" => TokenKind::Return,
+            "if" => TokenKind::If,
+            "else" => TokenKind::Else,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "null" => TokenKind::Null,
@@ -235,7 +239,10 @@ mod tests {
 
     #[test]
     fn recognizes_transform_and_pipeline_tokens() {
-        let source = SourceFile::new("test", "transform f(x: f32) -> f32 { return x }\ny = 1 | f");
+        let source = SourceFile::new(
+            "test",
+            "transform f(flag: bool, x: f32) -> f32 { if flag { return x } else { return x } }\ny = 1 | f",
+        );
         let tokens = lex(&source).unwrap();
         assert!(
             tokens
@@ -244,5 +251,7 @@ mod tests {
         );
         assert!(tokens.iter().any(|token| token.kind == TokenKind::Pipe));
         assert!(tokens.iter().any(|token| token.kind == TokenKind::Arrow));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::If));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Else));
     }
 }
