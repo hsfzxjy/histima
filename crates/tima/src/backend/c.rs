@@ -9,7 +9,7 @@ use crate::ir::{Constant, RuntimeCall, Terminator, Transform, TypedModule, Value
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "6";
+pub const C_BACKEND_VERSION: &str = "7";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -46,6 +46,21 @@ impl NativeBackend for CBackend {
                  if (runtime->environment_i64 == NULL) { runtime->status = -2; return 0; }\n\
                  runtime->status = runtime->environment_i64(runtime->context, transform, callsite, name, name_len, &result);\n\
                  return runtime->status == 0 ? result : 0;\n\
+                 }\n\n",
+            );
+        }
+
+        if module.transforms.iter().any(|transform| {
+            transform
+                .values
+                .iter()
+                .any(|value| matches!(value.kind, ValueKind::ImageZero { .. }))
+        }) {
+            source.push_str(
+                "static TimaImage tima_image_zero(TimaImage image) {\n\
+                 size_t byte_len = image.height * image.stride;\n\
+                 for (size_t index = 0; index < byte_len; ++index) image.data[index] = 0;\n\
+                 return image;\n\
                  }\n\n",
             );
         }
@@ -224,6 +239,9 @@ fn expression(transform: &Transform, transform_index: usize, id: ValueId) -> Str
                 format!("tima_transform_{}(runtime, {arguments})", callee.0)
             }
         }
+        ValueKind::ImageZero { image } => {
+            format!("tima_image_zero({})", value_name(transform, *image))
+        }
         ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
             let bytes = name
                 .as_bytes()
@@ -306,6 +324,23 @@ mod tests {
         assert!(artifact.source.contains("bool v2;"));
         assert!(artifact.source.contains("v2 = (p0 < p1);"));
         assert!(artifact.source.contains("return v2;"));
+    }
+
+    #[test]
+    fn emits_owned_image_zero_from_backend_neutral_ir() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform clear(img: Image) -> Image { return image_zero(img) }\n",
+        )
+        .unwrap();
+        let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(
+            artifact
+                .source
+                .contains("static TimaImage tima_image_zero(TimaImage image)")
+        );
+        assert!(artifact.source.contains("image.data[index] = 0;"));
+        assert!(artifact.source.contains("v1 = tima_image_zero(p0);"));
     }
 
     #[test]

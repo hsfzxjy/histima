@@ -4,7 +4,7 @@ use crate::source::Span;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TransformId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -103,6 +103,11 @@ pub enum ValueKind {
     Call {
         transform: TransformId,
         arguments: Vec<ValueId>,
+    },
+    /// Consumes one uniquely owned image, zeros its byte storage in place, and
+    /// produces the same owned storage under a new value ID.
+    ImageZero {
+        image: ValueId,
     },
     RuntimeCall(RuntimeCall),
 }

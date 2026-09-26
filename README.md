@@ -29,7 +29,8 @@ and `if` statements with required `else` arms. Either branch may return early
 or fall through to a continuation; branch-local bindings do not escape that
 join. The typed IR represents control flow as explicit basic-block branches and
 jumps consumed by both the reference interpreter and C backend. Merged branch
-values, rebinding, loops, and local mutation remain intentionally unsupported.
+values, rebinding, loops, and general user-authored mutation remain intentionally
+unsupported.
 Host-provided immutable images can cross the native boundary: `Image` acquires
 unique mutable storage by transfer or detach, multiple owned arguments cannot
 alias, `ImageView` shares storage zero-copy, and returned descriptors are frozen
@@ -37,6 +38,14 @@ only when they reference storage retained by the invocation. Inner-to-inner
 calls with owned images remain disabled until the IR has explicit move/detach
 lowering. Native `i64` arithmetic is also held back until its overflow and
 division-error semantics are specified.
+
+The first concrete owned-image operation is the inner-only
+`image_zero(image)`. It consumes an owned `Image`, zeros its byte storage in
+place, and returns the same ownership under a new value; aliases to the consumed
+value are rejected, including unsafe uses after branch joins. Both the reference
+interpreter and generated-C backend implement the same typed IR operation, while
+the outer input remains immutable because shared storage is detached at the
+boundary. This is intentionally narrower than general field or buffer mutation.
 
 Every checked transform also receives a stable semantic identity derived from
 canonical typed IR and referenced transform identities. Source formatting,

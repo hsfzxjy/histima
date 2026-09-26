@@ -1287,6 +1287,30 @@ enum NativeScalar {
     F32(f32),
 }
 
+enum InterpretedValue {
+    Scalar(NativeScalar),
+    Image(InterpretedImage),
+    ImageView(Arc<ImageValue>),
+}
+
+impl InterpretedValue {
+    fn scalar(&self) -> NativeScalar {
+        match self {
+            Self::Scalar(value) => *value,
+            Self::Image(_) | Self::ImageView(_) => {
+                unreachable!("typed scalar operation received an image")
+            }
+        }
+    }
+}
+
+struct InterpretedImage {
+    storage: ImageStorage,
+    width: usize,
+    height: usize,
+    stride: usize,
+}
+
 struct IrInterpreter<'a> {
     module: &'a crate::ir::TypedModule,
     capabilities: Option<&'a dyn RuntimeCapabilities>,
@@ -1296,7 +1320,7 @@ impl IrInterpreter<'_> {
     fn invoke_at_depth(
         &self,
         id: TransformId,
-        arguments: &[(OuterValue, Span)],
+        arguments: Vec<(OuterValue, Span)>,
         depth: usize,
         capabilities: &mut CapabilitySession<'_>,
     ) -> Result<OuterValue, Diagnostic> {
@@ -1307,9 +1331,12 @@ impl IrInterpreter<'_> {
                 transform.span,
             ));
         }
-        let mut values = vec![None; transform.values.len()];
+        let mut values = (0..transform.values.len())
+            .map(|_| None)
+            .collect::<Vec<_>>();
         for (parameter, (argument, span)) in transform.parameters.iter().zip(arguments) {
-            values[parameter.value.0 as usize] = Some(lower_scalar(argument, parameter.ty, *span)?);
+            values[parameter.value.0 as usize] =
+                Some(lower_interpreted_value(argument, parameter.ty, span)?);
         }
         let mut current = transform.entry;
         loop {
@@ -1318,47 +1345,63 @@ impl IrInterpreter<'_> {
                 let value = transform.value(*id);
                 let evaluated = match &value.kind {
                     ValueKind::Parameter { .. } => unreachable!(),
-                    ValueKind::Constant(constant) => match constant {
+                    ValueKind::Constant(constant) => InterpretedValue::Scalar(match constant {
                         Constant::Bool(value) => NativeScalar::Bool(*value),
                         Constant::I64(value) => NativeScalar::I64(*value),
                         Constant::F32(value) => NativeScalar::F32(*value),
-                    },
-                    ValueKind::Binary { op, left, right } => native_binary(
-                        *op,
-                        values[left.0 as usize].unwrap(),
-                        values[right.0 as usize].unwrap(),
-                        value.span,
-                    )?,
+                    }),
+                    ValueKind::Binary { op, left, right } => {
+                        InterpretedValue::Scalar(native_binary(
+                            *op,
+                            values[left.0 as usize].as_ref().unwrap().scalar(),
+                            values[right.0 as usize].as_ref().unwrap().scalar(),
+                            value.span,
+                        )?)
+                    }
                     ValueKind::Call {
                         transform: callee,
                         arguments,
                     } => {
                         let callee_transform = self.module.get(*callee);
+                        let call_span = value.span;
                         let call_arguments = arguments
                             .iter()
                             .zip(&callee_transform.parameters)
-                            .map(|(argument, _)| {
-                                let scalar = values[argument.0 as usize].unwrap();
-                                (freeze_scalar(scalar), value.span)
+                            .map(|(argument, parameter)| {
+                                clone_interpreted_argument(
+                                    values[argument.0 as usize].as_ref().unwrap(),
+                                    parameter.ty,
+                                    value.span,
+                                )
+                                .map(|value| (value, call_span))
                             })
-                            .collect::<Vec<_>>();
-                        let result = self.invoke_at_depth(
-                            *callee,
-                            &call_arguments,
-                            depth + 1,
-                            capabilities,
-                        )?;
-                        lower_scalar(&result, callee_transform.return_type, value.span)?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let result =
+                            self.invoke_at_depth(*callee, call_arguments, depth + 1, capabilities)?;
+                        lower_interpreted_value(result, callee_transform.return_type, value.span)?
+                    }
+                    ValueKind::ImageZero { image } => {
+                        let Some(InterpretedValue::Image(mut image)) =
+                            values[image.0 as usize].take()
+                        else {
+                            unreachable!("typed image_zero input is an available owned image")
+                        };
+                        image.storage.bytes.fill(0);
+                        InterpretedValue::Image(image)
                     }
                     ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
-                        NativeScalar::I64(capabilities.environment_i64(name, value.span)?)
+                        InterpretedValue::Scalar(NativeScalar::I64(
+                            capabilities.environment_i64(name, value.span)?,
+                        ))
                     }
                 };
                 values[id.0 as usize] = Some(evaluated);
             }
             match block.terminator {
                 Terminator::Return(value) => {
-                    return Ok(freeze_scalar(values[value.0 as usize].unwrap()));
+                    return Ok(freeze_interpreted_value(
+                        values[value.0 as usize].take().unwrap(),
+                    ));
                 }
                 Terminator::Jump(target) => current = target,
                 Terminator::Branch {
@@ -1366,7 +1409,7 @@ impl IrInterpreter<'_> {
                     then_block,
                     else_block,
                 } => {
-                    current = match values[condition.0 as usize].unwrap() {
+                    current = match values[condition.0 as usize].as_ref().unwrap().scalar() {
                         NativeScalar::Bool(true) => then_block,
                         NativeScalar::Bool(false) => else_block,
                         _ => unreachable!("typed branch conditions are bool"),
@@ -1384,7 +1427,7 @@ impl TransformEngine for IrInterpreter<'_> {
         arguments: Vec<(OuterValue, Span)>,
     ) -> Result<TransformOutcome, Diagnostic> {
         let mut capabilities = CapabilitySession::new(self.capabilities);
-        let value = self.invoke_at_depth(id, &arguments, 0, &mut capabilities)?;
+        let value = self.invoke_at_depth(id, arguments, 0, &mut capabilities)?;
         Ok(TransformOutcome {
             value,
             observations: capabilities.finish(),
@@ -1761,29 +1804,86 @@ fn validate_returned_layout(
     })
 }
 
-fn lower_scalar(
-    value: &OuterValue,
+fn lower_interpreted_value(
+    value: OuterValue,
     expected: Type,
     span: Span,
-) -> Result<NativeScalar, Diagnostic> {
-    match (expected, &value.data) {
-        (Type::Bool, ValueData::Bool(value)) => Ok(NativeScalar::Bool(*value)),
-        (Type::I64, ValueData::Integer(value)) => Ok(NativeScalar::I64(*value)),
-        (Type::F32, ValueData::Float(value)) => Ok(NativeScalar::F32(*value)),
-        (Type::Image | Type::ImageView, _) => Err(
-            Diagnostic::error(
-                format!(
-                    "{} cannot cross into the transform boundary yet",
-                    expected.name()
-                ),
-                span,
-            )
-            .with_note("owned detach/view acquisition and freeze-on-return are reserved for the native boundary milestone"),
-        ),
-        _ => Err(Diagnostic::error(
-            format!("outer value cannot cross into native parameter type {}", expected.name()),
+) -> Result<InterpretedValue, Diagnostic> {
+    match (expected, value.data) {
+        (Type::Bool, ValueData::Bool(value)) => {
+            Ok(InterpretedValue::Scalar(NativeScalar::Bool(value)))
+        }
+        (Type::I64, ValueData::Integer(value)) => {
+            Ok(InterpretedValue::Scalar(NativeScalar::I64(value)))
+        }
+        (Type::F32, ValueData::Float(value)) => {
+            Ok(InterpretedValue::Scalar(NativeScalar::F32(value)))
+        }
+        (Type::Image, ValueData::Image(image)) => {
+            let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
+            let ImageValue {
+                storage,
+                width,
+                height,
+                stride,
+            } = image;
+            let storage = Arc::try_unwrap(storage)
+                .unwrap_or_else(|shared| ImageStorage::new(shared.bytes.clone()));
+            Ok(InterpretedValue::Image(InterpretedImage {
+                storage,
+                width,
+                height,
+                stride,
+            }))
+        }
+        (Type::ImageView, ValueData::Image(image)) => Ok(InterpretedValue::ImageView(image)),
+        (expected, _) => Err(Diagnostic::error(
+            format!(
+                "outer value cannot cross into native parameter type {}",
+                expected.name()
+            ),
             span,
         )),
+    }
+}
+
+fn clone_interpreted_argument(
+    value: &InterpretedValue,
+    expected: Type,
+    span: Span,
+) -> Result<OuterValue, Diagnostic> {
+    match (expected, value) {
+        (Type::Bool, InterpretedValue::Scalar(NativeScalar::Bool(value))) => {
+            Ok(freeze_scalar(NativeScalar::Bool(*value)))
+        }
+        (Type::I64, InterpretedValue::Scalar(NativeScalar::I64(value))) => {
+            Ok(freeze_scalar(NativeScalar::I64(*value)))
+        }
+        (Type::F32, InterpretedValue::Scalar(NativeScalar::F32(value))) => {
+            Ok(freeze_scalar(NativeScalar::F32(*value)))
+        }
+        (Type::ImageView, InterpretedValue::ImageView(image)) => {
+            Ok(OuterValue::image((**image).clone()))
+        }
+        (Type::Image, InterpretedValue::Image(_)) => Err(Diagnostic::error(
+            "owned Image cannot be copied into an inner transform call",
+            span,
+        )
+        .with_note("owned inner-to-inner calls require explicit move lowering")),
+        _ => unreachable!("typed inner call arguments match their parameter types"),
+    }
+}
+
+fn freeze_interpreted_value(value: InterpretedValue) -> OuterValue {
+    match value {
+        InterpretedValue::Scalar(value) => freeze_scalar(value),
+        InterpretedValue::Image(image) => OuterValue::image(ImageValue {
+            storage: Arc::new(image.storage),
+            width: image.width,
+            height: image.height,
+            stride: image.stride,
+        }),
+        InterpretedValue::ImageView(image) => OuterValue::plain(ValueData::Image(image)),
     }
 }
 
@@ -1851,10 +1951,11 @@ mod tests {
     use crate::ir::{TransformId, Type};
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
-        ImageValue, OuterValue, ReplayDependencyResolver, ValueData, execute, execute_cached,
-        execute_cached_with_capabilities, execute_native, execute_native_cached_with_capabilities,
-        execute_native_with_bindings_cached, invoke_native_transform, lower_native_argument,
-        replay, replay_native, replay_with_capabilities, replay_with_dependencies,
+        ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver, ValueData, execute,
+        execute_cached, execute_cached_with_capabilities, execute_native,
+        execute_native_cached_with_capabilities, execute_native_with_bindings_cached, execute_with,
+        invoke_native_transform, lower_native_argument, replay, replay_native,
+        replay_with_capabilities, replay_with_dependencies,
     };
     use crate::source::Span;
 
@@ -2494,6 +2595,82 @@ mod tests {
             panic!("expected replayed image")
         };
         assert_eq!(replayed.bytes(), original.bytes());
+    }
+
+    #[test]
+    fn owned_image_zero_mutates_detached_storage_in_both_engines() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform clear(img: Image) -> Image { return image_zero(img) }\n\
+             cleared = img | clear\n",
+        )
+        .unwrap();
+        let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
+        let input_content = content_identity(&input).unwrap();
+        let input = input.with_lineage(Lineage::observed_source("cat.raw", input_content));
+
+        let reference_engine = IrInterpreter {
+            module: &compiled.transforms,
+            capabilities: None,
+        };
+        let reference = execute_with(
+            &compiled,
+            &reference_engine,
+            BTreeMap::from([("img".to_owned(), input.clone())]),
+            None,
+        )
+        .unwrap();
+        let ValueData::Image(reference_result) = &reference.bindings["cleared"].data else {
+            panic!("expected reference image")
+        };
+        assert_eq!(reference_result.bytes(), &[0, 0, 0, 0]);
+
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let mut cache = TransformResultCache::default();
+        let execution = execute_native_with_bindings_cached(
+            &compiled,
+            &native,
+            BTreeMap::from([("img".to_owned(), input.clone())]),
+            &mut cache,
+        )
+        .unwrap();
+        let ValueData::Image(original) = &execution.bindings["img"].data else {
+            panic!("expected original image")
+        };
+        let ValueData::Image(native_result) = &execution.bindings["cleared"].data else {
+            panic!("expected native image")
+        };
+        assert_eq!(original.bytes(), &[1, 2, 3, 4]);
+        assert_eq!(native_result.bytes(), &[0, 0, 0, 0]);
+        assert!(!original.shares_storage_with(native_result));
+        assert_eq!(
+            reference.bindings["cleared"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id(),
+            execution.bindings["cleared"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id()
+        );
+
+        let recorded = execution.bindings["cleared"].clone();
+        let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
+        cache.invalidate_recipe(recipe);
+        let replayed = replay_native(&compiled, &native, &recorded, &mut cache).unwrap();
+        let ValueData::Image(replayed) = replayed.data else {
+            panic!("expected replayed image")
+        };
+        assert_eq!(replayed.bytes(), &[0, 0, 0, 0]);
     }
 
     #[test]

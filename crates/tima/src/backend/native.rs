@@ -16,6 +16,7 @@ use crate::identity::{
 use crate::ir::{TransformId, TypedModule};
 
 const DEFAULT_CLANG: &str = "C:/Program Files/LLVM/bin/clang.exe";
+const OPTIMIZATION: &str = "O2-fno-builtin";
 static NEXT_BUILD: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
@@ -65,7 +66,7 @@ impl ClangCompiler {
             compiler_version: &fingerprint.compiler_version,
             target: &fingerprint.target,
             cpu_features: &[],
-            optimization: "O2",
+            optimization: OPTIMIZATION,
             abi_version: generated.abi_version,
         };
         let artifact_ids = transforms
@@ -165,6 +166,7 @@ impl ClangCompiler {
             .args([
                 "-std=c11",
                 "-O2",
+                "-fno-builtin",
                 "-Wall",
                 "-Wextra",
                 "-Werror",
@@ -207,7 +209,7 @@ impl ClangCompiler {
             compiler: self.executable.clone(),
             compiler_version: fingerprint.compiler_version,
             target: fingerprint.target,
-            optimization: "O2",
+            optimization: OPTIMIZATION,
             source_path,
             library_path,
             cleanup_dir: cleanup.then_some(build_dir),
@@ -355,7 +357,7 @@ fn compiled_artifact(
         compiler: fingerprint.executable,
         compiler_version: fingerprint.compiler_version,
         target: fingerprint.target,
-        optimization: "O2",
+        optimization: OPTIMIZATION,
         source_path: directory.join("module.c"),
         library_path: directory.join("module.dll"),
         cleanup_dir: cleanup.then_some(directory),

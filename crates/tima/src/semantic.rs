@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{self, ExprId, ExprKind, InnerStmt, Item};
 use crate::diagnostic::Diagnostic;
@@ -60,13 +60,16 @@ impl<'a> Checker<'a> {
             let Item::Transform(declaration) = item else {
                 continue;
             };
-            if declaration.name == "environment_i64" {
+            if matches!(declaration.name.as_str(), "environment_i64" | "image_zero") {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        "`environment_i64` is reserved for the runtime capability call",
+                        format!(
+                            "`{}` is reserved for an inner runtime operation",
+                            declaration.name
+                        ),
                         declaration.name_span,
                     )
-                    .with_note("runtime capability builtins cannot be redefined as transforms"),
+                    .with_note("inner builtins cannot be redefined as transforms"),
                 );
                 continue;
             }
@@ -164,6 +167,7 @@ struct Lowerer<'a> {
     signatures: &'a BTreeMap<String, Signature>,
     declaration: &'a ast::TransformDecl,
     environment: BTreeMap<String, (ValueId, crate::source::Span)>,
+    moved: BTreeSet<ValueId>,
     values: Vec<Value>,
     blocks: Vec<PendingBlock>,
     current_block: BlockId,
@@ -186,6 +190,7 @@ impl<'a> Lowerer<'a> {
             signatures,
             declaration,
             environment: BTreeMap::new(),
+            moved: BTreeSet::new(),
             values: Vec::new(),
             blocks: vec![PendingBlock {
                 instructions: Vec::new(),
@@ -339,15 +344,20 @@ impl<'a> Lowerer<'a> {
         });
 
         let outer_environment = self.environment.clone();
+        let outer_moved = self.moved.clone();
         self.current_block = then_block;
         self.environment = outer_environment.clone();
+        self.moved = outer_moved.clone();
         let then_returns = self.lower_statements(then_body);
         let then_end = self.current_block;
+        let then_moved = self.moved.clone();
 
         self.current_block = else_block;
         self.environment = outer_environment.clone();
+        self.moved = outer_moved;
         let else_returns = self.lower_statements(else_body);
         let else_end = self.current_block;
+        let else_moved = self.moved.clone();
         self.environment = outer_environment;
 
         if then_returns && else_returns {
@@ -364,6 +374,12 @@ impl<'a> Lowerer<'a> {
             self.terminate(Terminator::Jump(continuation));
         }
         self.current_block = continuation;
+        self.moved = match (then_returns, else_returns) {
+            (false, false) => then_moved.union(&else_moved).copied().collect(),
+            (false, true) => then_moved,
+            (true, false) => else_moved,
+            (true, true) => unreachable!(),
+        };
         false
     }
 
@@ -418,6 +434,18 @@ impl<'a> Lowerer<'a> {
                 true,
             )),
             ExprKind::Name(name) => match self.environment.get(name).copied() {
+                Some((value, _)) if self.moved.contains(&value) => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!("owned inner value `{name}` has already been moved"),
+                            expression.span,
+                        )
+                        .with_note(
+                            "`image_zero` consumes its Image input and returns new ownership",
+                        ),
+                    );
+                    None
+                }
                 Some((value, _)) => Some(value),
                 None => {
                     self.diagnostics.push(Diagnostic::error(
@@ -505,6 +533,9 @@ impl<'a> Lowerer<'a> {
                 };
                 if name == "environment_i64" {
                     return self.environment_i64(arguments, expression.span);
+                }
+                if name == "image_zero" {
+                    return self.image_zero(arguments, expression.span);
                 }
                 let Some(signature) = self.signatures.get(name) else {
                     self.diagnostics.push(Diagnostic::error(
@@ -647,6 +678,34 @@ impl<'a> Lowerer<'a> {
             span,
             true,
         ))
+    }
+
+    fn image_zero(
+        &mut self,
+        arguments: &[ast::Argument],
+        span: crate::source::Span,
+    ) -> Option<ValueId> {
+        if arguments.len() != 1 || arguments[0].name.is_some() {
+            self.diagnostics.push(
+                Diagnostic::error("image_zero expects one positional Image argument", span)
+                    .with_note("example: cleared = image_zero(img)"),
+            );
+            return None;
+        }
+        let image = self.expression(arguments[0].value)?;
+        let actual = self.values[image.0 as usize].ty;
+        if actual != Type::Image {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("image_zero requires owned Image, not {}", actual.name()),
+                    arguments[0].span,
+                )
+                .with_note("read-only ImageView values cannot be mutated"),
+            );
+            return None;
+        }
+        self.moved.insert(image);
+        Some(self.alloc(Type::Image, ValueKind::ImageZero { image }, span, true))
     }
 }
 
@@ -924,5 +983,73 @@ mod tests {
         )
         .unwrap_err();
         assert!(diagnostics[0].message.contains("owned Image arguments"));
+    }
+
+    #[test]
+    fn lowers_consuming_owned_image_zero_and_rejects_use_after_move() {
+        let compiled = compile(
+            "test.tima",
+            "transform clear(img: Image) -> Image {\n\
+                 cleared = image_zero(img)\n\
+                 return cleared\n\
+             }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.transforms.transforms[0].values[1].kind,
+            ir::ValueKind::ImageZero {
+                image: ir::ValueId(0)
+            }
+        ));
+
+        let diagnostics = compile(
+            "moved.tima",
+            "transform bad(img: Image) -> Image {\n\
+                 cleared = image_zero(img)\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("already been moved"))
+        );
+
+        let diagnostics = compile(
+            "view.tima",
+            "transform bad(img: ImageView) -> ImageView { return image_zero(img) }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("requires owned Image"))
+        );
+    }
+
+    #[test]
+    fn owned_image_moves_are_checked_across_branch_continuations() {
+        let diagnostics = compile(
+            "join.tima",
+            "transform bad(img: Image, flag: bool) -> Image {\n\
+                 if flag { cleared = image_zero(img) } else {}\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("already been moved"))
+        );
+
+        compile(
+            "returns.tima",
+            "transform clear_if(img: Image, flag: bool) -> Image {\n\
+                 if flag { return image_zero(img) } else { return img }\n\
+             }\n",
+        )
+        .unwrap();
     }
 }

@@ -214,6 +214,10 @@ impl TransformIdentityResolver<'_> {
                         hasher.u32(argument.0);
                     }
                 }
+                ValueKind::ImageZero { image } => {
+                    hasher.u8(5);
+                    hasher.u32(image.0);
+                }
                 ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
                     hasher.u8(4);
                     hasher.u8(0);
@@ -800,6 +804,24 @@ mod tests {
         assert_ne!(
             less.identities.get(TransformId(0)),
             less_equal.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
+    fn owned_image_operation_is_part_of_transform_identity() {
+        let keep = crate::compile(
+            "keep.tima",
+            "transform image(img: Image) -> Image { return img }\n",
+        )
+        .unwrap();
+        let clear = crate::compile(
+            "clear.tima",
+            "transform image(img: Image) -> Image { return image_zero(img) }\n",
+        )
+        .unwrap();
+        assert_ne!(
+            keep.identities.get(TransformId(0)),
+            clear.identities.get(TransformId(0))
         );
     }
 
