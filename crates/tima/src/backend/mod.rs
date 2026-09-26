@@ -1,9 +1,10 @@
 pub mod c;
+pub mod native;
 
 use crate::diagnostic::Diagnostic;
 use crate::ir::TypedModule;
 
-/// A compiled representation produced from backend-neutral typed IR.
+/// A backend representation produced from backend-neutral typed IR.
 ///
 /// Semantic transform identity belongs to the IR. Backend, target, compiler,
 /// optimization settings, and `abi_version` belong to future artifact identity.

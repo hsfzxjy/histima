@@ -9,16 +9,21 @@ The Rust workspace has one `tima` crate with:
   shared by outer code and inner `transform` declarations;
 - an immutable outer value model and small interpreter;
 - static checking and backend-neutral typed control-flow IR for transforms;
-- an inspectable generated-C backend behind an IR-to-artifact interface;
+- an inspectable generated-C backend, LLVM/Clang artifact compilation, and
+  dynamic loading behind IR/backend boundaries;
 - an explicit native ABI distinction between owned `Image` and read-only,
   aliasable `ImageView`.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
-transform calls, and pipelines. Transform bodies currently contain exactly one
-typed `return` expression. `Image`/`ImageView` are represented and emitted in
-the ABI, but the runtime rejects executing them until detach/view acquisition
-and freeze-on-return are implemented.
+transform calls, and pipelines. `tima run` compiles checked scalar transforms
+to a temporary DLL with LLVM/Clang and invokes them through generated C ABI
+adapters; the IR interpreter remains available as a reference execution path.
+Transform bodies currently contain exactly one typed `return` expression.
+`Image`/`ImageView` are represented and emitted in the ABI, but the runtime
+rejects executing them until detach/view acquisition and freeze-on-return are
+implemented. Native `i64` arithmetic is also held back until its overflow and
+division-error semantics are specified.
 
 Try the vertical slice:
 
@@ -30,4 +35,3 @@ cargo run -p tima -- emit-c examples/first.tima
 
 The language and runtime contract is maintained in the local design documents
 described by `AGENTS.md`.
-

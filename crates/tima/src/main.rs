@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use tima::backend::NativeBackend;
 use tima::backend::c::CBackend;
+use tima::backend::native::{ClangCompiler, NativeModule};
 use tima::runtime::{OuterValue, ValueData};
 use tima::source::SourceFile;
 
@@ -44,11 +45,25 @@ fn run() -> Result<(), ()> {
             println!("ok: {} transform(s)", compiled.transforms.transforms.len());
         }
         "run" => {
-            let execution = tima::runtime::execute(&compiled).map_err(|diagnostics| {
+            let generated = CBackend.emit(&compiled.transforms).map_err(|diagnostics| {
                 for diagnostic in diagnostics {
                     eprint!("{}", diagnostic.render(&compiled.source));
                 }
             })?;
+            let artifact = ClangCompiler::default()
+                .compile(&generated, "build")
+                .map_err(|error| {
+                    eprintln!("error: {error}");
+                })?;
+            let native = NativeModule::load(&artifact, &compiled.transforms).map_err(|error| {
+                eprintln!("error: could not load native transform artifact: {error}");
+            })?;
+            let execution =
+                tima::runtime::execute_native(&compiled, &native).map_err(|diagnostics| {
+                    for diagnostic in diagnostics {
+                        eprint!("{}", diagnostic.render(&compiled.source));
+                    }
+                })?;
             for (name, value) in execution.bindings {
                 println!("{name} = {}", display(&value));
             }

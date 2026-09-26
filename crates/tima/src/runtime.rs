@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
+use crate::backend::native::{AbiScalar, NativeModule};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Constant, Terminator, TransformId, Type, ValueKind};
 use crate::source::Span;
@@ -56,20 +58,54 @@ pub struct Execution {
 }
 
 pub fn execute(program: &CompiledProgram) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = IrInterpreter {
+        module: &program.transforms,
+    };
+    execute_with(program, &engine)
+}
+
+/// Executes outer code while dispatching transform calls to a loaded native
+/// artifact. Outer expressions remain interpreted; only checked inner
+/// transforms cross this boundary.
+pub fn execute_native(
+    program: &CompiledProgram,
+    native: &NativeModule,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = NativeEngine {
+        module: &program.transforms,
+        native,
+    };
+    execute_with(program, &engine)
+}
+
+fn execute_with(
+    program: &CompiledProgram,
+    engine: &dyn TransformEngine,
+) -> Result<Execution, Vec<Diagnostic>> {
     Interpreter {
         program,
+        engine,
         execution: Execution::default(),
     }
     .run()
     .map_err(|diagnostic| vec![diagnostic])
 }
 
-struct Interpreter<'a> {
-    program: &'a CompiledProgram,
+trait TransformEngine {
+    fn invoke(
+        &self,
+        id: TransformId,
+        arguments: &[(OuterValue, Span)],
+    ) -> Result<OuterValue, Diagnostic>;
+}
+
+struct Interpreter<'program, 'engine> {
+    program: &'program CompiledProgram,
+    engine: &'engine dyn TransformEngine,
     execution: Execution,
 }
 
-impl<'a> Interpreter<'a> {
+impl Interpreter<'_, '_> {
     fn run(mut self) -> Result<Execution, Diagnostic> {
         for item in &self.program.syntax.items {
             match item {
@@ -256,10 +292,7 @@ impl<'a> Interpreter<'a> {
             };
             values.push(value);
         }
-        IrInterpreter {
-            module: &self.program.transforms,
-        }
-        .invoke(id, &values, 0)
+        self.engine.invoke(id, &values)
     }
 
     fn asset(
@@ -338,7 +371,7 @@ struct IrInterpreter<'a> {
 }
 
 impl IrInterpreter<'_> {
-    fn invoke(
+    fn invoke_at_depth(
         &self,
         id: TransformId,
         arguments: &[(OuterValue, Span)],
@@ -384,7 +417,7 @@ impl IrInterpreter<'_> {
                             (freeze_scalar(scalar), value.span)
                         })
                         .collect::<Vec<_>>();
-                    let result = self.invoke(*callee, &call_arguments, depth + 1)?;
+                    let result = self.invoke_at_depth(*callee, &call_arguments, depth + 1)?;
                     lower_scalar(&result, callee_transform.return_type, value.span)?
                 }
             };
@@ -393,6 +426,109 @@ impl IrInterpreter<'_> {
         match block.terminator {
             Terminator::Return(value) => Ok(freeze_scalar(values[value.0 as usize].unwrap())),
         }
+    }
+}
+
+impl TransformEngine for IrInterpreter<'_> {
+    fn invoke(
+        &self,
+        id: TransformId,
+        arguments: &[(OuterValue, Span)],
+    ) -> Result<OuterValue, Diagnostic> {
+        self.invoke_at_depth(id, arguments, 0)
+    }
+}
+
+struct NativeEngine<'a> {
+    module: &'a crate::ir::TypedModule,
+    native: &'a NativeModule,
+}
+
+impl TransformEngine for NativeEngine<'_> {
+    fn invoke(
+        &self,
+        id: TransformId,
+        arguments: &[(OuterValue, Span)],
+    ) -> Result<OuterValue, Diagnostic> {
+        self.validate_path(id, &mut BTreeSet::new(), &mut BTreeSet::new())?;
+        let transform = self.module.get(id);
+        let mut lowered = Vec::with_capacity(arguments.len());
+        for (parameter, (argument, span)) in transform.parameters.iter().zip(arguments) {
+            lowered.push(to_abi_scalar(lower_scalar(argument, parameter.ty, *span)?));
+        }
+        let result = self
+            .native
+            .invoke_scalar(id, &lowered)
+            .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
+        // SAFETY: the generated adapter writes the union field selected by
+        // the statically checked transform return type.
+        let scalar = unsafe {
+            match transform.return_type {
+                Type::Bool => NativeScalar::Bool(result.boolean != 0),
+                Type::I64 => NativeScalar::I64(result.i64_value),
+                Type::F32 => NativeScalar::F32(result.f32_value),
+                Type::Image | Type::ImageView => {
+                    return Err(Diagnostic::error(
+                        "owned/view native return freezing is not implemented yet",
+                        transform.span,
+                    ));
+                }
+            }
+        };
+        Ok(freeze_scalar(scalar))
+    }
+}
+
+impl NativeEngine<'_> {
+    fn validate_path(
+        &self,
+        id: TransformId,
+        visiting: &mut BTreeSet<u32>,
+        visited: &mut BTreeSet<u32>,
+    ) -> Result<(), Diagnostic> {
+        if visited.contains(&id.0) {
+            return Ok(());
+        }
+        let transform = self.module.get(id);
+        if !visiting.insert(id.0) {
+            return Err(Diagnostic::error(
+                "recursive transform calls are not executable in the initial native runtime",
+                transform.span,
+            )
+            .with_note("the reference interpreter retains a bounded recursion guard"));
+        }
+        for value in &transform.values {
+            match &value.kind {
+                ValueKind::Binary { .. } if value.ty == Type::I64 => {
+                    return Err(
+                        Diagnostic::error(
+                            "i64 arithmetic is not executable in the initial native runtime",
+                            value.span,
+                        )
+                        .with_note(
+                            "Tima integer overflow and division-error semantics must be chosen before mapping them to C",
+                        ),
+                    );
+                }
+                ValueKind::Call {
+                    transform: callee, ..
+                } => self.validate_path(*callee, visiting, visited)?,
+                _ => {}
+            }
+        }
+        visiting.remove(&id.0);
+        visited.insert(id.0);
+        Ok(())
+    }
+}
+
+fn to_abi_scalar(value: NativeScalar) -> AbiScalar {
+    match value {
+        NativeScalar::Bool(value) => AbiScalar {
+            boolean: u8::from(value),
+        },
+        NativeScalar::I64(value) => AbiScalar { i64_value: value },
+        NativeScalar::F32(value) => AbiScalar { f32_value: value },
     }
 }
 
@@ -408,7 +544,7 @@ fn lower_scalar(
         (Type::Image | Type::ImageView, _) => Err(
             Diagnostic::error(
                 format!(
-                    "{} cannot cross into the interpreted transform boundary yet",
+                    "{} cannot cross into the transform boundary yet",
                     expected.name()
                 ),
                 span,
@@ -452,9 +588,13 @@ fn native_binary(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
-    use crate::runtime::{ValueData, execute};
+    use crate::backend::NativeBackend;
+    use crate::backend::c::CBackend;
+    use crate::backend::native::{ClangCompiler, NativeModule};
+    use crate::runtime::{ValueData, execute, execute_native};
 
     #[test]
     fn runs_a_scalar_transform_through_a_pipeline() {
@@ -488,5 +628,52 @@ mod tests {
             panic!("expected asset")
         };
         assert_eq!(&*asset.locator, "cat.png");
+    }
+
+    #[test]
+    fn compiles_loads_and_runs_nested_transforms_as_native_code() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform double(x: f32) -> f32 { return x * 2.0 }\n\
+             transform scale_twice(x: f32, factor: f32) -> f32 { return double(x * factor) }\n\
+             transform keep_i64(x: i64) -> i64 { return x }\n\
+             transform keep_bool(x: bool) -> bool { return x }\n\
+             out = 8.0 | scale_twice(factor=0.25)\n\
+             count = keep_i64(7)\n\
+             flag = keep_bool(true)\n",
+        )
+        .unwrap();
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let execution = execute_native(&compiled, &native).unwrap();
+        assert_eq!(execution.bindings["out"].data, ValueData::Float(4.0));
+        assert_eq!(execution.bindings["count"].data, ValueData::Integer(7));
+        assert_eq!(execution.bindings["flag"].data, ValueData::Bool(true));
+    }
+
+    #[test]
+    fn native_runtime_defers_unspecified_i64_arithmetic_semantics() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform add(x: i64, y: i64) -> i64 { return x + y }\n\
+             out = add(1, 2)\n",
+        )
+        .unwrap();
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let diagnostics = execute_native(&compiled, &native).unwrap_err();
+        assert!(diagnostics[0].message.contains("i64 arithmetic"));
     }
 }
