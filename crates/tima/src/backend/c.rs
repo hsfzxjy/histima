@@ -9,7 +9,7 @@ use crate::ir::{Constant, Terminator, Transform, TypedModule, ValueId, ValueKind
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "1";
+pub const C_BACKEND_VERSION: &str = "2";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -37,13 +37,13 @@ impl NativeBackend for CBackend {
         )
         .unwrap();
 
-        for transform in &module.transforms {
-            prototype(&mut source, transform);
+        for (index, transform) in module.transforms.iter().enumerate() {
+            prototype(&mut source, index, transform);
             source.push_str(";\n");
         }
         source.push('\n');
-        for transform in &module.transforms {
-            prototype(&mut source, transform);
+        for (index, transform) in module.transforms.iter().enumerate() {
+            prototype(&mut source, index, transform);
             source.push_str(" {\n");
             let block = &transform.blocks[transform.entry.0 as usize];
             for id in &block.instructions {
@@ -53,7 +53,7 @@ impl NativeBackend for CBackend {
                     "    {} v{} = {};",
                     abi::lower_type(value.ty).c_name,
                     id.0,
-                    expression(module, transform, *id)
+                    expression(transform, *id)
                 )
                 .unwrap();
             }
@@ -89,9 +89,8 @@ fn abi_adapter(output: &mut String, index: usize, transform: &Transform) {
     }
     write!(
         output,
-        "    result->{} = tima_{}(",
+        "    result->{} = tima_transform_{index}(",
         abi_field(transform.return_type),
-        transform.name
     )
     .unwrap();
     for (argument, parameter) in transform.parameters.iter().enumerate() {
@@ -113,12 +112,11 @@ fn abi_field(ty: crate::ir::Type) -> &'static str {
     }
 }
 
-fn prototype(output: &mut String, transform: &Transform) {
+fn prototype(output: &mut String, index: usize, transform: &Transform) {
     write!(
         output,
-        "{} tima_{}(",
+        "{} tima_transform_{index}(",
         abi::lower_type(transform.return_type).c_name,
-        transform.name
     )
     .unwrap();
     for (index, parameter) in transform.parameters.iter().enumerate() {
@@ -139,7 +137,7 @@ fn prototype(output: &mut String, transform: &Transform) {
     output.push(')');
 }
 
-fn expression(module: &TypedModule, transform: &Transform, id: ValueId) -> String {
+fn expression(transform: &Transform, id: ValueId) -> String {
     match &transform.value(id).kind {
         ValueKind::Parameter { index } => format!("p{index}"),
         ValueKind::Constant(Constant::Bool(value)) => value.to_string(),
@@ -162,13 +160,12 @@ fn expression(module: &TypedModule, transform: &Transform, id: ValueId) -> Strin
             transform: callee,
             arguments,
         } => {
-            let callee = module.get(*callee);
             let arguments = arguments
                 .iter()
                 .map(|argument| value_name(transform, *argument))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("tima_{}({arguments})", callee.name)
+            format!("tima_transform_{}({arguments})", callee.0)
         }
     }
 }
@@ -195,15 +192,13 @@ mod tests {
         assert!(
             artifact
                 .source
-                .contains("float tima_scale(float p0, float p1)")
+                .contains("float tima_transform_0(float p0, float p1)")
         );
         assert!(artifact.source.contains("float v2 = (p0 * p1);"));
         assert!(artifact.source.contains("return v2;"));
-        assert!(
-            artifact
-                .source
-                .contains("result->f32_value = tima_scale(args[0].f32_value, args[1].f32_value);")
-        );
+        assert!(artifact.source.contains(
+            "result->f32_value = tima_transform_0(args[0].f32_value, args[1].f32_value);"
+        ));
     }
 
     #[test]
@@ -218,22 +213,40 @@ mod tests {
         assert!(
             artifact
                 .source
-                .contains("TimaImage tima_freeze(TimaImage p0)")
+                .contains("TimaImage tima_transform_0(TimaImage p0)")
         );
         assert!(
             artifact
                 .source
-                .contains("TimaImageView tima_inspect(TimaImageView p0)")
+                .contains("TimaImageView tima_transform_1(TimaImageView p0)")
         );
         assert!(
             artifact
                 .source
-                .contains("result->image = tima_freeze(args[0].image);")
+                .contains("result->image = tima_transform_0(args[0].image);")
         );
         assert!(
             artifact
                 .source
-                .contains("result->image_view = tima_inspect(args[0].image_view);")
+                .contains("result->image_view = tima_transform_1(args[0].image_view);")
+        );
+    }
+
+    #[test]
+    fn emitted_code_does_not_depend_on_nonsemantic_transform_names() {
+        let first = crate::compile(
+            "first.tima",
+            "transform scale(x: f32) -> f32 { return x * 2.0 }\n",
+        )
+        .unwrap();
+        let second = crate::compile(
+            "second.tima",
+            "transform renamed(value: f32) -> f32 { return value * 2.0 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::CBackend.emit(&first.transforms).unwrap().source,
+            super::CBackend.emit(&second.transforms).unwrap().source
         );
     }
 }

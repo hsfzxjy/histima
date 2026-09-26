@@ -14,6 +14,7 @@ The Rust workspace has one `tima` crate with:
 - an explicit native ABI distinction between owned `Image` and read-only,
   aliasable `ImageView`.
 - immutable semantic lineage DAGs kept entirely outside native payloads.
+- separate native-artifact and transform-result caches keyed by semantic IDs.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
@@ -41,6 +42,14 @@ and ancestor edges without retaining owned native storage. `trace(value)`
 returns the derivation as an inspectable outer value. External-observation nodes
 are represented for future runtime-mediated capabilities, but no ambient access
 is introduced by this milestone.
+
+Native C bundles are cached persistently under `build/cache` using the ordered
+Artifact IDs of their transforms and are validated against the generated source
+and compiled-library Content ID before reuse. Transform results use a separate
+Recipe-ID index over an immutable content-addressed store. Cache hits reconstruct
+lineage from the current semantic invocation rather than recording cache
+execution history; conflicting content for one recipe is rejected as a
+reproducibility failure.
 
 Try the vertical slice:
 

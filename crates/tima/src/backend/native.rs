@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::abi::TIMA_ABI_VERSION;
 use crate::backend::NativeArtifact;
 use crate::identity::{
-    ArtifactConfiguration, ArtifactIdentity, TransformIdentity, artifact_identity,
+    ArtifactBundleIdentity, ArtifactConfiguration, ArtifactIdentity, TransformIdentity,
+    artifact_bundle_identity, artifact_identity, byte_content_identity,
 };
 use crate::ir::{TransformId, TypedModule};
 
@@ -40,16 +41,110 @@ impl ClangCompiler {
         generated: &NativeArtifact,
         build_root: impl AsRef<Path>,
     ) -> Result<CompiledNativeArtifact, NativeBuildError> {
+        let fingerprint = self.fingerprint()?;
+        let sequence = NEXT_BUILD.fetch_add(1, Ordering::Relaxed);
+        let build_dir = build_root
+            .as_ref()
+            .join(format!("tima-native-{}-{sequence}", std::process::id()));
+        self.compile_into(generated, build_dir, fingerprint, true)
+    }
+
+    /// Compiles or reuses one persistent native module cache entry. Individual
+    /// transform Artifact IDs remain distinct; the bundle ID captures their
+    /// module order because generated ABI adapters are index-addressed.
+    pub fn compile_cached(
+        &self,
+        generated: &NativeArtifact,
+        transforms: &[TransformIdentity],
+        cache_root: impl AsRef<Path>,
+    ) -> Result<CachedNativeArtifact, NativeBuildError> {
+        let fingerprint = self.fingerprint()?;
+        let configuration = ArtifactConfiguration {
+            backend: generated.backend,
+            backend_version: generated.backend_version,
+            compiler_version: &fingerprint.compiler_version,
+            target: &fingerprint.target,
+            cpu_features: &[],
+            optimization: "O2",
+            abi_version: generated.abi_version,
+        };
+        let artifact_ids = transforms
+            .iter()
+            .map(|transform| artifact_identity(*transform, &configuration))
+            .collect::<Vec<_>>();
+        let bundle_id = artifact_bundle_identity(&artifact_ids);
+        let native_root = cache_root.as_ref().join("native");
+        let cache_dir = native_root.join(bundle_id.to_string());
+        if cached_module_is_valid(&cache_dir, &generated.source) {
+            return Ok(CachedNativeArtifact {
+                artifact: compiled_artifact(generated, cache_dir, fingerprint, false),
+                artifact_ids,
+                bundle_id,
+                status: NativeCacheStatus::Hit,
+            });
+        }
+
+        fs::create_dir_all(&native_root).map_err(|error| {
+            NativeBuildError::new(
+                "create native cache directory",
+                format!("{}: {error}", native_root.display()),
+            )
+        })?;
+        let sequence = NEXT_BUILD.fetch_add(1, Ordering::Relaxed);
+        let temporary_dir = native_root.join(format!(".build-{}-{sequence}", std::process::id()));
+        let mut artifact =
+            self.compile_into(generated, temporary_dir.clone(), fingerprint, true)?;
+        write_library_checksum(&temporary_dir, &artifact.library_path)?;
+        if cache_dir.exists() {
+            fs::remove_dir_all(&cache_dir).map_err(|error| {
+                NativeBuildError::new(
+                    "replace invalid native cache entry",
+                    format!("{}: {error}", cache_dir.display()),
+                )
+            })?;
+        }
+        fs::rename(&temporary_dir, &cache_dir).map_err(|error| {
+            NativeBuildError::new(
+                "publish native cache entry",
+                format!(
+                    "{} -> {}: {error}",
+                    temporary_dir.display(),
+                    cache_dir.display()
+                ),
+            )
+        })?;
+        artifact.source_path = cache_dir.join("module.c");
+        artifact.library_path = cache_dir.join("module.dll");
+        artifact.cleanup_dir = None;
+        Ok(CachedNativeArtifact {
+            artifact,
+            artifact_ids,
+            bundle_id,
+            status: NativeCacheStatus::Miss,
+        })
+    }
+
+    fn fingerprint(&self) -> Result<CompilerFingerprint, NativeBuildError> {
         let compiler_version = tool_output(&self.executable, "read clang version", &["--version"])?
             .lines()
             .next()
             .unwrap_or("unknown clang version")
             .to_owned();
         let target = tool_output(&self.executable, "read clang target", &["-dumpmachine"])?;
-        let sequence = NEXT_BUILD.fetch_add(1, Ordering::Relaxed);
-        let build_dir = build_root
-            .as_ref()
-            .join(format!("tima-native-{}-{sequence}", std::process::id()));
+        Ok(CompilerFingerprint {
+            executable: self.executable.clone(),
+            compiler_version,
+            target,
+        })
+    }
+
+    fn compile_into(
+        &self,
+        generated: &NativeArtifact,
+        build_dir: PathBuf,
+        fingerprint: CompilerFingerprint,
+        cleanup: bool,
+    ) -> Result<CompiledNativeArtifact, NativeBuildError> {
         fs::create_dir_all(&build_dir).map_err(|error| {
             NativeBuildError::new(
                 "create native build directory",
@@ -110,14 +205,35 @@ impl ClangCompiler {
             backend_version: generated.backend_version,
             abi_version: generated.abi_version,
             compiler: self.executable.clone(),
-            compiler_version,
-            target,
+            compiler_version: fingerprint.compiler_version,
+            target: fingerprint.target,
             optimization: "O2",
             source_path,
             library_path,
-            build_dir,
+            cleanup_dir: cleanup.then_some(build_dir),
         })
     }
+}
+
+#[derive(Clone, Debug)]
+struct CompilerFingerprint {
+    executable: PathBuf,
+    compiler_version: String,
+    target: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeCacheStatus {
+    Hit,
+    Miss,
+}
+
+#[derive(Debug)]
+pub struct CachedNativeArtifact {
+    pub artifact: CompiledNativeArtifact,
+    pub artifact_ids: Vec<ArtifactIdentity>,
+    pub bundle_id: ArtifactBundleIdentity,
+    pub status: NativeCacheStatus,
 }
 
 #[derive(Debug)]
@@ -131,7 +247,7 @@ pub struct CompiledNativeArtifact {
     pub optimization: &'static str,
     pub source_path: PathBuf,
     pub library_path: PathBuf,
-    build_dir: PathBuf,
+    cleanup_dir: Option<PathBuf>,
 }
 
 impl CompiledNativeArtifact {
@@ -153,7 +269,9 @@ impl CompiledNativeArtifact {
 
 impl Drop for CompiledNativeArtifact {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.build_dir);
+        if let Some(directory) = &self.cleanup_dir {
+            let _ = fs::remove_dir_all(directory);
+        }
     }
 }
 
@@ -195,6 +313,53 @@ fn tool_output(
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn cached_module_is_valid(directory: &Path, expected_source: &str) -> bool {
+    let source = directory.join("module.c");
+    let library = directory.join("module.dll");
+    let checksum = directory.join("module.sha256");
+    fs::read_to_string(source).is_ok_and(|source| source == expected_source)
+        && fs::read(&library).is_ok_and(|bytes| {
+            fs::read_to_string(checksum)
+                .is_ok_and(|expected| expected == byte_content_identity(&bytes).to_string())
+        })
+}
+
+fn write_library_checksum(directory: &Path, library: &Path) -> Result<(), NativeBuildError> {
+    let bytes = fs::read(library).map_err(|error| {
+        NativeBuildError::new(
+            "read compiled native artifact",
+            format!("{}: {error}", library.display()),
+        )
+    })?;
+    let checksum = directory.join("module.sha256");
+    fs::write(&checksum, byte_content_identity(&bytes).to_string()).map_err(|error| {
+        NativeBuildError::new(
+            "write native artifact checksum",
+            format!("{}: {error}", checksum.display()),
+        )
+    })
+}
+
+fn compiled_artifact(
+    generated: &NativeArtifact,
+    directory: PathBuf,
+    fingerprint: CompilerFingerprint,
+    cleanup: bool,
+) -> CompiledNativeArtifact {
+    CompiledNativeArtifact {
+        backend: generated.backend,
+        backend_version: generated.backend_version,
+        abi_version: generated.abi_version,
+        compiler: fingerprint.executable,
+        compiler_version: fingerprint.compiler_version,
+        target: fingerprint.target,
+        optimization: "O2",
+        source_path: directory.join("module.c"),
+        library_path: directory.join("module.dll"),
+        cleanup_dir: cleanup.then_some(directory),
+    }
 }
 
 /// Owned mutable image descriptor used by the generated C ABI.
@@ -406,4 +571,71 @@ unsafe extern "system" {
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
     fn FreeLibrary(module: *mut c_void) -> i32;
     fn GetLastError() -> u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::NativeBackend;
+    use crate::backend::c::CBackend;
+
+    #[test]
+    fn persistent_cache_reuses_and_validates_native_modules() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform scale(x: f32) -> f32 { return x * 2.0 }\n",
+        )
+        .unwrap();
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let sequence = NEXT_BUILD.fetch_add(1, Ordering::Relaxed);
+        let cache_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join(format!(
+                "native-cache-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let identities = compiled.identities.iter().collect::<Vec<_>>();
+        let compiler = ClangCompiler::default();
+
+        let first = compiler
+            .compile_cached(&generated, &identities, &cache_root)
+            .unwrap();
+        assert_eq!(first.status, NativeCacheStatus::Miss);
+        assert_eq!(first.artifact_ids.len(), 1);
+        assert_eq!(
+            first.artifact_ids[0],
+            first.artifact.identity(identities[0])
+        );
+        assert!(first.artifact.library_path.is_file());
+        let source_path = first.artifact.source_path.clone();
+        drop(first);
+
+        let second = compiler
+            .compile_cached(&generated, &identities, &cache_root)
+            .unwrap();
+        assert_eq!(second.status, NativeCacheStatus::Hit);
+        let native = NativeModule::load(&second.artifact, &compiled.transforms).unwrap();
+        drop(native);
+        drop(second);
+
+        fs::write(&source_path, "corrupt cache marker").unwrap();
+        let repaired = compiler
+            .compile_cached(&generated, &identities, &cache_root)
+            .unwrap();
+        assert_eq!(repaired.status, NativeCacheStatus::Miss);
+        assert_eq!(fs::read_to_string(&source_path).unwrap(), generated.source);
+        let library_path = repaired.artifact.library_path.clone();
+        drop(repaired);
+
+        fs::write(&library_path, b"corrupt library marker").unwrap();
+        let repaired_library = compiler
+            .compile_cached(&generated, &identities, &cache_root)
+            .unwrap();
+        assert_eq!(repaired_library.status, NativeCacheStatus::Miss);
+        let native = NativeModule::load(&repaired_library.artifact, &compiled.transforms).unwrap();
+        drop(native);
+        drop(repaired_library);
+        fs::remove_dir_all(cache_root).unwrap();
+    }
 }

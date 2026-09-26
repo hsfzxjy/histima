@@ -7,6 +7,7 @@
 pub mod abi;
 pub mod ast;
 pub mod backend;
+pub mod cache;
 pub mod diagnostic;
 pub mod identity;
 pub mod ir;

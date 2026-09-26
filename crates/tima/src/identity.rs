@@ -62,6 +62,7 @@ identity_type!(TransformIdentity);
 identity_type!(RecipeIdentity);
 identity_type!(ContentIdentity);
 identity_type!(ArtifactIdentity);
+identity_type!(ArtifactBundleIdentity);
 identity_type!(DependencyIdentity);
 identity_type!(SourceIdentity);
 
@@ -397,6 +398,19 @@ pub fn artifact_identity(
     ArtifactIdentity(Digest::from_hasher(hasher))
 }
 
+/// Identity of one backend compilation unit containing an ordered set of
+/// transform artifacts. Transform order is included because generated adapter
+/// symbols are indexed by module order.
+pub fn artifact_bundle_identity(artifacts: &[ArtifactIdentity]) -> ArtifactBundleIdentity {
+    let mut hasher = CanonicalHasher::new(b"tima.artifact.bundle");
+    hasher.u32(SEMANTIC_ID_VERSION);
+    hasher.u64(artifacts.len() as u64);
+    for artifact in artifacts {
+        hasher.raw(artifact.as_bytes());
+    }
+    ArtifactBundleIdentity(Digest::from_hasher(hasher))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityError {
     message: String,
@@ -718,7 +732,7 @@ mod tests {
             transform,
             &ArtifactConfiguration {
                 backend: "c",
-                backend_version: "1",
+                backend_version: "2",
                 compiler_version: "clang 23",
                 target: "x86_64-pc-windows-msvc",
                 cpu_features: &[],
@@ -727,6 +741,31 @@ mod tests {
             },
         );
         assert_ne!(recipe.as_bytes(), artifact.as_bytes());
+    }
+
+    #[test]
+    fn artifact_bundle_identity_includes_transform_order() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform first(x: f32) -> f32 { return x }\n\
+             transform second(x: f32) -> f32 { return x * 2.0 }\n",
+        )
+        .unwrap();
+        let configuration = ArtifactConfiguration {
+            backend: "c",
+            backend_version: "2",
+            compiler_version: "clang 23",
+            target: "x86_64-pc-windows-msvc",
+            cpu_features: &[],
+            optimization: "O2",
+            abi_version: 2,
+        };
+        let first = artifact_identity(compiled.identities.get(TransformId(0)), &configuration);
+        let second = artifact_identity(compiled.identities.get(TransformId(1)), &configuration);
+        assert_ne!(
+            artifact_bundle_identity(&[first, second]),
+            artifact_bundle_identity(&[second, first])
+        );
     }
 
     #[test]

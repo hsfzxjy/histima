@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::native::{AbiImage, AbiImageView, AbiValue, NativeModule};
+use crate::cache::TransformResultCache;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Constant, Terminator, TransformId, Type, ValueKind};
 use crate::lineage::{Lineage, LineageArgument};
@@ -171,7 +172,17 @@ pub fn execute(program: &CompiledProgram) -> Result<Execution, Vec<Diagnostic>> 
     let engine = IrInterpreter {
         module: &program.transforms,
     };
-    execute_with(program, &engine, BTreeMap::new())
+    execute_with(program, &engine, BTreeMap::new(), None)
+}
+
+pub fn execute_cached(
+    program: &CompiledProgram,
+    cache: &mut TransformResultCache,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = IrInterpreter {
+        module: &program.transforms,
+    };
+    execute_with(program, &engine, BTreeMap::new(), Some(cache))
 }
 
 /// Executes outer code while dispatching transform calls to a loaded native
@@ -185,7 +196,19 @@ pub fn execute_native(
         module: &program.transforms,
         native,
     };
-    execute_with(program, &engine, BTreeMap::new())
+    execute_with(program, &engine, BTreeMap::new(), None)
+}
+
+pub fn execute_native_cached(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    cache: &mut TransformResultCache,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = NativeEngine {
+        module: &program.transforms,
+        native,
+    };
+    execute_with(program, &engine, BTreeMap::new(), Some(cache))
 }
 
 /// Runs a program with immutable values supplied by the Histima host runtime.
@@ -200,7 +223,20 @@ pub fn execute_native_with_bindings(
         module: &program.transforms,
         native,
     };
-    execute_with(program, &engine, bindings)
+    execute_with(program, &engine, bindings, None)
+}
+
+pub fn execute_native_with_bindings_cached(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    bindings: BTreeMap<String, OuterValue>,
+    cache: &mut TransformResultCache,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = NativeEngine {
+        module: &program.transforms,
+        native,
+    };
+    execute_with(program, &engine, bindings, Some(cache))
 }
 
 /// Invokes one checked transform with owned outer arguments. This makes the
@@ -232,13 +268,44 @@ pub fn invoke_native_transform(
         module: &program.transforms,
         native,
     };
-    invoke_transform_with_lineage(program, &engine, transform, arguments)
+    invoke_transform_with_lineage(program, &engine, transform, arguments, None)
+}
+
+pub fn invoke_native_transform_cached(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    transform: TransformId,
+    arguments: Vec<OuterValue>,
+    cache: &mut TransformResultCache,
+) -> Result<OuterValue, Diagnostic> {
+    let definition = program.transforms.get(transform);
+    if arguments.len() != definition.parameters.len() {
+        return Err(Diagnostic::error(
+            format!(
+                "transform `{}` expects {} arguments, but {} were supplied",
+                definition.name,
+                definition.parameters.len(),
+                arguments.len()
+            ),
+            definition.span,
+        ));
+    }
+    let arguments = arguments
+        .into_iter()
+        .map(|value| (value, definition.span))
+        .collect();
+    let engine = NativeEngine {
+        module: &program.transforms,
+        native,
+    };
+    invoke_transform_with_lineage(program, &engine, transform, arguments, Some(cache))
 }
 
 fn execute_with(
     program: &CompiledProgram,
     engine: &dyn TransformEngine,
     bindings: BTreeMap<String, OuterValue>,
+    cache: Option<&mut TransformResultCache>,
 ) -> Result<Execution, Vec<Diagnostic>> {
     Interpreter {
         program,
@@ -247,6 +314,7 @@ fn execute_with(
             bindings,
             last_value: None,
         },
+        cache,
     }
     .run()
     .map_err(|diagnostic| vec![diagnostic])
@@ -258,6 +326,10 @@ trait TransformEngine {
         id: TransformId,
         arguments: Vec<(OuterValue, Span)>,
     ) -> Result<TransformOutcome, Diagnostic>;
+
+    fn may_observe_dependencies(&self, _id: TransformId) -> bool {
+        false
+    }
 }
 
 struct TransformOutcome {
@@ -270,6 +342,7 @@ fn invoke_transform_with_lineage(
     engine: &dyn TransformEngine,
     id: TransformId,
     arguments: Vec<(OuterValue, Span)>,
+    mut cache: Option<&mut TransformResultCache>,
 ) -> Result<OuterValue, Diagnostic> {
     let transform = program.transforms.get(id);
     let recorded = transform
@@ -288,29 +361,59 @@ fn invoke_transform_with_lineage(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if !engine.may_observe_dependencies(id) {
+        let lineage = Lineage::invocation(
+            transform.name.as_str(),
+            program.identities.get(id),
+            recorded.clone(),
+            vec![],
+        )
+        .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
+        let recipe = lineage
+            .recipe_id()
+            .expect("invocation lineage always has a recipe identity");
+        if let Some(cache) = cache.as_deref_mut()
+            && let Some(mut value) = cache
+                .lookup(recipe)
+                .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?
+        {
+            value.lineage = Some(lineage);
+            return Ok(value);
+        }
+    }
     let TransformOutcome {
         mut value,
         observations,
     } = engine.invoke(id, arguments)?;
-    value.lineage = Some(
-        Lineage::invocation(
-            transform.name.as_str(),
-            program.identities.get(id),
-            recorded,
-            observations,
-        )
-        .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?,
-    );
+    let lineage = Lineage::invocation(
+        transform.name.as_str(),
+        program.identities.get(id),
+        recorded,
+        observations,
+    )
+    .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
+    if let Some(cache) = cache {
+        cache
+            .store(
+                lineage
+                    .recipe_id()
+                    .expect("invocation lineage always has a recipe identity"),
+                &value,
+            )
+            .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
+    }
+    value.lineage = Some(lineage);
     Ok(value)
 }
 
-struct Interpreter<'program, 'engine> {
+struct Interpreter<'program, 'engine, 'cache> {
     program: &'program CompiledProgram,
     engine: &'engine dyn TransformEngine,
     execution: Execution,
+    cache: Option<&'cache mut TransformResultCache>,
 }
 
-impl Interpreter<'_, '_> {
+impl Interpreter<'_, '_, '_> {
     fn run(mut self) -> Result<Execution, Diagnostic> {
         for item in &self.program.syntax.items {
             match item {
@@ -500,7 +603,13 @@ impl Interpreter<'_, '_> {
             };
             values.push(value);
         }
-        invoke_transform_with_lineage(self.program, self.engine, id, values)
+        invoke_transform_with_lineage(
+            self.program,
+            self.engine,
+            id,
+            values,
+            self.cache.as_deref_mut(),
+        )
     }
 
     fn asset(
@@ -1001,12 +1110,13 @@ mod tests {
     use crate::backend::NativeBackend;
     use crate::backend::c::CBackend;
     use crate::backend::native::{ClangCompiler, NativeModule};
+    use crate::cache::TransformResultCache;
     use crate::identity::content_identity;
     use crate::ir::{TransformId, Type};
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
-        ImageValue, OuterValue, ValueData, execute, execute_native, execute_native_with_bindings,
-        invoke_native_transform, lower_native_argument,
+        ImageValue, OuterValue, ValueData, execute, execute_cached, execute_native,
+        execute_native_with_bindings, invoke_native_transform, lower_native_argument,
     };
     use crate::source::Span;
 
@@ -1056,6 +1166,56 @@ mod tests {
             unreachable!()
         };
         assert_eq!(invocation.recipe_id, second.recipe_id);
+    }
+
+    #[test]
+    fn repeated_recipes_reuse_content_addressed_results() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform scale(x: f32, factor: f32) -> f32 { return x * factor }\n\
+             first = scale(8.0, 0.25)\n\
+             second = scale(8.0, 0.25)\n",
+        )
+        .unwrap();
+        let mut cache = TransformResultCache::default();
+        let first_execution = execute_cached(&compiled, &mut cache).unwrap();
+        assert_eq!(
+            first_execution.bindings["first"].data,
+            ValueData::Float(2.0)
+        );
+        assert_eq!(
+            first_execution.bindings["second"].data,
+            ValueData::Float(2.0)
+        );
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().stores, 1);
+        assert_eq!(cache.content().len(), 1);
+
+        let second_execution = execute_cached(&compiled, &mut cache).unwrap();
+        assert_eq!(
+            second_execution.bindings["second"].data,
+            ValueData::Float(2.0)
+        );
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 3);
+        let LineageNode::Invocation(first_lineage) = first_execution.bindings["first"]
+            .lineage
+            .as_ref()
+            .unwrap()
+            .node()
+        else {
+            unreachable!()
+        };
+        let LineageNode::Invocation(cached_lineage) = second_execution.bindings["second"]
+            .lineage
+            .as_ref()
+            .unwrap()
+            .node()
+        else {
+            unreachable!()
+        };
+        assert_eq!(first_lineage.recipe_id, cached_lineage.recipe_id);
     }
 
     #[test]

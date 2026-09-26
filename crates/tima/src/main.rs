@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use tima::backend::NativeBackend;
 use tima::backend::c::CBackend;
 use tima::backend::native::{ClangCompiler, NativeModule};
+use tima::cache::TransformResultCache;
 use tima::runtime::{OuterValue, ValueData};
 use tima::source::SourceFile;
 
@@ -57,20 +58,24 @@ fn run() -> Result<(), ()> {
                     eprint!("{}", diagnostic.render(&compiled.source));
                 }
             })?;
-            let artifact = ClangCompiler::default()
-                .compile(&generated, "build")
+            let transform_ids = compiled.identities.iter().collect::<Vec<_>>();
+            let cached_artifact = ClangCompiler::default()
+                .compile_cached(&generated, &transform_ids, "build/cache")
                 .map_err(|error| {
                     eprintln!("error: {error}");
                 })?;
-            let native = NativeModule::load(&artifact, &compiled.transforms).map_err(|error| {
-                eprintln!("error: could not load native transform artifact: {error}");
-            })?;
-            let execution =
-                tima::runtime::execute_native(&compiled, &native).map_err(|diagnostics| {
-                    for diagnostic in diagnostics {
-                        eprint!("{}", diagnostic.render(&compiled.source));
-                    }
+            let native = NativeModule::load(&cached_artifact.artifact, &compiled.transforms)
+                .map_err(|error| {
+                    eprintln!("error: could not load native transform artifact: {error}");
                 })?;
+            let mut result_cache = TransformResultCache::default();
+            let execution =
+                tima::runtime::execute_native_cached(&compiled, &native, &mut result_cache)
+                    .map_err(|diagnostics| {
+                        for diagnostic in diagnostics {
+                            eprint!("{}", diagnostic.render(&compiled.source));
+                        }
+                    })?;
             let unbound_trace = execution.last_value.as_ref().and_then(|last| {
                 let ValueData::Lineage(lineage) = &last.data else {
                     return None;

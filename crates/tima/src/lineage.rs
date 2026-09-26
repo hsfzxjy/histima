@@ -167,6 +167,13 @@ impl Lineage {
         }
     }
 
+    pub fn recipe_id(&self) -> Option<RecipeIdentity> {
+        match self.node() {
+            LineageNode::Invocation(invocation) => Some(invocation.recipe_id),
+            LineageNode::Source(_) | LineageNode::ExternalObservation(_) => None,
+        }
+    }
+
     /// Produces a deterministic, human-readable derivation listing. Ancestors
     /// appear before consumers and shared ancestors are printed once.
     pub fn render(&self) -> String {
