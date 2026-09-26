@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 
 use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
-use crate::backend::native::{AbiScalar, NativeModule};
+use crate::backend::native::{AbiImage, AbiImageView, AbiValue, NativeModule};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Constant, Terminator, TransformId, Type, ValueKind};
 use crate::source::Span;
@@ -29,6 +31,10 @@ impl OuterValue {
             lineage: None,
         }
     }
+
+    pub fn image(image: ImageValue) -> Self {
+        Self::plain(ValueData::Image(Arc::new(image)))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +47,7 @@ pub enum ValueData {
     List(Arc<[OuterValue]>),
     Record(Arc<BTreeMap<String, OuterValue>>),
     Asset(Arc<AssetValue>),
+    Image(Arc<ImageValue>),
     Transform(TransformId),
 }
 
@@ -49,6 +56,105 @@ pub struct AssetValue {
     /// A locator is not a content identity. Asset observation/materialization
     /// will record content identity and source lineage in a later milestone.
     pub locator: Arc<str>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ImageStorage {
+    bytes: Vec<u8>,
+}
+
+impl ImageStorage {
+    fn new(mut bytes: Vec<u8>) -> Self {
+        // Empty Vec pointers are shared dangling sentinels, which cannot serve
+        // as invocation-local storage identities. Reserve one byte without
+        // changing the logical image length so even empty images have a live,
+        // unique allocation while crossing the native boundary.
+        if bytes.is_empty() {
+            bytes.reserve_exact(1);
+        }
+        Self { bytes }
+    }
+}
+
+/// Immutable outer image descriptor backed by shareable byte storage.
+///
+/// `width` and `height` are logical dimensions, while `stride` is the backing
+/// byte count per row. Pixel format is deliberately outside this first
+/// ownership milestone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageValue {
+    storage: Arc<ImageStorage>,
+    width: usize,
+    height: usize,
+    stride: usize,
+}
+
+impl ImageValue {
+    pub fn new(
+        width: usize,
+        height: usize,
+        stride: usize,
+        bytes: Vec<u8>,
+    ) -> Result<Self, ImageLayoutError> {
+        validate_image_layout(height, stride, bytes.len())?;
+        Ok(Self {
+            storage: Arc::new(ImageStorage::new(bytes)),
+            width,
+            height,
+            stride,
+        })
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.storage.bytes
+    }
+
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.storage, &other.storage)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageLayoutError {
+    message: String,
+}
+
+impl fmt::Display for ImageLayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for ImageLayoutError {}
+
+fn validate_image_layout(
+    height: usize,
+    stride: usize,
+    byte_len: usize,
+) -> Result<(), ImageLayoutError> {
+    let expected = height.checked_mul(stride).ok_or_else(|| ImageLayoutError {
+        message: "image byte length overflows usize".to_owned(),
+    })?;
+    if byte_len != expected {
+        return Err(ImageLayoutError {
+            message: format!(
+                "image storage has {byte_len} bytes, but height {height} and stride {stride} require {expected}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -61,7 +167,7 @@ pub fn execute(program: &CompiledProgram) -> Result<Execution, Vec<Diagnostic>> 
     let engine = IrInterpreter {
         module: &program.transforms,
     };
-    execute_with(program, &engine)
+    execute_with(program, &engine, BTreeMap::new())
 }
 
 /// Executes outer code while dispatching transform calls to a loaded native
@@ -75,17 +181,68 @@ pub fn execute_native(
         module: &program.transforms,
         native,
     };
-    execute_with(program, &engine)
+    execute_with(program, &engine, BTreeMap::new())
+}
+
+/// Runs a program with immutable values supplied by the Histima host runtime.
+/// This is the initial integration point for materialized asset-native values;
+/// it avoids inventing source-language image literal semantics.
+pub fn execute_native_with_bindings(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    bindings: BTreeMap<String, OuterValue>,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = NativeEngine {
+        module: &program.transforms,
+        native,
+    };
+    execute_with(program, &engine, bindings)
+}
+
+/// Invokes one checked transform with owned outer arguments. This makes the
+/// ownership transition directly usable by Histima and testable independently
+/// of outer binding liveness.
+pub fn invoke_native_transform(
+    program: &CompiledProgram,
+    native: &NativeModule,
+    transform: TransformId,
+    arguments: Vec<OuterValue>,
+) -> Result<OuterValue, Diagnostic> {
+    let definition = program.transforms.get(transform);
+    if arguments.len() != definition.parameters.len() {
+        return Err(Diagnostic::error(
+            format!(
+                "transform `{}` expects {} arguments, but {} were supplied",
+                definition.name,
+                definition.parameters.len(),
+                arguments.len()
+            ),
+            definition.span,
+        ));
+    }
+    let arguments = arguments
+        .into_iter()
+        .map(|value| (value, definition.span))
+        .collect();
+    NativeEngine {
+        module: &program.transforms,
+        native,
+    }
+    .invoke(transform, arguments)
 }
 
 fn execute_with(
     program: &CompiledProgram,
     engine: &dyn TransformEngine,
+    bindings: BTreeMap<String, OuterValue>,
 ) -> Result<Execution, Vec<Diagnostic>> {
     Interpreter {
         program,
         engine,
-        execution: Execution::default(),
+        execution: Execution {
+            bindings,
+            last_value: None,
+        },
     }
     .run()
     .map_err(|diagnostic| vec![diagnostic])
@@ -95,7 +252,7 @@ trait TransformEngine {
     fn invoke(
         &self,
         id: TransformId,
-        arguments: &[(OuterValue, Span)],
+        arguments: Vec<(OuterValue, Span)>,
     ) -> Result<OuterValue, Diagnostic>;
 }
 
@@ -292,7 +449,7 @@ impl Interpreter<'_, '_> {
             };
             values.push(value);
         }
-        self.engine.invoke(id, &values)
+        self.engine.invoke(id, values)
     }
 
     fn asset(
@@ -433,9 +590,9 @@ impl TransformEngine for IrInterpreter<'_> {
     fn invoke(
         &self,
         id: TransformId,
-        arguments: &[(OuterValue, Span)],
+        arguments: Vec<(OuterValue, Span)>,
     ) -> Result<OuterValue, Diagnostic> {
-        self.invoke_at_depth(id, arguments, 0)
+        self.invoke_at_depth(id, &arguments, 0)
     }
 }
 
@@ -448,34 +605,23 @@ impl TransformEngine for NativeEngine<'_> {
     fn invoke(
         &self,
         id: TransformId,
-        arguments: &[(OuterValue, Span)],
+        arguments: Vec<(OuterValue, Span)>,
     ) -> Result<OuterValue, Diagnostic> {
         self.validate_path(id, &mut BTreeSet::new(), &mut BTreeSet::new())?;
         let transform = self.module.get(id);
         let mut lowered = Vec::with_capacity(arguments.len());
         for (parameter, (argument, span)) in transform.parameters.iter().zip(arguments) {
-            lowered.push(to_abi_scalar(lower_scalar(argument, parameter.ty, *span)?));
+            lowered.push(lower_native_argument(argument, parameter.ty, span)?);
         }
+        let abi_arguments = lowered
+            .iter()
+            .map(|argument| argument.abi)
+            .collect::<Vec<_>>();
         let result = self
             .native
-            .invoke_scalar(id, &lowered)
+            .invoke(id, &abi_arguments)
             .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
-        // SAFETY: the generated adapter writes the union field selected by
-        // the statically checked transform return type.
-        let scalar = unsafe {
-            match transform.return_type {
-                Type::Bool => NativeScalar::Bool(result.boolean != 0),
-                Type::I64 => NativeScalar::I64(result.i64_value),
-                Type::F32 => NativeScalar::F32(result.f32_value),
-                Type::Image | Type::ImageView => {
-                    return Err(Diagnostic::error(
-                        "owned/view native return freezing is not implemented yet",
-                        transform.span,
-                    ));
-                }
-            }
-        };
-        Ok(freeze_scalar(scalar))
+        freeze_native_result(result, transform.return_type, &mut lowered, transform.span)
     }
 }
 
@@ -522,14 +668,186 @@ impl NativeEngine<'_> {
     }
 }
 
-fn to_abi_scalar(value: NativeScalar) -> AbiScalar {
-    match value {
-        NativeScalar::Bool(value) => AbiScalar {
-            boolean: u8::from(value),
-        },
-        NativeScalar::I64(value) => AbiScalar { i64_value: value },
-        NativeScalar::F32(value) => AbiScalar { f32_value: value },
+struct LoweredArgument {
+    abi: AbiValue,
+    keep_alive: BoundaryStorage,
+}
+
+enum BoundaryStorage {
+    Scalar,
+    Owned(Option<OwnedImage>),
+    View(Arc<ImageValue>),
+}
+
+struct OwnedImage {
+    storage: ImageStorage,
+}
+
+fn lower_native_argument(
+    value: OuterValue,
+    expected: Type,
+    span: Span,
+) -> Result<LoweredArgument, Diagnostic> {
+    match (expected, value.data) {
+        (Type::Bool, ValueData::Bool(value)) => Ok(LoweredArgument {
+            abi: AbiValue {
+                boolean: u8::from(value),
+            },
+            keep_alive: BoundaryStorage::Scalar,
+        }),
+        (Type::I64, ValueData::Integer(value)) => Ok(LoweredArgument {
+            abi: AbiValue { i64_value: value },
+            keep_alive: BoundaryStorage::Scalar,
+        }),
+        (Type::F32, ValueData::Float(value)) => Ok(LoweredArgument {
+            abi: AbiValue { f32_value: value },
+            keep_alive: BoundaryStorage::Scalar,
+        }),
+        (Type::Image, ValueData::Image(image)) => {
+            let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
+            let ImageValue {
+                storage,
+                width,
+                height,
+                stride,
+            } = image;
+            let mut storage = Arc::try_unwrap(storage)
+                .unwrap_or_else(|shared| ImageStorage::new(shared.bytes.clone()));
+            let abi = AbiValue {
+                image: AbiImage {
+                    data: storage.bytes.as_mut_ptr(),
+                    width,
+                    height,
+                    stride,
+                },
+            };
+            Ok(LoweredArgument {
+                abi,
+                keep_alive: BoundaryStorage::Owned(Some(OwnedImage { storage })),
+            })
+        }
+        (Type::ImageView, ValueData::Image(image)) => Ok(LoweredArgument {
+            abi: AbiValue {
+                image_view: AbiImageView {
+                    data: image.storage.bytes.as_ptr(),
+                    width: image.width,
+                    height: image.height,
+                    stride: image.stride,
+                },
+            },
+            keep_alive: BoundaryStorage::View(image),
+        }),
+        (expected, _) => Err(Diagnostic::error(
+            format!(
+                "outer value cannot cross into native parameter type {}",
+                expected.name()
+            ),
+            span,
+        )),
     }
+}
+
+fn freeze_native_result(
+    result: AbiValue,
+    ty: Type,
+    arguments: &mut [LoweredArgument],
+    span: Span,
+) -> Result<OuterValue, Diagnostic> {
+    // SAFETY: the generated adapter writes the union field selected by the
+    // statically checked transform return type.
+    unsafe {
+        match ty {
+            Type::Bool => Ok(freeze_scalar(NativeScalar::Bool(result.boolean != 0))),
+            Type::I64 => Ok(freeze_scalar(NativeScalar::I64(result.i64_value))),
+            Type::F32 => Ok(freeze_scalar(NativeScalar::F32(result.f32_value))),
+            Type::Image => freeze_owned_image(result.image, arguments, span),
+            Type::ImageView => freeze_image_view(result.image_view, arguments, span),
+        }
+    }
+}
+
+fn freeze_owned_image(
+    returned: AbiImage,
+    arguments: &mut [LoweredArgument],
+    span: Span,
+) -> Result<OuterValue, Diagnostic> {
+    for argument in arguments {
+        let BoundaryStorage::Owned(owned) = &mut argument.keep_alive else {
+            continue;
+        };
+        let Some(candidate) = owned.as_ref() else {
+            continue;
+        };
+        if candidate.storage.bytes.as_ptr() != returned.data.cast_const() {
+            continue;
+        }
+        validate_returned_layout(
+            returned.width,
+            returned.height,
+            returned.stride,
+            candidate.storage.bytes.len(),
+            span,
+        )?;
+        let owned = owned.take().expect("matched owned image remains available");
+        return Ok(OuterValue::image(ImageValue {
+            storage: Arc::new(owned.storage),
+            width: returned.width,
+            height: returned.height,
+            stride: returned.stride,
+        }));
+    }
+    Err(Diagnostic::error(
+        "returned owned image does not reference storage acquired by this invocation",
+        span,
+    )
+    .with_note("native allocation will require an explicit runtime allocator capability"))
+}
+
+fn freeze_image_view(
+    returned: AbiImageView,
+    arguments: &mut [LoweredArgument],
+    span: Span,
+) -> Result<OuterValue, Diagnostic> {
+    for argument in arguments {
+        let BoundaryStorage::View(image) = &argument.keep_alive else {
+            continue;
+        };
+        if image.storage.bytes.as_ptr() != returned.data {
+            continue;
+        }
+        validate_returned_layout(
+            returned.width,
+            returned.height,
+            returned.stride,
+            image.storage.bytes.len(),
+            span,
+        )?;
+        return Ok(OuterValue::image(ImageValue {
+            storage: image.storage.clone(),
+            width: returned.width,
+            height: returned.height,
+            stride: returned.stride,
+        }));
+    }
+    Err(Diagnostic::error(
+        "returned image view does not reference a live input view",
+        span,
+    ))
+}
+
+fn validate_returned_layout(
+    _width: usize,
+    height: usize,
+    stride: usize,
+    byte_len: usize,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    validate_image_layout(height, stride, byte_len).map_err(|error| {
+        Diagnostic::error(
+            format!("native transform returned an invalid image: {error}"),
+            span,
+        )
+    })
 }
 
 fn lower_scalar(
@@ -588,13 +906,19 @@ fn native_binary(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
     use crate::backend::NativeBackend;
     use crate::backend::c::CBackend;
     use crate::backend::native::{ClangCompiler, NativeModule};
-    use crate::runtime::{ValueData, execute, execute_native};
+    use crate::ir::Type;
+    use crate::runtime::{
+        ImageValue, OuterValue, ValueData, execute, execute_native, execute_native_with_bindings,
+        invoke_native_transform, lower_native_argument,
+    };
+    use crate::source::Span;
 
     #[test]
     fn runs_a_scalar_transform_through_a_pipeline() {
@@ -675,5 +999,129 @@ mod tests {
         let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
         let diagnostics = execute_native(&compiled, &native).unwrap_err();
         assert!(diagnostics[0].message.contains("i64 arithmetic"));
+    }
+
+    #[test]
+    fn owned_image_arguments_detach_when_storage_is_shared() {
+        let image = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
+        let original_pointer = match &image.data {
+            ValueData::Image(image) => image.storage.bytes.as_ptr(),
+            _ => unreachable!(),
+        };
+        let retained_outer_alias = image.clone();
+        let first = lower_native_argument(image.clone(), Type::Image, Span::default()).unwrap();
+        let second = lower_native_argument(image, Type::Image, Span::default()).unwrap();
+        // SAFETY: each union was initialized with its `image` field.
+        let first_pointer = unsafe { first.abi.image.data.cast_const() };
+        // SAFETY: each union was initialized with its `image` field.
+        let second_pointer = unsafe { second.abi.image.data.cast_const() };
+        assert_ne!(first_pointer, original_pointer);
+        assert_ne!(second_pointer, original_pointer);
+        assert_ne!(first_pointer, second_pointer);
+        drop(retained_outer_alias);
+    }
+
+    #[test]
+    fn image_views_alias_shared_storage_without_copying() {
+        let image = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
+        let original_pointer = match &image.data {
+            ValueData::Image(image) => image.storage.bytes.as_ptr(),
+            _ => unreachable!(),
+        };
+        let first = lower_native_argument(image.clone(), Type::ImageView, Span::default()).unwrap();
+        let second = lower_native_argument(image, Type::ImageView, Span::default()).unwrap();
+        // SAFETY: each union was initialized with its `image_view` field.
+        assert_eq!(unsafe { first.abi.image_view.data }, original_pointer);
+        // SAFETY: each union was initialized with its `image_view` field.
+        assert_eq!(unsafe { second.abi.image_view.data }, original_pointer);
+    }
+
+    #[test]
+    fn owned_image_detaches_from_a_simultaneous_view() {
+        let image = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
+        let view = lower_native_argument(image.clone(), Type::ImageView, Span::default()).unwrap();
+        let owned = lower_native_argument(image, Type::Image, Span::default()).unwrap();
+        // SAFETY: the unions were initialized with the fields read here.
+        let view_pointer = unsafe { view.abi.image_view.data };
+        // SAFETY: the unions were initialized with the fields read here.
+        let owned_pointer = unsafe { owned.abi.image.data.cast_const() };
+        assert_ne!(owned_pointer, view_pointer);
+    }
+
+    #[test]
+    fn native_image_boundary_detaches_owned_values_and_freezes_returns() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform own(img: Image) -> Image { return img }\n\
+             transform view(img: ImageView) -> ImageView { return img }\n\
+             owned = img | own\n\
+             viewed = img | view\n",
+        )
+        .unwrap();
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
+        let execution = execute_native_with_bindings(
+            &compiled,
+            &native,
+            BTreeMap::from([("img".to_owned(), input)]),
+        )
+        .unwrap();
+        let ValueData::Image(original) = &execution.bindings["img"].data else {
+            panic!("expected input image")
+        };
+        let ValueData::Image(owned) = &execution.bindings["owned"].data else {
+            panic!("expected owned result image")
+        };
+        let ValueData::Image(viewed) = &execution.bindings["viewed"].data else {
+            panic!("expected viewed result image")
+        };
+        assert!(!original.shares_storage_with(owned));
+        assert!(original.shares_storage_with(viewed));
+        assert_eq!(original.bytes(), owned.bytes());
+        assert_eq!(original.bytes(), viewed.bytes());
+    }
+
+    #[test]
+    fn unique_owned_image_storage_transfers_without_copying() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform own(img: Image) -> Image { return img }\n",
+        )
+        .unwrap();
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let image = ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap();
+        let original_pointer = image.storage.bytes.as_ptr();
+        let result = invoke_native_transform(
+            &compiled,
+            &native,
+            crate::ir::TransformId(0),
+            vec![OuterValue::image(image)],
+        )
+        .unwrap();
+        let ValueData::Image(result) = result.data else {
+            panic!("expected image result")
+        };
+        assert_eq!(result.storage.bytes.as_ptr(), original_pointer);
+        assert_eq!(result.bytes(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn validates_outer_image_layouts() {
+        let error = ImageValue::new(2, 2, 2, vec![0; 3]).unwrap_err();
+        assert!(error.to_string().contains("require 4"));
     }
 }

@@ -143,21 +143,43 @@ impl fmt::Display for NativeBuildError {
 
 impl Error for NativeBuildError {}
 
-/// Scalar payload used only by generated ABI adapters.
+/// Owned mutable image descriptor used by the generated C ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AbiImage {
+    pub(crate) data: *mut u8,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) stride: usize,
+}
+
+/// Read-only image descriptor used by the generated C ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AbiImageView {
+    pub(crate) data: *const u8,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) stride: usize,
+}
+
+/// Native-safe payload used only by generated ABI adapters.
 ///
 /// Native transform functions retain their precise C signatures. This union
 /// gives the Rust runtime one stable entry point per transform without making
 /// the typed IR or language semantics depend on C calling conventions.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub union AbiScalar {
-    pub boolean: u8,
-    pub i64_value: i64,
-    pub f32_value: f32,
+pub(crate) union AbiValue {
+    pub(crate) boolean: u8,
+    pub(crate) i64_value: i64,
+    pub(crate) f32_value: f32,
+    pub(crate) image: AbiImage,
+    pub(crate) image_view: AbiImageView,
 }
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
-type InvokeFn = unsafe extern "C" fn(*const AbiScalar, *mut AbiScalar) -> i32;
+type InvokeFn = unsafe extern "C" fn(*const AbiValue, *mut AbiValue) -> i32;
 
 #[derive(Debug)]
 pub struct NativeModule {
@@ -205,26 +227,23 @@ impl NativeModule {
         }
     }
 
-    pub fn invoke_scalar(
+    pub(crate) fn invoke(
         &self,
         transform: TransformId,
-        arguments: &[AbiScalar],
-    ) -> Result<AbiScalar, NativeLoadError> {
+        arguments: &[AbiValue],
+    ) -> Result<AbiValue, NativeLoadError> {
         let Some(function) = self.invocations.get(transform.0 as usize) else {
             return Err(NativeLoadError::new(format!(
                 "native transform index {} is unavailable",
                 transform.0
             )));
         };
-        let mut result = AbiScalar { i64_value: 0 };
+        let mut result = AbiValue { i64_value: 0 };
         // SAFETY: the adapter symbol was loaded with `InvokeFn`; `arguments`
         // and `result` remain valid for the duration of the synchronous call.
         let status = unsafe { function(arguments.as_ptr(), &mut result) };
         match status {
             0 => Ok(result),
-            1 => Err(NativeLoadError::new(
-                "transform uses a native boundary type not supported by the scalar adapter",
-            )),
             other => Err(NativeLoadError::new(format!(
                 "native transform adapter returned status {other}"
             ))),

@@ -105,6 +105,13 @@ fn display(value: &OuterValue) -> String {
                 .join(", ")
         ),
         ValueData::Asset(asset) => format!("asset({:?})", asset.locator),
+        ValueData::Image(image) => format!(
+            "image(width={}, height={}, stride={}, bytes={})",
+            image.width(),
+            image.height(),
+            image.stride(),
+            image.bytes().len()
+        ),
         ValueData::Transform(id) => format!("<transform {}>", id.0),
     }
 }

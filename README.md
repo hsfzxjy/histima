@@ -20,9 +20,12 @@ transform calls, and pipelines. `tima run` compiles checked scalar transforms
 to a temporary DLL with LLVM/Clang and invokes them through generated C ABI
 adapters; the IR interpreter remains available as a reference execution path.
 Transform bodies currently contain exactly one typed `return` expression.
-`Image`/`ImageView` are represented and emitted in the ABI, but the runtime
-rejects executing them until detach/view acquisition and freeze-on-return are
-implemented. Native `i64` arithmetic is also held back until its overflow and
+Host-provided immutable images can cross the native boundary: `Image` acquires
+unique mutable storage by transfer or detach, multiple owned arguments cannot
+alias, `ImageView` shares storage zero-copy, and returned descriptors are frozen
+only when they reference storage retained by the invocation. Inner-to-inner
+calls with owned images remain disabled until the IR has explicit move/detach
+lowering. Native `i64` arithmetic is also held back until its overflow and
 division-error semantics are specified.
 
 Try the vertical slice:

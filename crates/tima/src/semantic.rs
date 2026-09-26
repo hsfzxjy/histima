@@ -338,6 +338,22 @@ impl<'a> Lowerer<'a> {
                     ));
                     return None;
                 };
+                if signature
+                    .parameters
+                    .iter()
+                    .any(|(_, ty)| *ty == Type::Image)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "owned Image arguments are not yet supported in inner-to-inner calls",
+                            expression.span,
+                        )
+                        .with_note(
+                            "move/detach lowering is required to preserve non-aliasing across nested native calls",
+                        ),
+                    );
+                    return None;
+                }
                 if arguments.iter().any(|argument| argument.name.is_some()) {
                     self.diagnostics.push(Diagnostic::error(
                         "named arguments are not yet supported inside transforms",
@@ -440,5 +456,16 @@ mod tests {
         let diagnostics =
             compile("test.tima", "transform bad(x: f32) -> f32 { return [x] }\n").unwrap_err();
         assert!(diagnostics[0].message.contains("outer-only"));
+    }
+
+    #[test]
+    fn rejects_owned_image_inner_calls_until_move_lowering_exists() {
+        let diagnostics = compile(
+            "test.tima",
+            "transform choose(a: Image, b: Image) -> Image { return a }\n\
+             transform unsafe_alias(x: Image) -> Image { return choose(x, x) }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics[0].message.contains("owned Image arguments"));
     }
 }

@@ -20,7 +20,7 @@ impl NativeBackend for CBackend {
         source.push_str(
             "typedef struct { unsigned char *data; size_t width; size_t height; size_t stride; } TimaImage;\n\
              typedef struct { const unsigned char *data; size_t width; size_t height; size_t stride; } TimaImageView;\n\
-             typedef union { bool boolean; int64_t i64_value; float f32_value; } TimaScalar;\n\n\
+             typedef union { bool boolean; int64_t i64_value; float f32_value; TimaImage image; TimaImageView image_view; } TimaValue;\n\n\
              #if defined(_WIN32)\n\
              #define TIMA_EXPORT __declspec(dllexport)\n\
              int _fltused = 0;\n\
@@ -64,7 +64,7 @@ impl NativeBackend for CBackend {
         }
 
         for (index, transform) in module.transforms.iter().enumerate() {
-            scalar_adapter(&mut source, index, transform);
+            abi_adapter(&mut source, index, transform);
         }
 
         Ok(NativeArtifact {
@@ -75,28 +75,19 @@ impl NativeBackend for CBackend {
     }
 }
 
-fn scalar_adapter(output: &mut String, index: usize, transform: &Transform) {
+fn abi_adapter(output: &mut String, index: usize, transform: &Transform) {
     writeln!(
         output,
-        "TIMA_EXPORT int32_t tima_invoke_{index}(const TimaScalar *args, TimaScalar *result) {{"
+        "TIMA_EXPORT int32_t tima_invoke_{index}(const TimaValue *args, TimaValue *result) {{"
     )
     .unwrap();
-    let scalar_safe = transform
-        .parameters
-        .iter()
-        .all(|parameter| abi::lower_type(parameter.ty).ownership == abi::Ownership::Scalar)
-        && abi::lower_type(transform.return_type).ownership == abi::Ownership::Scalar;
-    if !scalar_safe {
-        output.push_str("    (void)args;\n    (void)result;\n    return 1;\n}\n\n");
-        return;
-    }
     if transform.parameters.is_empty() {
         output.push_str("    (void)args;\n");
     }
     write!(
         output,
         "    result->{} = tima_{}(",
-        scalar_field(transform.return_type),
+        abi_field(transform.return_type),
         transform.name
     )
     .unwrap();
@@ -104,19 +95,18 @@ fn scalar_adapter(output: &mut String, index: usize, transform: &Transform) {
         if argument != 0 {
             output.push_str(", ");
         }
-        write!(output, "args[{argument}].{}", scalar_field(parameter.ty)).unwrap();
+        write!(output, "args[{argument}].{}", abi_field(parameter.ty)).unwrap();
     }
     output.push_str(");\n    return 0;\n}\n\n");
 }
 
-fn scalar_field(ty: crate::ir::Type) -> &'static str {
+fn abi_field(ty: crate::ir::Type) -> &'static str {
     match ty {
         crate::ir::Type::Bool => "boolean",
         crate::ir::Type::I64 => "i64_value",
         crate::ir::Type::F32 => "f32_value",
-        crate::ir::Type::Image | crate::ir::Type::ImageView => {
-            unreachable!("non-scalar type has no scalar adapter field")
-        }
+        crate::ir::Type::Image => "image",
+        crate::ir::Type::ImageView => "image_view",
     }
 }
 
@@ -231,6 +221,16 @@ mod tests {
             artifact
                 .source
                 .contains("TimaImageView tima_inspect(TimaImageView p0)")
+        );
+        assert!(
+            artifact
+                .source
+                .contains("result->image = tima_freeze(args[0].image);")
+        );
+        assert!(
+            artifact
+                .source
+                .contains("result->image_view = tima_inspect(args[0].image_view);")
         );
     }
 }
