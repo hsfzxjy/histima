@@ -14,6 +14,7 @@ pub struct BlockId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Bool,
+    U8,
     I64,
     F32,
     /// Uniquely owned and mutable while an inner transform runs.
@@ -26,6 +27,7 @@ impl Type {
     pub fn name(self) -> &'static str {
         match self {
             Self::Bool => "bool",
+            Self::U8 => "u8",
             Self::I64 => "i64",
             Self::F32 => "f32",
             Self::Image => "Image",
@@ -108,6 +110,12 @@ pub enum ValueKind {
     /// produces the same owned storage under a new value ID.
     ImageZero {
         image: ValueId,
+    },
+    /// Consumes one uniquely owned image, fills its byte storage in place, and
+    /// produces the same owned storage under a new value ID.
+    ImageFill {
+        image: ValueId,
+        value: ValueId,
     },
     RuntimeCall(RuntimeCall),
 }

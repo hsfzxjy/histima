@@ -60,7 +60,10 @@ impl<'a> Checker<'a> {
             let Item::Transform(declaration) = item else {
                 continue;
             };
-            if matches!(declaration.name.as_str(), "environment_i64" | "image_zero") {
+            if matches!(
+                declaration.name.as_str(),
+                "environment_i64" | "image_zero" | "image_fill"
+            ) {
                 self.diagnostics.push(
                     Diagnostic::error(
                         format!(
@@ -141,6 +144,7 @@ impl<'a> Checker<'a> {
     fn resolve_type(&mut self, reference: &ast::TypeRef) -> Option<Type> {
         let ty = match reference.name.as_str() {
             "bool" => Type::Bool,
+            "u8" => Type::U8,
             "i64" => Type::I64,
             "f32" => Type::F32,
             "Image" => Type::Image,
@@ -152,7 +156,7 @@ impl<'a> Checker<'a> {
                         reference.span,
                     )
                     .with_note(
-                        "the initial native-safe types are bool, i64, f32, Image, and ImageView",
+                        "the initial native-safe types are bool, u8, i64, f32, Image, and ImageView",
                     ),
                 );
                 return None;
@@ -441,7 +445,7 @@ impl<'a> Lowerer<'a> {
                             expression.span,
                         )
                         .with_note(
-                            "`image_zero` consumes its Image input and returns new ownership",
+                            "owned image operations consume their Image input and return new ownership",
                         ),
                     );
                     None
@@ -479,7 +483,7 @@ impl<'a> Lowerer<'a> {
                     }
                 } else if op.is_equality() {
                     if left_type == right_type
-                        && matches!(left_type, Type::Bool | Type::I64 | Type::F32)
+                        && matches!(left_type, Type::Bool | Type::U8 | Type::I64 | Type::F32)
                     {
                         Type::Bool
                     } else {
@@ -496,7 +500,9 @@ impl<'a> Lowerer<'a> {
                         );
                         return None;
                     }
-                } else if left_type == right_type && left_type.is_numeric() {
+                } else if left_type == right_type
+                    && (left_type.is_numeric() || left_type == Type::U8)
+                {
                     Type::Bool
                 } else {
                     self.diagnostics.push(
@@ -536,6 +542,9 @@ impl<'a> Lowerer<'a> {
                 }
                 if name == "image_zero" {
                     return self.image_zero(arguments, expression.span);
+                }
+                if name == "image_fill" {
+                    return self.image_fill(arguments, expression.span);
                 }
                 let Some(signature) = self.signatures.get(name) else {
                     self.diagnostics.push(Diagnostic::error(
@@ -706,6 +715,57 @@ impl<'a> Lowerer<'a> {
         }
         self.moved.insert(image);
         Some(self.alloc(Type::Image, ValueKind::ImageZero { image }, span, true))
+    }
+
+    fn image_fill(
+        &mut self,
+        arguments: &[ast::Argument],
+        span: crate::source::Span,
+    ) -> Option<ValueId> {
+        if arguments.len() != 2 || arguments.iter().any(|argument| argument.name.is_some()) {
+            self.diagnostics.push(
+                Diagnostic::error("image_fill expects positional Image and u8 arguments", span)
+                    .with_note("example: filled = image_fill(img, value)"),
+            );
+            return None;
+        }
+        let image = self.expression(arguments[0].value)?;
+        let actual_image = self.values[image.0 as usize].ty;
+        if actual_image != Type::Image {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "image_fill requires owned Image, not {}",
+                        actual_image.name()
+                    ),
+                    arguments[0].span,
+                )
+                .with_note("read-only ImageView values cannot be mutated"),
+            );
+            return None;
+        }
+        let value = self.expression(arguments[1].value)?;
+        let actual_value = self.values[value.0 as usize].ty;
+        if actual_value != Type::U8 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "image_fill requires u8 fill value, not {}",
+                        actual_value.name()
+                    ),
+                    arguments[1].span,
+                )
+                .with_note("integer literals are i64; pass a u8 transform parameter for now"),
+            );
+            return None;
+        }
+        self.moved.insert(image);
+        Some(self.alloc(
+            Type::Image,
+            ValueKind::ImageFill { image, value },
+            span,
+            true,
+        ))
     }
 }
 
@@ -1025,6 +1085,86 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("requires owned Image"))
+        );
+    }
+
+    #[test]
+    fn lowers_u8_image_fill_and_rejects_invalid_ownership_or_value_types() {
+        let compiled = compile(
+            "fill.tima",
+            "transform fill(img: Image, value: u8) -> Image {\n\
+                 filled = image_fill(img, value)\n\
+                 return filled\n\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.transforms.transforms[0].parameters[1].ty,
+            ir::Type::U8
+        );
+        assert!(matches!(
+            compiled.transforms.transforms[0].values[2].kind,
+            ir::ValueKind::ImageFill {
+                image: ir::ValueId(0),
+                value: ir::ValueId(1),
+            }
+        ));
+
+        let diagnostics = compile(
+            "moved.tima",
+            "transform bad(img: Image, value: u8) -> Image {\n\
+                 filled = image_fill(img, value)\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("already been moved"))
+        );
+
+        let diagnostics = compile(
+            "view.tima",
+            "transform bad(img: ImageView, value: u8) -> ImageView { return image_fill(img, value) }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("requires owned Image"))
+        );
+
+        let diagnostics = compile(
+            "value.tima",
+            "transform bad(img: Image, value: i64) -> Image { return image_fill(img, value) }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("requires u8 fill value"))
+        );
+    }
+
+    #[test]
+    fn permits_u8_comparisons_but_not_arithmetic() {
+        compile(
+            "compare.tima",
+            "transform before(left: u8, right: u8) -> bool { return left < right }\n\
+             transform same(left: u8, right: u8) -> bool { return left == right }\n",
+        )
+        .unwrap();
+
+        let diagnostics = compile(
+            "arithmetic.tima",
+            "transform add(left: u8, right: u8) -> u8 { return left + right }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("inner arithmetic"))
         );
     }
 

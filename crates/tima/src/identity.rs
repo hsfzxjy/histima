@@ -218,6 +218,11 @@ impl TransformIdentityResolver<'_> {
                     hasher.u8(5);
                     hasher.u32(image.0);
                 }
+                ValueKind::ImageFill { image, value } => {
+                    hasher.u8(6);
+                    hasher.u32(image.0);
+                    hasher.u32(value.0);
+                }
                 ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
                     hasher.u8(4);
                     hasher.u8(0);
@@ -469,6 +474,7 @@ fn encode_type(hasher: &mut CanonicalHasher, ty: Type) {
         Type::F32 => 2,
         Type::Image => 3,
         Type::ImageView => 4,
+        Type::U8 => 5,
     });
 }
 
@@ -822,6 +828,21 @@ mod tests {
         assert_ne!(
             keep.identities.get(TransformId(0)),
             clear.identities.get(TransformId(0))
+        );
+
+        let keep_with_value = crate::compile(
+            "keep_value.tima",
+            "transform image(img: Image, value: u8) -> Image { return img }\n",
+        )
+        .unwrap();
+        let fill = crate::compile(
+            "fill.tima",
+            "transform image(img: Image, value: u8) -> Image { return image_fill(img, value) }\n",
+        )
+        .unwrap();
+        assert_ne!(
+            keep_with_value.identities.get(TransformId(0)),
+            fill.identities.get(TransformId(0))
         );
     }
 

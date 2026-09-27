@@ -1283,6 +1283,7 @@ fn float_comparison(op: BinaryOp, left: f32, right: f32) -> bool {
 #[derive(Clone, Copy, Debug)]
 enum NativeScalar {
     Bool(bool),
+    U8(u8),
     I64(i64),
     F32(f32),
 }
@@ -1387,6 +1388,20 @@ impl IrInterpreter<'_> {
                             unreachable!("typed image_zero input is an available owned image")
                         };
                         image.storage.bytes.fill(0);
+                        InterpretedValue::Image(image)
+                    }
+                    ValueKind::ImageFill { image, value: fill } => {
+                        let NativeScalar::U8(fill) =
+                            values[fill.0 as usize].as_ref().unwrap().scalar()
+                        else {
+                            unreachable!("typed image_fill value is u8")
+                        };
+                        let Some(InterpretedValue::Image(mut image)) =
+                            values[image.0 as usize].take()
+                        else {
+                            unreachable!("typed image_fill input is an available owned image")
+                        };
+                        image.storage.bytes.fill(fill);
                         InterpretedValue::Image(image)
                     }
                     ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
@@ -1649,6 +1664,12 @@ fn lower_native_argument(
             },
             keep_alive: BoundaryStorage::Scalar,
         }),
+        (Type::U8, ValueData::Integer(value)) => Ok(LoweredArgument {
+            abi: AbiValue {
+                u8_value: checked_u8(value, span)?,
+            },
+            keep_alive: BoundaryStorage::Scalar,
+        }),
         (Type::I64, ValueData::Integer(value)) => Ok(LoweredArgument {
             abi: AbiValue { i64_value: value },
             keep_alive: BoundaryStorage::Scalar,
@@ -1712,6 +1733,7 @@ fn freeze_native_result(
     unsafe {
         match ty {
             Type::Bool => Ok(freeze_scalar(NativeScalar::Bool(result.boolean != 0))),
+            Type::U8 => Ok(freeze_scalar(NativeScalar::U8(result.u8_value))),
             Type::I64 => Ok(freeze_scalar(NativeScalar::I64(result.i64_value))),
             Type::F32 => Ok(freeze_scalar(NativeScalar::F32(result.f32_value))),
             Type::Image => freeze_owned_image(result.image, arguments, span),
@@ -1813,6 +1835,9 @@ fn lower_interpreted_value(
         (Type::Bool, ValueData::Bool(value)) => {
             Ok(InterpretedValue::Scalar(NativeScalar::Bool(value)))
         }
+        (Type::U8, ValueData::Integer(value)) => Ok(InterpretedValue::Scalar(NativeScalar::U8(
+            checked_u8(value, span)?,
+        ))),
         (Type::I64, ValueData::Integer(value)) => {
             Ok(InterpretedValue::Scalar(NativeScalar::I64(value)))
         }
@@ -1856,6 +1881,9 @@ fn clone_interpreted_argument(
         (Type::Bool, InterpretedValue::Scalar(NativeScalar::Bool(value))) => {
             Ok(freeze_scalar(NativeScalar::Bool(*value)))
         }
+        (Type::U8, InterpretedValue::Scalar(NativeScalar::U8(value))) => {
+            Ok(freeze_scalar(NativeScalar::U8(*value)))
+        }
         (Type::I64, InterpretedValue::Scalar(NativeScalar::I64(value))) => {
             Ok(freeze_scalar(NativeScalar::I64(*value)))
         }
@@ -1890,6 +1918,7 @@ fn freeze_interpreted_value(value: InterpretedValue) -> OuterValue {
 fn freeze_scalar(value: NativeScalar) -> OuterValue {
     OuterValue::plain(match value {
         NativeScalar::Bool(value) => ValueData::Bool(value),
+        NativeScalar::U8(value) => ValueData::Integer(i64::from(value)),
         NativeScalar::I64(value) => ValueData::Integer(value),
         NativeScalar::F32(value) => ValueData::Float(value),
     })
@@ -1914,6 +1943,7 @@ fn native_binary(
     } else if op.is_equality() {
         let equal = match (left, right) {
             (NativeScalar::Bool(left), NativeScalar::Bool(right)) => left == right,
+            (NativeScalar::U8(left), NativeScalar::U8(right)) => left == right,
             (NativeScalar::I64(left), NativeScalar::I64(right)) => left == right,
             (NativeScalar::F32(left), NativeScalar::F32(right)) => left == right,
             _ => unreachable!("typed equality operands are matching scalar values"),
@@ -1925,6 +1955,9 @@ fn native_binary(
         }))
     } else {
         match (left, right) {
+            (NativeScalar::U8(left), NativeScalar::U8(right)) => Ok(NativeScalar::Bool(
+                integer_comparison(op, i64::from(left), i64::from(right)),
+            )),
             (NativeScalar::I64(left), NativeScalar::I64(right)) => {
                 Ok(NativeScalar::Bool(integer_comparison(op, left, right)))
             }
@@ -1934,6 +1967,16 @@ fn native_binary(
             _ => unreachable!("typed ordering operands are matching numeric values"),
         }
     }
+}
+
+fn checked_u8(value: i64, span: Span) -> Result<u8, Diagnostic> {
+    u8::try_from(value).map_err(|_| {
+        Diagnostic::error(
+            format!("outer integer {value} cannot cross into native parameter type u8"),
+            span,
+        )
+        .with_note("u8 values must be in the inclusive range 0..=255")
+    })
 }
 
 #[cfg(test)]
@@ -2671,6 +2714,128 @@ mod tests {
             panic!("expected replayed image")
         };
         assert_eq!(replayed.bytes(), &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn u8_image_fill_mutates_detached_storage_in_both_engines() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n\
+             transform keep(value: u8) -> u8 { return value }\n\
+             transform before(left: u8, right: u8) -> bool { return left < right }\n\
+             filled = fill(img, amount)\n\
+             kept = keep(amount)\n\
+             ordered = before(amount, larger)\n",
+        )
+        .unwrap();
+        let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
+        let input_content = content_identity(&input).unwrap();
+        let input = input.with_lineage(Lineage::observed_source("cat.raw", input_content));
+        let amount = OuterValue::plain(ValueData::Integer(173));
+
+        let reference_engine = IrInterpreter {
+            module: &compiled.transforms,
+            capabilities: None,
+        };
+        let reference = execute_with(
+            &compiled,
+            &reference_engine,
+            BTreeMap::from([
+                ("img".to_owned(), input.clone()),
+                ("amount".to_owned(), amount.clone()),
+                (
+                    "larger".to_owned(),
+                    OuterValue::plain(ValueData::Integer(200)),
+                ),
+            ]),
+            None,
+        )
+        .unwrap();
+        let ValueData::Image(reference_result) = &reference.bindings["filled"].data else {
+            panic!("expected reference image")
+        };
+        assert_eq!(reference_result.bytes(), &[173, 173, 173, 173]);
+        assert_eq!(reference.bindings["kept"].data, ValueData::Integer(173));
+        assert_eq!(reference.bindings["ordered"].data, ValueData::Bool(true));
+
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let mut cache = TransformResultCache::default();
+        let execution = execute_native_with_bindings_cached(
+            &compiled,
+            &native,
+            BTreeMap::from([
+                ("img".to_owned(), input.clone()),
+                ("amount".to_owned(), amount),
+                (
+                    "larger".to_owned(),
+                    OuterValue::plain(ValueData::Integer(200)),
+                ),
+            ]),
+            &mut cache,
+        )
+        .unwrap();
+        let ValueData::Image(original) = &execution.bindings["img"].data else {
+            panic!("expected original image")
+        };
+        let ValueData::Image(native_result) = &execution.bindings["filled"].data else {
+            panic!("expected native image")
+        };
+        assert_eq!(original.bytes(), &[1, 2, 3, 4]);
+        assert_eq!(native_result.bytes(), &[173, 173, 173, 173]);
+        assert!(!original.shares_storage_with(native_result));
+        assert_eq!(execution.bindings["kept"].data, ValueData::Integer(173));
+        assert_eq!(execution.bindings["ordered"].data, ValueData::Bool(true));
+        assert_eq!(
+            reference.bindings["filled"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id(),
+            execution.bindings["filled"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id()
+        );
+
+        let recorded = execution.bindings["filled"].clone();
+        let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
+        cache.invalidate_recipe(recipe);
+        let replayed = replay_native(&compiled, &native, &recorded, &mut cache).unwrap();
+        let ValueData::Image(replayed) = replayed.data else {
+            panic!("expected replayed image")
+        };
+        assert_eq!(replayed.bytes(), &[173, 173, 173, 173]);
+
+        let invalid_bindings = BTreeMap::from([
+            ("img".to_owned(), input),
+            (
+                "amount".to_owned(),
+                OuterValue::plain(ValueData::Integer(256)),
+            ),
+            (
+                "larger".to_owned(),
+                OuterValue::plain(ValueData::Integer(200)),
+            ),
+        ]);
+        let diagnostics =
+            execute_with(&compiled, &reference_engine, invalid_bindings.clone(), None).unwrap_err();
+        assert!(diagnostics[0].message.contains("parameter type u8"));
+        let diagnostics = execute_native_with_bindings_cached(
+            &compiled,
+            &native,
+            invalid_bindings,
+            &mut TransformResultCache::default(),
+        )
+        .unwrap_err();
+        assert!(diagnostics[0].message.contains("parameter type u8"));
     }
 
     #[test]

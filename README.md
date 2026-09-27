@@ -47,6 +47,13 @@ interpreter and generated-C backend implement the same typed IR operation, while
 the outer input remains immutable because shared storage is detached at the
 boundary. This is intentionally narrower than general field or buffer mutation.
 
+The same ownership path now supports `image_fill(image, value)`, where `value`
+is a native-safe `u8`. Outer integers cross a `u8` parameter only after a
+`0..=255` range check; inner integer literals remain `i64`, and implicit numeric
+conversions or `u8` arithmetic are intentionally deferred. `u8` equality and
+ordering are statically checked and execute consistently in the reference and C
+paths.
+
 Every checked transform also receives a stable semantic identity derived from
 canonical typed IR and referenced transform identities. Source formatting,
 comments, local names, declaration order, backend, and target do not affect it.

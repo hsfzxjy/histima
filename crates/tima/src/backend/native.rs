@@ -393,6 +393,7 @@ pub(crate) struct AbiImageView {
 #[derive(Clone, Copy)]
 pub(crate) union AbiValue {
     pub(crate) boolean: u8,
+    pub(crate) u8_value: u8,
     pub(crate) i64_value: i64,
     pub(crate) f32_value: f32,
     pub(crate) image: AbiImage,

@@ -9,7 +9,7 @@ use crate::ir::{Constant, RuntimeCall, Terminator, Transform, TypedModule, Value
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "7";
+pub const C_BACKEND_VERSION: &str = "8";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -22,7 +22,7 @@ impl NativeBackend for CBackend {
         source.push_str(
             "typedef struct { unsigned char *data; size_t width; size_t height; size_t stride; } TimaImage;\n\
              typedef struct { const unsigned char *data; size_t width; size_t height; size_t stride; } TimaImageView;\n\
-             typedef union { bool boolean; int64_t i64_value; float f32_value; TimaImage image; TimaImageView image_view; } TimaValue;\n\
+             typedef union { bool boolean; uint8_t u8_value; int64_t i64_value; float f32_value; TimaImage image; TimaImageView image_view; } TimaValue;\n\
              typedef int32_t (*TimaEnvironmentI64Fn)(void *context, uint32_t transform, uint32_t callsite, const unsigned char *name, size_t name_len, int64_t *result);\n\
              typedef struct { void *context; TimaEnvironmentI64Fn environment_i64; int32_t status; } TimaRuntime;\n\n\
              #if defined(_WIN32)\n\
@@ -46,6 +46,21 @@ impl NativeBackend for CBackend {
                  if (runtime->environment_i64 == NULL) { runtime->status = -2; return 0; }\n\
                  runtime->status = runtime->environment_i64(runtime->context, transform, callsite, name, name_len, &result);\n\
                  return runtime->status == 0 ? result : 0;\n\
+                 }\n\n",
+            );
+        }
+
+        if module.transforms.iter().any(|transform| {
+            transform
+                .values
+                .iter()
+                .any(|value| matches!(value.kind, ValueKind::ImageFill { .. }))
+        }) {
+            source.push_str(
+                "static TimaImage tima_image_fill(TimaImage image, uint8_t value) {\n\
+                 size_t byte_len = image.height * image.stride;\n\
+                 for (size_t index = 0; index < byte_len; ++index) image.data[index] = value;\n\
+                 return image;\n\
                  }\n\n",
             );
         }
@@ -173,6 +188,7 @@ fn abi_adapter(output: &mut String, index: usize, transform: &Transform) {
 fn abi_field(ty: crate::ir::Type) -> &'static str {
     match ty {
         crate::ir::Type::Bool => "boolean",
+        crate::ir::Type::U8 => "u8_value",
         crate::ir::Type::I64 => "i64_value",
         crate::ir::Type::F32 => "f32_value",
         crate::ir::Type::Image => "image",
@@ -242,6 +258,11 @@ fn expression(transform: &Transform, transform_index: usize, id: ValueId) -> Str
         ValueKind::ImageZero { image } => {
             format!("tima_image_zero({})", value_name(transform, *image))
         }
+        ValueKind::ImageFill { image, value } => format!(
+            "tima_image_fill({}, {})",
+            value_name(transform, *image),
+            value_name(transform, *value)
+        ),
         ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
             let bytes = name
                 .as_bytes()
@@ -341,6 +362,24 @@ mod tests {
         );
         assert!(artifact.source.contains("image.data[index] = 0;"));
         assert!(artifact.source.contains("v1 = tima_image_zero(p0);"));
+    }
+
+    #[test]
+    fn emits_u8_image_fill_from_backend_neutral_ir() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n",
+        )
+        .unwrap();
+        let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(
+            artifact
+                .source
+                .contains("static TimaImage tima_image_fill(TimaImage image, uint8_t value)")
+        );
+        assert!(artifact.source.contains("image.data[index] = value;"));
+        assert!(artifact.source.contains("v2 = tima_image_fill(p0, p1);"));
+        assert!(artifact.source.contains("args[1].u8_value"));
     }
 
     #[test]
