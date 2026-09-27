@@ -32,6 +32,19 @@ deduplicate bytes, and every read revalidates stored content before returning
 it. The workspace implements Tima's explicit asset-read capability and never
 falls back to an ambient path that has not been imported.
 
+The initial `histima` CLI exposes that storage boundary across processes:
+
+```text
+cargo run -p histima -- init build/my-workspace
+cargo run -p histima -- import build/my-workspace examples/tiny.ppm
+cargo run -p histima -- stats build/my-workspace
+cargo run -p histima -- materialize build/my-workspace <content-id> output.ppm
+```
+
+Materialization verifies the stored Content ID, publishes through a temporary
+file, and refuses to replace an existing destination. Tima identities use one
+canonical durable text form: 64 lowercase hexadecimal characters.
+
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
 comparisons, transform calls, and pipelines. `tima run` compiles checked scalar

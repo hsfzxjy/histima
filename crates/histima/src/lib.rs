@@ -4,6 +4,7 @@
 //! SQLite stores queryable identities and relationships; it is not the blob
 //! store. This crate intentionally starts with source import and lookup only.
 
+mod atomic_file;
 mod cas;
 mod catalog;
 mod error;
@@ -86,6 +87,15 @@ impl Workspace {
 
     pub fn content_path(&self, identity: ContentIdentity) -> PathBuf {
         self.content.object_path(identity)
+    }
+
+    pub fn materialize_content(
+        &self,
+        identity: ContentIdentity,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let bytes = self.read_content(identity)?;
+        atomic_file::write_new(destination.as_ref(), &bytes)
     }
 
     pub fn catalog_info(&self) -> Result<CatalogInfo> {
@@ -229,6 +239,34 @@ mod tests {
         assert!(matches!(error, Error::Integrity { .. }));
         let error = workspace.import_file(&input).unwrap_err();
         assert!(matches!(error, Error::Integrity { .. }));
+    }
+
+    #[test]
+    fn materialization_is_atomic_and_does_not_replace_existing_files() {
+        let test = TestDirectory::new("materialize");
+        let input = test.path().join("source.bin");
+        let output = test.path().join("output.bin");
+        write(&input, b"stored bytes");
+        let mut workspace = Workspace::open(test.path().join("workspace")).unwrap();
+        let imported = workspace.import_file(input).unwrap();
+
+        workspace
+            .materialize_content(imported.content_id, &output)
+            .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"stored bytes");
+
+        let error = workspace
+            .materialize_content(imported.content_id, &output)
+            .unwrap_err();
+        assert!(matches!(error, Error::MaterializationExists(_)));
+        assert_eq!(fs::read(&output).unwrap(), b"stored bytes");
+        assert!(test.path().read_dir().unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".histima-")
+        }));
     }
 
     #[test]

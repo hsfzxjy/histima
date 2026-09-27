@@ -23,6 +23,47 @@ impl Digest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityParseError {
+    message: String,
+}
+
+impl fmt::Display for IdentityParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for IdentityParseError {}
+
+fn parse_digest(text: &str) -> Result<Digest, IdentityParseError> {
+    if text.len() != 64 {
+        return Err(IdentityParseError {
+            message: format!(
+                "identity must contain exactly 64 lowercase hexadecimal characters, found {}",
+                text.len()
+            ),
+        });
+    }
+    let mut bytes = [0_u8; 32];
+    let (pairs, remainder) = text.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (index, pair) in pairs.iter().enumerate() {
+        bytes[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Ok(Digest(bytes))
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, IdentityParseError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(IdentityParseError {
+            message: "identity must use canonical lowercase hexadecimal characters".to_owned(),
+        }),
+    }
+}
+
 fn format_digest(digest: Digest, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     for byte in digest.0 {
         write!(formatter, "{byte:02x}")?;
@@ -53,6 +94,14 @@ macro_rules! identity_type {
                     .debug_tuple(stringify!($name))
                     .field(&self.to_string())
                     .finish()
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = IdentityParseError;
+
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                parse_digest(text).map(Self)
             }
         }
     };
@@ -735,6 +784,21 @@ mod tests {
         assert_eq!(
             hex(abc.finish()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn identity_text_round_trips_in_canonical_lowercase_hex() {
+        let identity = byte_content_identity(b"round trip");
+        let text = identity.to_string();
+
+        assert_eq!(text.parse::<ContentIdentity>().unwrap(), identity);
+        assert!(text.to_uppercase().parse::<ContentIdentity>().is_err());
+        assert!(text[..63].parse::<ContentIdentity>().is_err());
+        assert!(
+            format!("{}g", &text[..63])
+                .parse::<ContentIdentity>()
+                .is_err()
         );
     }
 

@@ -13,6 +13,8 @@ pub enum Error {
     Database(rusqlite::Error),
     NonUtf8Locator(PathBuf),
     AssetNotFound(String),
+    InvalidMaterializationPath(PathBuf),
+    MaterializationExists(PathBuf),
     Integrity {
         path: PathBuf,
         expected: String,
@@ -56,6 +58,16 @@ impl fmt::Display for Error {
             Self::AssetNotFound(locator) => {
                 write!(formatter, "asset locator {locator:?} is not imported")
             }
+            Self::InvalidMaterializationPath(path) => write!(
+                formatter,
+                "materialization path must name a file: {}",
+                path.display()
+            ),
+            Self::MaterializationExists(path) => write!(
+                formatter,
+                "refusing to replace existing materialization: {}",
+                path.display()
+            ),
             Self::Integrity {
                 path,
                 expected,
@@ -79,6 +91,8 @@ impl StdError for Error {
             Self::Database(source) => Some(source),
             Self::NonUtf8Locator(_)
             | Self::AssetNotFound(_)
+            | Self::InvalidMaterializationPath(_)
+            | Self::MaterializationExists(_)
             | Self::Integrity { .. }
             | Self::CatalogInvariant(_) => None,
         }

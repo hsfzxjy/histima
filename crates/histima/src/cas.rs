@@ -52,6 +52,7 @@ impl ContentStore {
         let mut temporary = self.create_temporary_file()?;
         let temporary_path = temporary.path().to_owned();
         write_all_and_sync(temporary.file(), &temporary_path, bytes)?;
+        temporary.close();
         match fs::rename(temporary.path(), &destination) {
             Ok(()) => {}
             Err(_error) if destination.exists() => {
@@ -103,7 +104,12 @@ impl ContentStore {
                 std::process::id()
             ));
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok(PendingFile { path, file }),
+                Ok(file) => {
+                    return Ok(PendingFile {
+                        path,
+                        file: Some(file),
+                    });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
                     return Err(Error::io("create temporary content object", &path, error));
@@ -175,7 +181,7 @@ fn validate_bytes_text(path: &Path, expected: &str, bytes: &[u8]) -> Result<()> 
 
 struct PendingFile {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
 }
 
 impl PendingFile {
@@ -184,12 +190,19 @@ impl PendingFile {
     }
 
     fn file(&mut self) -> &mut File {
-        &mut self.file
+        self.file
+            .as_mut()
+            .expect("temporary content file is still open")
+    }
+
+    fn close(&mut self) {
+        drop(self.file.take());
     }
 }
 
 impl Drop for PendingFile {
     fn drop(&mut self) {
+        drop(self.file.take());
         let _ = fs::remove_file(&self.path);
     }
 }
