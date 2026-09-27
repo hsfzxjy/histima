@@ -149,6 +149,14 @@ replay, but remain outside typed inner IR and the generated-C artifact cache.
 The CLI explicitly supplies local-file access; the library has no ambient
 filesystem fallback.
 
+The same boundary now provides `decode.png` and `encode.png`. PNG decoding
+accepts still images, normalizes supported grayscale, RGB, palette, and alpha
+forms to validated RGBA8, and deliberately rejects APNG. Encoding preserves
+RGBA bytes while removing row padding and ancillary metadata, with pinned codec,
+filter, and compression settings plus a snapshot-tested output identity. Any
+future codec-setting change must bump the host-transform implementation version
+so existing Recipe IDs cannot silently acquire different output semantics.
+
 Encoded bytes can be persisted with the outer sink
 `bytes | save("output.ppm")`. Saving requires an explicit host asset-output
 capability and returns the same immutable value with the same derivation

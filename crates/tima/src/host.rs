@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::capability::RuntimeCapabilities;
@@ -8,11 +9,14 @@ use crate::runtime::{ImageFormat, ImageValue, OuterValue, ValueData};
 use crate::source::Span;
 
 const PPM_TRANSFORM_VERSION: u32 = 1;
+const PNG_TRANSFORM_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostTransform {
     DecodePpm,
     EncodePpm,
+    DecodePng,
+    EncodePng,
 }
 
 impl HostTransform {
@@ -20,32 +24,45 @@ impl HostTransform {
         match name {
             "decode.ppm" => Some(Self::DecodePpm),
             "encode.ppm" => Some(Self::EncodePpm),
+            "decode.png" => Some(Self::DecodePng),
+            "encode.png" => Some(Self::EncodePng),
             _ => None,
         }
     }
 
     pub(crate) fn from_identity(identity: TransformIdentity) -> Option<Self> {
-        [Self::DecodePpm, Self::EncodePpm]
-            .into_iter()
-            .find(|transform| transform.identity() == identity)
+        [
+            Self::DecodePpm,
+            Self::EncodePpm,
+            Self::DecodePng,
+            Self::EncodePng,
+        ]
+        .into_iter()
+        .find(|transform| transform.identity() == identity)
     }
 
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::DecodePpm => "decode.ppm",
             Self::EncodePpm => "encode.ppm",
+            Self::DecodePng => "decode.png",
+            Self::EncodePng => "encode.png",
         }
     }
 
     pub(crate) const fn parameters(self) -> &'static [&'static str] {
         match self {
-            Self::DecodePpm => &["asset"],
-            Self::EncodePpm => &["image"],
+            Self::DecodePpm | Self::DecodePng => &["asset"],
+            Self::EncodePpm | Self::EncodePng => &["image"],
         }
     }
 
     pub(crate) fn identity(self) -> TransformIdentity {
-        host_transform_identity(self.name(), PPM_TRANSFORM_VERSION)
+        let version = match self {
+            Self::DecodePpm | Self::EncodePpm => PPM_TRANSFORM_VERSION,
+            Self::DecodePng | Self::EncodePng => PNG_TRANSFORM_VERSION,
+        };
+        host_transform_identity(self.name(), version)
     }
 
     pub(crate) fn prepare(
@@ -61,11 +78,11 @@ impl HostTransform {
             ));
         }
         match self {
-            Self::DecodePpm => {
+            Self::DecodePpm | Self::DecodePng => {
                 let (asset, span) = &mut arguments[0];
                 let ValueData::Asset(value) = &asset.data else {
                     return Err(Diagnostic::error(
-                        "decode.ppm expects an asset value",
+                        format!("{} expects an asset value", self.name()),
                         *span,
                     ));
                 };
@@ -119,16 +136,16 @@ impl HostTransform {
                     decode_bytes: Some(bytes),
                 })
             }
-            Self::EncodePpm => {
+            Self::EncodePpm | Self::EncodePng => {
                 let ValueData::Image(image) = &arguments[0].0.data else {
                     return Err(Diagnostic::error(
-                        "encode.ppm expects an image value",
+                        format!("{} expects an image value", self.name()),
                         arguments[0].1,
                     ));
                 };
                 if image.format() != ImageFormat::Rgba8 {
                     return Err(Diagnostic::error(
-                        "encode.ppm requires an RGBA8 image",
+                        format!("{} requires an RGBA8 image", self.name()),
                         arguments[0].1,
                     ));
                 }
@@ -160,6 +177,17 @@ impl PreparedHostInvocation {
                 Ok(OuterValue::plain(ValueData::Bytes(Arc::from(encode_ppm(
                     image,
                 )))))
+            }
+            HostTransform::DecodePng => {
+                let bytes = self.decode_bytes.expect("decode preparation retains bytes");
+                decode_png(&bytes, self.arguments[0].1).map(OuterValue::image)
+            }
+            HostTransform::EncodePng => {
+                let ValueData::Image(image) = &self.arguments[0].0.data else {
+                    unreachable!("prepared encode.png argument is an image")
+                };
+                encode_png(image, self.arguments[0].1)
+                    .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::from(bytes))))
             }
         }
     }
@@ -273,6 +301,140 @@ fn encode_ppm(image: &ImageValue) -> Vec<u8> {
     output.into_bytes()
 }
 
+fn decode_png(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().map_err(|error| {
+        Diagnostic::error(
+            format!("decode.png could not read PNG metadata: {error}"),
+            span,
+        )
+    })?;
+    if reader.info().animation_control.is_some() {
+        return Err(Diagnostic::error(
+            "decode.png does not support animated PNG images",
+            span,
+        ));
+    }
+    let buffer_size = reader.output_buffer_size().ok_or_else(|| {
+        Diagnostic::error("decode.png image dimensions exceed this runtime", span)
+    })?;
+    let mut decoded = vec![0; buffer_size];
+    let output = reader.next_frame(&mut decoded).map_err(|error| {
+        Diagnostic::error(
+            format!("decode.png could not decode image data: {error}"),
+            span,
+        )
+    })?;
+    if output.bit_depth != png::BitDepth::Eight {
+        return Err(Diagnostic::error(
+            format!(
+                "decode.png produced unsupported {:?} channel depth",
+                output.bit_depth
+            ),
+            span,
+        ));
+    }
+    let width = usize::try_from(output.width)
+        .map_err(|_| Diagnostic::error("decode.png width exceeds usize", span))?;
+    let height = usize::try_from(output.height)
+        .map_err(|_| Diagnostic::error("decode.png height exceeds usize", span))?;
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| Diagnostic::error("decode.png pixel count overflows usize", span))?;
+    let rgba_length = pixels
+        .checked_mul(4)
+        .ok_or_else(|| Diagnostic::error("decode.png RGBA byte length overflows usize", span))?;
+    let channels = output.color_type.samples();
+    let expected_line = width
+        .checked_mul(channels)
+        .ok_or_else(|| Diagnostic::error("decode.png row byte length overflows usize", span))?;
+    if output.line_size != expected_line {
+        return Err(Diagnostic::error(
+            "decode.png returned an inconsistent row layout",
+            span,
+        ));
+    }
+    let decoded = &decoded[..output.buffer_size()];
+    let mut rgba = Vec::with_capacity(rgba_length);
+    for pixel in decoded.chunks_exact(channels) {
+        match output.color_type {
+            png::ColorType::Grayscale => {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 255])
+            }
+            png::ColorType::GrayscaleAlpha => {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]])
+            }
+            png::ColorType::Rgb => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]),
+            png::ColorType::Rgba => rgba.extend_from_slice(pixel),
+            png::ColorType::Indexed => {
+                return Err(Diagnostic::error(
+                    "decode.png palette expansion did not produce RGB pixels",
+                    span,
+                ));
+            }
+        }
+    }
+    if rgba.len() != rgba_length {
+        return Err(Diagnostic::error(
+            "decode.png returned an incomplete pixel buffer",
+            span,
+        ));
+    }
+    let stride = width
+        .checked_mul(4)
+        .ok_or_else(|| Diagnostic::error("decode.png RGBA stride overflows usize", span))?;
+    ImageValue::new_rgba8(width, height, stride, rgba).map_err(|error| {
+        Diagnostic::error(format!("decode.png produced invalid image: {error}"), span)
+    })
+}
+
+fn encode_png(image: &ImageValue, span: Span) -> Result<Vec<u8>, Diagnostic> {
+    let width = u32::try_from(image.width())
+        .map_err(|_| Diagnostic::error("encode.png width exceeds PNG limits", span))?;
+    let height = u32::try_from(image.height())
+        .map_err(|_| Diagnostic::error("encode.png height exceeds PNG limits", span))?;
+    let row_length = image
+        .width()
+        .checked_mul(4)
+        .ok_or_else(|| Diagnostic::error("encode.png row byte length overflows usize", span))?;
+    let packed_length = row_length
+        .checked_mul(image.height())
+        .ok_or_else(|| Diagnostic::error("encode.png image byte length overflows usize", span))?;
+    let mut packed = Vec::with_capacity(packed_length);
+    for row in 0..image.height() {
+        let start = row
+            .checked_mul(image.stride())
+            .ok_or_else(|| Diagnostic::error("encode.png row offset overflows usize", span))?;
+        packed.extend_from_slice(&image.bytes()[start..start + row_length]);
+    }
+
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_deflate_compression(png::DeflateCompression::Level(6));
+        encoder.set_filter(png::Filter::Paeth);
+        let mut writer = encoder.write_header().map_err(|error| {
+            Diagnostic::error(
+                format!("encode.png could not write PNG header: {error}"),
+                span,
+            )
+        })?;
+        writer.write_image_data(&packed).map_err(|error| {
+            Diagnostic::error(
+                format!("encode.png could not write image data: {error}"),
+                span,
+            )
+        })?;
+        writer.finish().map_err(|error| {
+            Diagnostic::error(format!("encode.png could not finish image: {error}"), span)
+        })?;
+    }
+    Ok(encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +451,74 @@ mod tests {
         let image = ImageValue::new_rgba8(1, 1, 6, vec![1, 2, 3, 4, 99, 100]).unwrap();
 
         assert_eq!(encode_ppm(&image), b"P3\n1 1\n255\n1 2 3\n");
+    }
+
+    #[test]
+    fn png_encoding_is_deterministic_and_ignores_row_padding() {
+        let image =
+            ImageValue::new_rgba8(2, 1, 10, vec![1, 2, 3, 4, 200, 150, 100, 50, 99, 100]).unwrap();
+
+        let first = encode_png(&image, Span::default()).unwrap();
+        let second = encode_png(&image, Span::default()).unwrap();
+        let decoded = decode_png(&first, Span::default()).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(&first[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 1);
+        assert_eq!(decoded.stride(), 8);
+        assert_eq!(decoded.bytes(), &[1, 2, 3, 4, 200, 150, 100, 50]);
+        assert_eq!(
+            byte_content_identity(&first).to_string(),
+            "01d6d2f53cdbc115059b2116ff7b33acbe95f4c5ba138980086b705a9fd0cee0"
+        );
+    }
+
+    #[test]
+    fn png_decoding_normalizes_grayscale_to_rgba8() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 2, 1);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[5, 200]).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let decoded = decode_png(&encoded, Span::default()).unwrap();
+
+        assert_eq!(decoded.format(), ImageFormat::Rgba8);
+        assert_eq!(decoded.bytes(), &[5, 5, 5, 255, 200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn png_decoding_reports_invalid_input() {
+        let diagnostic = decode_png(b"not a PNG", Span::default()).unwrap_err();
+
+        assert!(
+            diagnostic
+                .message
+                .contains("decode.png could not read PNG metadata")
+        );
+    }
+
+    #[test]
+    fn png_decoding_rejects_animation() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_animated(2, 0).unwrap();
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[1, 2, 3, 4]).unwrap();
+            writer.write_image_data(&[5, 6, 7, 8]).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let diagnostic = decode_png(&encoded, Span::default()).unwrap_err();
+
+        assert!(diagnostic.message.contains("does not support animated PNG"));
     }
 }

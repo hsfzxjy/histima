@@ -264,6 +264,61 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     );
 }
 
+#[test]
+fn cli_runs_records_and_replays_a_png_pipeline() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let source = test.path().join("source.png");
+    let script = test.path().join("pipeline.tima");
+    let output = test.path().join("darkened.png");
+    fs::write(
+        &source,
+        encode_test_png(2, 1, &[100, 50, 20, 255, 200, 100, 50, 128]),
+    )
+    .unwrap();
+    let source_locator = portable(&source);
+    let output_locator = portable(&output);
+    fs::write(
+        &script,
+        format!(
+            "source = asset({source_locator:?})\n\
+             transform darken(img: Image, factor: f32) -> Image {{\n\
+                 for p in img.pixels {{\n\
+                     p.r *= factor\n\
+                     p.g *= factor\n\
+                     p.b *= factor\n\
+                 }}\n\
+                 return img\n\
+             }}\n\
+             out = source | decode.png | darken(0.5) | encode.png\n\
+             saved = out | save({output_locator:?})\n"
+        ),
+    )
+    .unwrap();
+
+    assert_success(&histima(["init", text(&workspace)]));
+    assert_success(&histima(["import", text(&workspace), &source_locator]));
+    let run = histima(["run", text(&workspace), text(&script), "--record", "out"]);
+    assert_success(&run);
+    assert!(stdout(&run).contains("native_cache = miss"));
+    assert_eq!(
+        decode_test_png(&fs::read(&output).unwrap()),
+        vec![50, 25, 10, 255, 100, 50, 25, 128]
+    );
+    let recipe_id = field(&run, "recipe_id");
+
+    let trace = histima(["trace", text(&workspace), &recipe_id]);
+    assert_success(&trace);
+    assert!(stdout(&trace).contains("invoke decode.png"));
+    assert!(stdout(&trace).contains("invoke darken"));
+    assert!(stdout(&trace).contains("invoke encode.png"));
+
+    let replay = histima(["replay", text(&workspace), text(&script), &recipe_id]);
+    assert_success(&replay);
+    assert!(stdout(&replay).contains("result_cache_hits = 1"));
+    assert_eq!(field(&replay, "content_id"), field(&run, "content_id"));
+}
+
 fn histima<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_histima"))
         .args(arguments)
@@ -302,6 +357,30 @@ fn text(path: &Path) -> &str {
 
 fn portable(path: &Path) -> String {
     text(path).replace('\\', "/")
+}
+
+fn encode_test_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(rgba).unwrap();
+        writer.finish().unwrap();
+    }
+    encoded
+}
+
+fn decode_test_png(encoded: &[u8]) -> Vec<u8> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(encoded));
+    let mut reader = decoder.read_info().unwrap();
+    let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+    let output = reader.next_frame(&mut pixels).unwrap();
+    assert_eq!(output.color_type, png::ColorType::Rgba);
+    assert_eq!(output.bit_depth, png::BitDepth::Eight);
+    pixels.truncate(output.buffer_size());
+    pixels
 }
 
 struct TestDirectory(PathBuf);

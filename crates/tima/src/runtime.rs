@@ -2984,6 +2984,97 @@ mod tests {
     }
 
     #[test]
+    fn host_png_pipeline_runs_native_transform_with_lineage_and_replay() {
+        let compiled = crate::compile(
+            "pipeline.tima",
+            "source = asset(\"cat.png\")\n\
+             transform darken(img: Image, factor: f32) -> Image {\n\
+                 for p in img.pixels {\n\
+                     p.r *= factor\n\
+                     p.g *= factor\n\
+                     p.b *= factor\n\
+                 }\n\
+                 return img\n\
+             }\n\
+             decoded = source | decode.png\n\
+             darkened = decoded | darken(0.5)\n\
+             out = darkened | encode.png\n\
+             replayed = replay(out)\n\
+             derivation = trace(out)\n",
+        )
+        .unwrap();
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let input = encode_test_png(2, 1, &[100, 50, 20, 255, 200, 100, 50, 128]);
+        let assets = FixedAssets::one("cat.png", &input);
+        let mut cache = TransformResultCache::default();
+
+        let execution =
+            execute_native_cached_with_capabilities(&compiled, &native, &mut cache, &assets)
+                .unwrap();
+
+        let ValueData::Bytes(encoded) = &execution.bindings["out"].data else {
+            panic!("expected encoded bytes")
+        };
+        assert_eq!(
+            decode_test_png(encoded),
+            vec![50, 25, 10, 255, 100, 50, 25, 128]
+        );
+        assert_eq!(
+            execution.bindings["replayed"].data,
+            execution.bindings["out"].data
+        );
+        let ValueData::Lineage(lineage) = &execution.bindings["derivation"].data else {
+            panic!("expected lineage")
+        };
+        let rendered = lineage.render();
+        assert!(rendered.contains("source \"cat.png\" content="));
+        assert!(rendered.contains("invoke decode.png"));
+        assert!(rendered.contains("invoke darken"));
+        assert!(rendered.contains("invoke encode.png"));
+
+        let replayed = replay_native_with_capabilities(
+            &compiled,
+            &native,
+            &execution.bindings["out"],
+            &mut TransformResultCache::default(),
+            &assets,
+        )
+        .unwrap();
+        assert_eq!(replayed.data, execution.bindings["out"].data);
+    }
+
+    fn encode_test_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(rgba).unwrap();
+            writer.finish().unwrap();
+        }
+        encoded
+    }
+
+    fn decode_test_png(encoded: &[u8]) -> Vec<u8> {
+        let decoder = png::Decoder::new(std::io::Cursor::new(encoded));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let output = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(output.color_type, png::ColorType::Rgba);
+        assert_eq!(output.bit_depth, png::BitDepth::Eight);
+        pixels.truncate(output.buffer_size());
+        pixels
+    }
+
+    #[test]
     fn compiles_loads_and_runs_nested_transforms_as_native_code() {
         let compiled = crate::compile(
             "test.tima",
