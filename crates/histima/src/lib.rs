@@ -2,7 +2,8 @@
 //!
 //! Large immutable payloads live in a filesystem content-addressed store.
 //! SQLite stores queryable identities and relationships; it is not the blob
-//! store. This crate intentionally starts with source import and lookup only.
+//! store. Durable derived byte results retain separate recipe, content, and
+//! normalized lineage records for cross-process inspection.
 
 mod atomic_file;
 mod cas;
@@ -14,7 +15,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tima::capability::RuntimeCapabilities;
-use tima::identity::{ContentIdentity, SourceIdentity, source_identity};
+use tima::identity::{ContentIdentity, RecipeIdentity, SourceIdentity, source_identity};
+use tima::lineage::LineageNode;
+use tima::runtime::{OuterValue, ValueData};
 
 use cas::ContentStore;
 use catalog::Catalog;
@@ -29,6 +32,20 @@ pub struct ImportedAsset {
     pub content_id: ContentIdentity,
     pub source_id: SourceIdentity,
     pub byte_len: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedResult {
+    pub recipe_id: RecipeIdentity,
+    pub content_id: ContentIdentity,
+    pub byte_len: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableTrace {
+    pub recipe_id: RecipeIdentity,
+    pub content_id: ContentIdentity,
+    pub rendered: String,
 }
 
 pub struct Workspace {
@@ -74,9 +91,9 @@ impl Workspace {
             .catalog
             .current_source(locator)?
             .ok_or_else(|| Error::AssetNotFound(locator.to_owned()))?;
-        let bytes = self
-            .content
-            .read_recorded(&object.content_id, &object.relative_path)?;
+        let bytes =
+            self.content
+                .read_recorded(&object.content_id, &object.relative_path, object.kind)?;
         if bytes.len() as u64 != object.byte_len {
             return Err(Error::catalog(format!(
                 "content {} has catalog length {} but stored length {}",
@@ -89,7 +106,22 @@ impl Workspace {
     }
 
     pub fn read_content(&self, identity: ContentIdentity) -> Result<Vec<u8>> {
-        self.content.read(identity, &object_relative_path(identity))
+        let object = self
+            .catalog
+            .content(identity)?
+            .ok_or_else(|| Error::ContentNotFound(identity.to_string()))?;
+        let bytes =
+            self.content
+                .read_recorded(&object.content_id, &object.relative_path, object.kind)?;
+        if bytes.len() as u64 != object.byte_len {
+            return Err(Error::catalog(format!(
+                "content {} has catalog length {} but stored length {}",
+                object.content_id,
+                object.byte_len,
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
     }
 
     pub fn content_path(&self, identity: ContentIdentity) -> PathBuf {
@@ -103,6 +135,46 @@ impl Workspace {
     ) -> Result<()> {
         let bytes = self.read_content(identity)?;
         atomic_file::write_new(destination.as_ref(), &bytes)
+    }
+
+    /// Persists one invocation-derived immutable byte value and its semantic
+    /// lineage. Other outer value encodings remain intentionally unsupported.
+    pub fn record_value(&mut self, value: &OuterValue) -> Result<RecordedResult> {
+        let ValueData::Bytes(bytes) = &value.data else {
+            return Err(Error::ValueNotRecordable(
+                "durable recording currently supports only immutable byte values".to_owned(),
+            ));
+        };
+        let Some(lineage) = &value.lineage else {
+            return Err(Error::ValueNotRecordable(
+                "durable recording requires transform invocation lineage".to_owned(),
+            ));
+        };
+        if !matches!(lineage.node(), LineageNode::Invocation(_)) {
+            return Err(Error::ValueNotRecordable(
+                "durable recording requires transform invocation lineage".to_owned(),
+            ));
+        }
+        let content = self.content.put_bytes_value(bytes)?;
+        let trace = self.catalog.record_result(lineage, &content)?;
+        Ok(RecordedResult {
+            recipe_id: trace.recipe_id,
+            content_id: trace.content_id,
+            byte_len: content.byte_len,
+        })
+    }
+
+    pub fn trace_recipe(&self, recipe: RecipeIdentity) -> Result<DurableTrace> {
+        let trace = self
+            .catalog
+            .trace(recipe)?
+            .ok_or_else(|| Error::RecipeNotFound(recipe.to_string()))?;
+        self.read_content(trace.content_id)?;
+        Ok(DurableTrace {
+            recipe_id: trace.recipe_id,
+            content_id: trace.content_id,
+            rendered: trace.rendered,
+        })
     }
 
     pub fn catalog_info(&self) -> Result<CatalogInfo> {
@@ -142,11 +214,6 @@ impl RuntimeCapabilities for Workspace {
     }
 }
 
-fn object_relative_path(identity: ContentIdentity) -> String {
-    let identity = identity.to_string();
-    format!("objects/{}/{}", &identity[..2], &identity[2..])
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,7 +231,7 @@ mod tests {
         assert_eq!(
             workspace.catalog_info().unwrap(),
             CatalogInfo {
-                schema_version: 1,
+                schema_version: 2,
                 foreign_keys_enabled: true,
                 journal_mode: "wal".to_owned(),
             }
@@ -200,6 +267,8 @@ mod tests {
                 contents: 1,
                 source_versions: 2,
                 source_heads: 2,
+                lineage_invocations: 0,
+                recipe_results: 0,
             }
         );
 
@@ -217,6 +286,8 @@ mod tests {
                 contents: 2,
                 source_versions: 3,
                 source_heads: 2,
+                lineage_invocations: 0,
+                recipe_results: 0,
             }
         );
         assert!(
@@ -307,6 +378,37 @@ mod tests {
 
         assert!(error.contains("refusing to replace"));
         assert_eq!(fs::read(output).unwrap(), b"first");
+    }
+
+    #[test]
+    fn one_recipe_cannot_be_recorded_with_conflicting_content() {
+        use tima::lineage::{Lineage, LineageArgument};
+
+        let test = TestDirectory::new("recipe-conflict");
+        let mut workspace = Workspace::open(test.path().join("workspace")).unwrap();
+        let compiled = tima::compile(
+            "test.tima",
+            "transform keep(value: i64) -> i64 { return value }\n",
+        )
+        .unwrap();
+        let argument = OuterValue::plain(ValueData::Integer(1));
+        let lineage = Lineage::invocation(
+            "keep",
+            compiled.identities.get(tima::ir::TransformId(0)),
+            vec![LineageArgument::record("value", &argument).unwrap()],
+            vec![],
+        )
+        .unwrap();
+
+        let first = OuterValue::plain(ValueData::Bytes(b"first".as_slice().into()))
+            .with_lineage(lineage.clone());
+        let conflicting =
+            OuterValue::plain(ValueData::Bytes(b"second".as_slice().into())).with_lineage(lineage);
+        workspace.record_value(&first).unwrap();
+
+        let error = workspace.record_value(&conflicting).unwrap_err();
+        assert!(error.to_string().contains("already maps to content"));
+        assert_eq!(workspace.catalog_stats().unwrap().recipe_results, 1);
     }
 
     fn write(path: &Path, bytes: &[u8]) {

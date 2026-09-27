@@ -1,10 +1,12 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tima::identity::{ContentIdentity, byte_content_identity};
+use tima::identity::{ContentIdentity, byte_content_identity, content_identity};
+use tima::runtime::{OuterValue, ValueData};
 
 use crate::error::{Error, Result};
 
@@ -15,6 +17,30 @@ pub(crate) struct StoredContent {
     pub identity: ContentIdentity,
     pub byte_len: u64,
     pub relative_path: String,
+    pub kind: ContentKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentKind {
+    Raw,
+    Bytes,
+}
+
+impl ContentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Bytes => "bytes",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "raw" => Ok(Self::Raw),
+            "bytes" => Ok(Self::Bytes),
+            _ => Err(Error::catalog(format!("unknown content kind {value:?}"))),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -37,6 +63,22 @@ impl ContentStore {
 
     pub fn put(&self, bytes: &[u8]) -> Result<StoredContent> {
         let identity = byte_content_identity(bytes);
+        self.put_known(identity, ContentKind::Raw, bytes)
+    }
+
+    pub fn put_bytes_value(&self, bytes: &[u8]) -> Result<StoredContent> {
+        let value = OuterValue::plain(ValueData::Bytes(Arc::from(bytes)));
+        let identity = content_identity(&value)
+            .map_err(|error| Error::catalog(format!("cannot identify byte value: {error}")))?;
+        self.put_known(identity, ContentKind::Bytes, bytes)
+    }
+
+    fn put_known(
+        &self,
+        identity: ContentIdentity,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<StoredContent> {
         let relative_path = object_relative_path(identity);
         let destination = self.workspace_root.join(&relative_path);
         let parent = destination
@@ -45,8 +87,8 @@ impl ContentStore {
         create_directory(parent)?;
 
         if destination.exists() {
-            self.validate_file(&destination, identity)?;
-            return Ok(stored(identity, bytes.len(), relative_path));
+            self.validate_file(&destination, identity, kind)?;
+            return Ok(stored(identity, bytes.len(), relative_path, kind));
         }
 
         let mut temporary = self.create_temporary_file()?;
@@ -56,19 +98,20 @@ impl ContentStore {
         match fs::rename(temporary.path(), &destination) {
             Ok(()) => {}
             Err(_error) if destination.exists() => {
-                self.validate_file(&destination, identity)?;
+                self.validate_file(&destination, identity, kind)?;
             }
             Err(error) => return Err(Error::io("publish content object", &destination, error)),
         }
-        self.validate_file(&destination, identity)?;
-        Ok(stored(identity, bytes.len(), relative_path))
+        self.validate_file(&destination, identity, kind)?;
+        Ok(stored(identity, bytes.len(), relative_path, kind))
     }
 
-    pub fn read(&self, identity: ContentIdentity, relative_path: &str) -> Result<Vec<u8>> {
-        self.read_recorded(&identity.to_string(), relative_path)
-    }
-
-    pub fn read_recorded(&self, identity: &str, relative_path: &str) -> Result<Vec<u8>> {
+    pub fn read_recorded(
+        &self,
+        identity: &str,
+        relative_path: &str,
+        kind: ContentKind,
+    ) -> Result<Vec<u8>> {
         let expected_relative = object_relative_path_text(identity)?;
         if relative_path != expected_relative {
             return Err(Error::catalog(format!(
@@ -78,7 +121,7 @@ impl ContentStore {
         let path = self.workspace_root.join(relative_path);
         let bytes =
             fs::read(&path).map_err(|error| Error::io("read content object", &path, error))?;
-        validate_bytes_text(&path, identity, &bytes)?;
+        validate_bytes_text(&path, identity, kind, &bytes)?;
         Ok(bytes)
     }
 
@@ -86,10 +129,15 @@ impl ContentStore {
         self.workspace_root.join(object_relative_path(identity))
     }
 
-    fn validate_file(&self, path: &Path, expected: ContentIdentity) -> Result<()> {
+    fn validate_file(
+        &self,
+        path: &Path,
+        expected: ContentIdentity,
+        kind: ContentKind,
+    ) -> Result<()> {
         let bytes =
             fs::read(path).map_err(|error| Error::io("read content object", path, error))?;
-        validate_bytes(path, expected, &bytes)
+        validate_bytes(path, expected, kind, &bytes)
     }
 
     fn create_temporary_file(&self) -> Result<PendingFile> {
@@ -122,11 +170,17 @@ impl ContentStore {
     }
 }
 
-fn stored(identity: ContentIdentity, byte_len: usize, relative_path: String) -> StoredContent {
+fn stored(
+    identity: ContentIdentity,
+    byte_len: usize,
+    relative_path: String,
+    kind: ContentKind,
+) -> StoredContent {
     StoredContent {
         identity,
         byte_len: byte_len as u64,
         relative_path,
+        kind,
     }
 }
 
@@ -155,8 +209,13 @@ fn write_all_and_sync(file: &mut File, path: &Path, bytes: &[u8]) -> Result<()> 
         .map_err(|error| Error::io("sync temporary content object", path, error))
 }
 
-fn validate_bytes(path: &Path, expected: ContentIdentity, bytes: &[u8]) -> Result<()> {
-    let observed = byte_content_identity(bytes);
+fn validate_bytes(
+    path: &Path,
+    expected: ContentIdentity,
+    kind: ContentKind,
+    bytes: &[u8],
+) -> Result<()> {
+    let observed = identity_for(kind, bytes)?;
     if observed == expected {
         return Ok(());
     }
@@ -167,8 +226,8 @@ fn validate_bytes(path: &Path, expected: ContentIdentity, bytes: &[u8]) -> Resul
     })
 }
 
-fn validate_bytes_text(path: &Path, expected: &str, bytes: &[u8]) -> Result<()> {
-    let observed = byte_content_identity(bytes).to_string();
+fn validate_bytes_text(path: &Path, expected: &str, kind: ContentKind, bytes: &[u8]) -> Result<()> {
+    let observed = identity_for(kind, bytes)?.to_string();
     if observed == expected {
         return Ok(());
     }
@@ -177,6 +236,16 @@ fn validate_bytes_text(path: &Path, expected: &str, bytes: &[u8]) -> Result<()> 
         expected: expected.to_owned(),
         observed,
     })
+}
+
+fn identity_for(kind: ContentKind, bytes: &[u8]) -> Result<ContentIdentity> {
+    match kind {
+        ContentKind::Raw => Ok(byte_content_identity(bytes)),
+        ContentKind::Bytes => content_identity(&OuterValue::plain(ValueData::Bytes(Arc::from(
+            bytes,
+        ))))
+        .map_err(|error| Error::catalog(format!("cannot identify stored byte value: {error}"))),
+    }
 }
 
 struct PendingFile {

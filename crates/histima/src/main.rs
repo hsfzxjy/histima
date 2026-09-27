@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use histima::{RunError, Workspace};
 use tima::backend::native::NativeCacheStatus;
-use tima::identity::ContentIdentity;
+use tima::identity::{ContentIdentity, RecipeIdentity};
 use tima::runtime::{OuterValue, ValueData};
 use tima::source::SourceFile;
 
@@ -66,6 +66,8 @@ fn run() -> Result<(), String> {
             println!("contents = {}", stats.contents);
             println!("source_versions = {}", stats.source_versions);
             println!("source_heads = {}", stats.source_heads);
+            println!("lineage_invocations = {}", stats.lineage_invocations);
+            println!("recipe_results = {}", stats.recipe_results);
         }
         "materialize" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
@@ -85,7 +87,19 @@ fn run() -> Result<(), String> {
         "run" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
             let script_path = required(&mut arguments, "Tima source path")?;
-            finished(&mut arguments)?;
+            let record_binding = match arguments.next() {
+                None => None,
+                Some(option) if option == "--record" => {
+                    let binding = required(&mut arguments, "binding name after --record")?;
+                    finished(&mut arguments)?;
+                    Some(binding)
+                }
+                Some(argument) => {
+                    return Err(format!(
+                        "unexpected additional argument {argument:?}; expected --record <binding>"
+                    ));
+                }
+            };
             let text = fs::read_to_string(&script_path)
                 .map_err(|error| format!("could not read {script_path}: {error}"))?;
             let diagnostic_source = SourceFile::new(script_path.clone(), text.clone());
@@ -95,10 +109,23 @@ fn run() -> Result<(), String> {
                     render_diagnostics(&diagnostic_source, &diagnostics)
                 )
             })?;
-            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let mut workspace =
+                Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let result = workspace
                 .execute(&compiled)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
+            let recorded = record_binding
+                .as_ref()
+                .map(|name| {
+                    let value =
+                        result.execution.bindings.get(name).ok_or_else(|| {
+                            format!("cannot record unknown outer binding {name:?}")
+                        })?;
+                    workspace
+                        .record_value(value)
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?;
             println!(
                 "native_cache = {}",
                 match result.native_cache {
@@ -123,10 +150,31 @@ fn run() -> Result<(), String> {
             if let Some(lineage) = unbound_trace {
                 println!("{}", lineage.render());
             }
+            if let (Some(name), Some(recorded)) = (record_binding, recorded) {
+                println!("recorded_binding = {name}");
+                println!("recipe_id = {}", recorded.recipe_id);
+                println!("content_id = {}", recorded.content_id);
+                println!("byte_length = {}", recorded.byte_len);
+            }
+        }
+        "trace" => {
+            let workspace_path = required(&mut arguments, "workspace path")?;
+            let recipe_text = required(&mut arguments, "Recipe ID")?;
+            finished(&mut arguments)?;
+            let recipe = recipe_text
+                .parse::<RecipeIdentity>()
+                .map_err(|error| format!("invalid Recipe ID: {error}"))?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let trace = workspace
+                .trace_recipe(recipe)
+                .map_err(|error| error.to_string())?;
+            println!("recipe_id = {}", trace.recipe_id);
+            println!("content_id = {}", trace.content_id);
+            println!("{}", trace.rendered);
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, materialize, or run"
+                "unknown command `{command}`; expected init, import, stats, materialize, run, or trace"
             ));
         }
     }
@@ -150,7 +198,8 @@ fn print_usage() {
     eprintln!("  histima import <workspace> <source-file>");
     eprintln!("  histima stats <workspace>");
     eprintln!("  histima materialize <workspace> <content-id> <destination>");
-    eprintln!("  histima run <workspace> <file.tima>");
+    eprintln!("  histima run <workspace> <file.tima> [--record <binding>]");
+    eprintln!("  histima trace <workspace> <recipe-id>");
 }
 
 fn render_run_error(source: &SourceFile, error: RunError) -> String {

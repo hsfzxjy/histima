@@ -13,6 +13,9 @@ pub enum Error {
     Database(rusqlite::Error),
     NonUtf8Locator(PathBuf),
     AssetNotFound(String),
+    ContentNotFound(String),
+    RecipeNotFound(String),
+    ValueNotRecordable(String),
     InvalidMaterializationPath(PathBuf),
     MaterializationExists(PathBuf),
     Integrity {
@@ -58,6 +61,19 @@ impl fmt::Display for Error {
             Self::AssetNotFound(locator) => {
                 write!(formatter, "asset locator {locator:?} is not imported")
             }
+            Self::ContentNotFound(identity) => {
+                write!(
+                    formatter,
+                    "content {identity} is not recorded in this workspace"
+                )
+            }
+            Self::RecipeNotFound(identity) => {
+                write!(
+                    formatter,
+                    "recipe {identity} is not recorded in this workspace"
+                )
+            }
+            Self::ValueNotRecordable(message) => formatter.write_str(message),
             Self::InvalidMaterializationPath(path) => write!(
                 formatter,
                 "materialization path must name a file: {}",
@@ -91,6 +107,9 @@ impl StdError for Error {
             Self::Database(source) => Some(source),
             Self::NonUtf8Locator(_)
             | Self::AssetNotFound(_)
+            | Self::ContentNotFound(_)
+            | Self::RecipeNotFound(_)
+            | Self::ValueNotRecordable(_)
             | Self::InvalidMaterializationPath(_)
             | Self::MaterializationExists(_)
             | Self::Integrity { .. }

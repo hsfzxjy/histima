@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use tima::identity::SourceIdentity;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use tima::identity::{ContentIdentity, RecipeIdentity, SemanticValueIdentity, SourceIdentity};
+use tima::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
 
-use crate::cas::StoredContent;
+use crate::cas::{ContentKind, StoredContent};
 use crate::error::{Error, Result};
 
-const LATEST_SCHEMA_VERSION: i64 = 1;
+const LATEST_SCHEMA_VERSION: i64 = 2;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE contents (
@@ -36,6 +37,58 @@ CREATE TABLE source_heads (
 ) STRICT;
 "#;
 
+const MIGRATION_2: &str = r#"
+ALTER TABLE contents
+    ADD COLUMN kind TEXT NOT NULL DEFAULT 'raw'
+    CHECK (kind IN ('raw', 'bytes'));
+
+CREATE TABLE lineage_invocations (
+    recipe_id     TEXT PRIMARY KEY CHECK (length(recipe_id) = 64),
+    transform_id  TEXT NOT NULL CHECK (length(transform_id) = 64),
+    transform_name TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE lineage_arguments (
+    recipe_id            TEXT NOT NULL REFERENCES lineage_invocations(recipe_id) ON DELETE CASCADE,
+    argument_index       INTEGER NOT NULL CHECK (argument_index >= 0),
+    argument_name        TEXT NOT NULL,
+    semantic_kind        TEXT NOT NULL CHECK (semantic_kind IN ('content', 'source', 'recipe')),
+    semantic_id          TEXT NOT NULL CHECK (length(semantic_id) = 64),
+    recorded_kind        TEXT NOT NULL,
+    recorded_text        TEXT,
+    recorded_content_id  TEXT,
+    parent_kind          TEXT CHECK (parent_kind IN ('source', 'recipe')),
+    parent_id            TEXT,
+    PRIMARY KEY (recipe_id, argument_index),
+    CHECK ((parent_kind IS NULL) = (parent_id IS NULL)),
+    CHECK (recorded_content_id IS NULL OR length(recorded_content_id) = 64),
+    CHECK (parent_id IS NULL OR length(parent_id) = 64)
+) STRICT;
+
+CREATE TABLE external_observations (
+    dependency_id      TEXT PRIMARY KEY CHECK (length(dependency_id) = 64),
+    capability         TEXT NOT NULL,
+    observation_key    BLOB NOT NULL,
+    observed_content_id TEXT NOT NULL CHECK (length(observed_content_id) = 64)
+) STRICT;
+
+CREATE TABLE invocation_observations (
+    recipe_id       TEXT NOT NULL REFERENCES lineage_invocations(recipe_id) ON DELETE CASCADE,
+    observation_index INTEGER NOT NULL CHECK (observation_index >= 0),
+    dependency_id   TEXT NOT NULL REFERENCES external_observations(dependency_id) ON DELETE RESTRICT,
+    PRIMARY KEY (recipe_id, observation_index),
+    UNIQUE (recipe_id, dependency_id)
+) STRICT;
+
+CREATE TABLE recipe_results (
+    recipe_id      TEXT PRIMARY KEY REFERENCES lineage_invocations(recipe_id) ON DELETE RESTRICT,
+    content_id     TEXT NOT NULL REFERENCES contents(content_id) ON DELETE RESTRICT,
+    rendered_trace TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX recipe_results_content_idx ON recipe_results(content_id);
+"#;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogInfo {
     pub schema_version: u32,
@@ -48,6 +101,8 @@ pub struct CatalogStats {
     pub contents: u64,
     pub source_versions: u64,
     pub source_heads: u64,
+    pub lineage_invocations: u64,
+    pub recipe_results: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +110,14 @@ pub(crate) struct CatalogObject {
     pub content_id: String,
     pub byte_len: u64,
     pub relative_path: String,
+    pub kind: ContentKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogTrace {
+    pub recipe_id: RecipeIdentity,
+    pub content_id: ContentIdentity,
+    pub rendered: String,
 }
 
 pub(crate) struct Catalog {
@@ -86,28 +149,17 @@ impl Catalog {
         source_id: SourceIdentity,
         content: &StoredContent,
     ) -> Result<()> {
-        let byte_len = i64::try_from(content.byte_len)
-            .map_err(|_| Error::catalog("content byte length does not fit SQLite INTEGER"))?;
+        if content.kind != ContentKind::Raw {
+            return Err(Error::catalog(
+                "source imports must use raw content identity",
+            ));
+        }
         let content_id = content.identity.to_string();
         let source_id = source_id.to_string();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO contents(content_id, byte_length, relative_path)
-             VALUES (?1, ?2, ?3)",
-            params![content_id, byte_len, content.relative_path],
-        )?;
-        let recorded_content = transaction.query_row(
-            "SELECT byte_length, relative_path FROM contents WHERE content_id = ?1",
-            [&content_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )?;
-        if recorded_content != (byte_len, content.relative_path.clone()) {
-            return Err(Error::catalog(format!(
-                "content {content_id} already has incompatible metadata"
-            )));
-        }
+        insert_content(&transaction, content)?;
 
         transaction.execute(
             "INSERT OR IGNORE INTO source_assets(source_id, locator, content_id)
@@ -137,7 +189,7 @@ impl Catalog {
     pub fn current_source(&self, locator: &str) -> Result<Option<CatalogObject>> {
         self.connection
             .query_row(
-                "SELECT content.content_id, content.byte_length, content.relative_path
+                "SELECT content.content_id, content.byte_length, content.relative_path, content.kind
                  FROM source_heads AS head
                  JOIN source_assets AS source
                    ON source.locator = head.locator AND source.source_id = head.source_id
@@ -146,11 +198,55 @@ impl Catalog {
                 [locator],
                 |row| {
                     let byte_len = row.get::<_, i64>(1)?;
-                    Ok((row.get::<_, String>(0)?, byte_len, row.get::<_, String>(2)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        byte_len,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
                 },
             )
             .optional()?
-            .map(|(content_id, byte_len, relative_path)| {
+            .map(|(content_id, byte_len, relative_path, kind)| {
+                let byte_len = u64::try_from(byte_len).map_err(|_| {
+                    Error::catalog(format!(
+                        "content {content_id} has a negative byte length in the catalog"
+                    ))
+                })?;
+                let kind = ContentKind::parse(&kind)?;
+                if kind != ContentKind::Raw {
+                    return Err(Error::catalog(format!(
+                        "source locator {locator:?} points to non-raw content {content_id}"
+                    )));
+                }
+                Ok(CatalogObject {
+                    content_id,
+                    byte_len,
+                    relative_path,
+                    kind,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn content(&self, identity: ContentIdentity) -> Result<Option<CatalogObject>> {
+        let identity = identity.to_string();
+        self.connection
+            .query_row(
+                "SELECT content_id, byte_length, relative_path, kind
+                 FROM contents WHERE content_id = ?1",
+                [&identity],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(content_id, byte_len, relative_path, kind)| {
                 let byte_len = u64::try_from(byte_len).map_err(|_| {
                     Error::catalog(format!(
                         "content {content_id} has a negative byte length in the catalog"
@@ -160,6 +256,73 @@ impl Catalog {
                     content_id,
                     byte_len,
                     relative_path,
+                    kind: ContentKind::parse(&kind)?,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn record_result(
+        &mut self,
+        lineage: &Lineage,
+        content: &StoredContent,
+    ) -> Result<CatalogTrace> {
+        let LineageNode::Invocation(root) = lineage.node() else {
+            return Err(Error::catalog(
+                "a durable recipe result must have invocation lineage",
+            ));
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_content(&transaction, content)?;
+        insert_lineage(&transaction, lineage)?;
+        let recipe_id = root.recipe_id.to_string();
+        let content_id = content.identity.to_string();
+        let rendered = lineage.render();
+        transaction.execute(
+            "INSERT OR IGNORE INTO recipe_results(recipe_id, content_id, rendered_trace)
+             VALUES (?1, ?2, ?3)",
+            params![recipe_id, content_id, rendered],
+        )?;
+        let recorded = transaction.query_row(
+            "SELECT content_id, rendered_trace FROM recipe_results WHERE recipe_id = ?1",
+            [&recipe_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        if recorded.0 != content_id {
+            return Err(Error::catalog(format!(
+                "recipe {recipe_id} already maps to content {}, not {content_id}",
+                recorded.0
+            )));
+        }
+        transaction.commit()?;
+        Ok(CatalogTrace {
+            recipe_id: root.recipe_id,
+            content_id: content.identity,
+            rendered: recorded.1,
+        })
+    }
+
+    pub fn trace(&self, recipe: RecipeIdentity) -> Result<Option<CatalogTrace>> {
+        let recipe_text = recipe.to_string();
+        self.connection
+            .query_row(
+                "SELECT content_id, rendered_trace FROM recipe_results WHERE recipe_id = ?1",
+                [&recipe_text],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(content_id, rendered)| {
+                let content_id = content_id.parse::<ContentIdentity>().map_err(|error| {
+                    Error::catalog(format!(
+                        "recipe {recipe} has invalid Content ID {content_id:?}: {error}"
+                    ))
+                })?;
+                Ok(CatalogTrace {
+                    recipe_id: recipe,
+                    content_id,
+                    rendered,
                 })
             })
             .transpose()
@@ -187,6 +350,8 @@ impl Catalog {
             contents: count(&self.connection, "contents")?,
             source_versions: count(&self.connection, "source_assets")?,
             source_heads: count(&self.connection, "source_heads")?,
+            lineage_invocations: count(&self.connection, "lineage_invocations")?,
+            recipe_results: count(&self.connection, "recipe_results")?,
         })
     }
 }
@@ -204,7 +369,10 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
             "catalog schema version {current} is newer than supported version {LATEST_SCHEMA_VERSION}"
         )));
     }
-    for (version, name, sql) in [(1_i64, "initial catalog", MIGRATION_1)] {
+    for (version, name, sql) in [
+        (1_i64, "initial catalog", MIGRATION_1),
+        (2_i64, "durable recipe results", MIGRATION_2),
+    ] {
         if version <= current {
             continue;
         }
@@ -219,6 +387,304 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn insert_content(transaction: &Transaction<'_>, content: &StoredContent) -> Result<()> {
+    let byte_len = i64::try_from(content.byte_len)
+        .map_err(|_| Error::catalog("content byte length does not fit SQLite INTEGER"))?;
+    let content_id = content.identity.to_string();
+    transaction.execute(
+        "INSERT OR IGNORE INTO contents(content_id, byte_length, relative_path, kind)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            content_id,
+            byte_len,
+            content.relative_path,
+            content.kind.as_str()
+        ],
+    )?;
+    let recorded = transaction.query_row(
+        "SELECT byte_length, relative_path, kind FROM contents WHERE content_id = ?1",
+        [&content_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )?;
+    let expected = (
+        byte_len,
+        content.relative_path.clone(),
+        content.kind.as_str().to_owned(),
+    );
+    if recorded != expected {
+        return Err(Error::catalog(format!(
+            "content {content_id} already has incompatible metadata"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_lineage(transaction: &Transaction<'_>, lineage: &Lineage) -> Result<()> {
+    match lineage.node() {
+        LineageNode::Source(source) => {
+            let (Some(source_id), Some(content_id)) = (source.source_id, source.observed_content)
+            else {
+                return Err(Error::catalog(format!(
+                    "source {:?} was not observed before durable recording",
+                    source.locator
+                )));
+            };
+            let recorded = transaction
+                .query_row(
+                    "SELECT locator, content_id FROM source_assets WHERE source_id = ?1",
+                    [source_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if recorded != Some((source.locator.to_string(), content_id.to_string())) {
+                return Err(Error::catalog(format!(
+                    "source lineage {source_id} is not present in this workspace"
+                )));
+            }
+        }
+        LineageNode::ExternalObservation(observation) => {
+            let dependency_id = observation.dependency_id.to_string();
+            transaction.execute(
+                "INSERT OR IGNORE INTO external_observations(
+                     dependency_id, capability, observation_key, observed_content_id
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    dependency_id,
+                    observation.capability.as_ref(),
+                    observation.key.as_ref(),
+                    observation.observed_content.to_string()
+                ],
+            )?;
+            let recorded = transaction.query_row(
+                "SELECT capability, observation_key, observed_content_id
+                 FROM external_observations WHERE dependency_id = ?1",
+                [&dependency_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            let expected = (
+                observation.capability.to_string(),
+                observation.key.to_vec(),
+                observation.observed_content.to_string(),
+            );
+            if recorded != expected {
+                return Err(Error::catalog(format!(
+                    "dependency {dependency_id} already has incompatible lineage"
+                )));
+            }
+        }
+        LineageNode::Invocation(invocation) => {
+            for argument in invocation.arguments.iter() {
+                if let Some(parent) = &argument.lineage {
+                    insert_lineage(transaction, parent)?;
+                }
+            }
+            for observation in invocation.observations.iter() {
+                insert_lineage(transaction, observation)?;
+            }
+
+            let recipe_id = invocation.recipe_id.to_string();
+            let transform_id = invocation.transform_id.to_string();
+            transaction.execute(
+                "INSERT OR IGNORE INTO lineage_invocations(
+                     recipe_id, transform_id, transform_name
+                 ) VALUES (?1, ?2, ?3)",
+                params![recipe_id, transform_id, invocation.transform_name.as_ref()],
+            )?;
+            let recorded_transform = transaction.query_row(
+                "SELECT transform_id FROM lineage_invocations WHERE recipe_id = ?1",
+                [&recipe_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            if recorded_transform != transform_id {
+                return Err(Error::catalog(format!(
+                    "recipe {recipe_id} already has transform {recorded_transform}, not {transform_id}"
+                )));
+            }
+
+            for (index, argument) in invocation.arguments.iter().enumerate() {
+                insert_argument(transaction, &recipe_id, index, argument)?;
+            }
+            ensure_related_count(
+                transaction,
+                "lineage_arguments",
+                &recipe_id,
+                invocation.arguments.len(),
+            )?;
+            for (index, observation) in invocation.observations.iter().enumerate() {
+                let LineageNode::ExternalObservation(observation) = observation.node() else {
+                    return Err(Error::catalog(
+                        "invocation observation is not an external dependency",
+                    ));
+                };
+                let index = i64::try_from(index)
+                    .map_err(|_| Error::catalog("observation index does not fit SQLite INTEGER"))?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO invocation_observations(
+                         recipe_id, observation_index, dependency_id
+                     ) VALUES (?1, ?2, ?3)",
+                    params![recipe_id, index, observation.dependency_id.to_string()],
+                )?;
+                let recorded = transaction.query_row(
+                    "SELECT dependency_id FROM invocation_observations
+                     WHERE recipe_id = ?1 AND observation_index = ?2",
+                    params![recipe_id, index],
+                    |row| row.get::<_, String>(0),
+                )?;
+                if recorded != observation.dependency_id.to_string() {
+                    return Err(Error::catalog(format!(
+                        "recipe {recipe_id} observation {index} has incompatible lineage"
+                    )));
+                }
+            }
+            ensure_related_count(
+                transaction,
+                "invocation_observations",
+                &recipe_id,
+                invocation.observations.len(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_related_count(
+    transaction: &Transaction<'_>,
+    table: &str,
+    recipe_id: &str,
+    expected: usize,
+) -> Result<()> {
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE recipe_id = ?1");
+    let recorded = transaction.query_row(&sql, [recipe_id], |row| row.get::<_, i64>(0))?;
+    let expected = i64::try_from(expected)
+        .map_err(|_| Error::catalog(format!("{table} count does not fit SQLite INTEGER")))?;
+    if recorded != expected {
+        return Err(Error::catalog(format!(
+            "recipe {recipe_id} has {recorded} recorded {table} rows, expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_argument(
+    transaction: &Transaction<'_>,
+    recipe_id: &str,
+    index: usize,
+    argument: &LineageArgument,
+) -> Result<()> {
+    let index = i64::try_from(index)
+        .map_err(|_| Error::catalog("argument index does not fit SQLite INTEGER"))?;
+    let (semantic_kind, semantic_id) = semantic_identity(argument.semantic_identity);
+    let (recorded_kind, recorded_text, recorded_content_id) = recorded_value(&argument.value)?;
+    let (parent_kind, parent_id) = argument
+        .lineage
+        .as_ref()
+        .map(lineage_parent)
+        .transpose()?
+        .map_or((None, None), |(kind, id)| (Some(kind), Some(id)));
+    transaction.execute(
+        "INSERT OR IGNORE INTO lineage_arguments(
+             recipe_id, argument_index, argument_name, semantic_kind, semantic_id,
+             recorded_kind, recorded_text, recorded_content_id, parent_kind, parent_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            recipe_id,
+            index,
+            argument.name.as_ref(),
+            semantic_kind,
+            semantic_id,
+            recorded_kind,
+            recorded_text,
+            recorded_content_id,
+            parent_kind,
+            parent_id
+        ],
+    )?;
+    let recorded = transaction.query_row(
+        "SELECT semantic_kind, semantic_id, recorded_kind, recorded_text,
+                recorded_content_id, parent_kind, parent_id
+         FROM lineage_arguments WHERE recipe_id = ?1 AND argument_index = ?2",
+        params![recipe_id, index],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        },
+    )?;
+    let expected = (
+        semantic_kind.to_owned(),
+        semantic_id,
+        recorded_kind.to_owned(),
+        recorded_text,
+        recorded_content_id,
+        parent_kind.map(str::to_owned),
+        parent_id,
+    );
+    if recorded != expected {
+        return Err(Error::catalog(format!(
+            "recipe {recipe_id} argument {index} already has incompatible lineage"
+        )));
+    }
+    Ok(())
+}
+
+fn semantic_identity(identity: SemanticValueIdentity) -> (&'static str, String) {
+    match identity {
+        SemanticValueIdentity::Content(identity) => ("content", identity.to_string()),
+        SemanticValueIdentity::Source(identity) => ("source", identity.to_string()),
+        SemanticValueIdentity::Recipe(identity) => ("recipe", identity.to_string()),
+    }
+}
+
+fn recorded_value(value: &RecordedValue) -> Result<(&'static str, Option<String>, Option<String>)> {
+    Ok(match value {
+        RecordedValue::Null => ("null", None, None),
+        RecordedValue::Bool(value) => ("bool", Some(u8::from(*value).to_string()), None),
+        RecordedValue::Integer(value) => ("i64", Some(value.to_string()), None),
+        RecordedValue::Float(value) => ("f32", Some(format!("{:08x}", value.to_bits())), None),
+        RecordedValue::String(value) => ("string", Some(value.to_string()), None),
+        RecordedValue::Materialized { kind, content_id } => {
+            if !matches!(*kind, "bytes" | "list" | "record" | "image") {
+                return Err(Error::catalog(format!(
+                    "unsupported recorded materialized value kind {kind:?}"
+                )));
+            }
+            (kind, None, Some(content_id.to_string()))
+        }
+        RecordedValue::Source { locator, .. } => ("source", Some(locator.to_string()), None),
+    })
+}
+
+fn lineage_parent(lineage: &Lineage) -> Result<(&'static str, String)> {
+    match lineage.node() {
+        LineageNode::Source(source) => source
+            .source_id
+            .map(|identity| ("source", identity.to_string()))
+            .ok_or_else(|| Error::catalog("argument source lineage is not observed")),
+        LineageNode::Invocation(invocation) => Ok(("recipe", invocation.recipe_id.to_string())),
+        LineageNode::ExternalObservation(_) => Err(Error::catalog(
+            "external observations cannot be argument lineage parents",
+        )),
+    }
+}
+
 fn current_schema_version(connection: &Connection) -> rusqlite::Result<i64> {
     connection.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -231,4 +697,69 @@ fn count(connection: &Connection, table: &str) -> Result<u64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     let value = connection.query_row(&sql, [], |row| row.get::<_, i64>(0))?;
     u64::try_from(value).map_err(|_| Error::catalog(format!("negative row count for {table}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn existing_initial_catalog_migrates_raw_content_to_version_two() {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join("histima-catalog-tests")
+            .join(format!("{}-{sequence}", std::process::id()));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).unwrap();
+        }
+        fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("catalog.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY CHECK (version > 0),
+                     name TEXT NOT NULL UNIQUE
+                 ) STRICT;",
+            )
+            .unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, name) VALUES (1, 'initial catalog')",
+                [],
+            )
+            .unwrap();
+        let identity = "0".repeat(64);
+        connection
+            .execute(
+                "INSERT INTO contents(content_id, byte_length, relative_path)
+                 VALUES (?1, 0, ?2)",
+                params![identity, format!("objects/00/{}", "0".repeat(62))],
+            )
+            .unwrap();
+        drop(connection);
+
+        let catalog = Catalog::open(&database).unwrap();
+
+        assert_eq!(catalog.info().unwrap().schema_version, 2);
+        assert_eq!(
+            catalog
+                .connection
+                .query_row("SELECT kind FROM contents", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "raw"
+        );
+        drop(catalog);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

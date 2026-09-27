@@ -15,7 +15,7 @@ fn cli_imports_inspects_and_materializes_across_processes() {
 
     let initialized = histima(["init", text(&workspace)]);
     assert_success(&initialized);
-    assert!(stdout(&initialized).contains("schema_version = 1"));
+    assert!(stdout(&initialized).contains("schema_version = 2"));
 
     let imported = histima(["import", text(&workspace), text(&source)]);
     assert_success(&imported);
@@ -59,6 +59,7 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     let source = test.path().join("source.ppm");
     let script = test.path().join("pipeline.tima");
     let output = test.path().join("darkened.ppm");
+    let restored = test.path().join("restored.ppm");
     fs::write(&source, b"P3\n1 1\n255\n200 100 50\n").unwrap();
     let source_locator = portable(&source);
     let output_locator = portable(&output);
@@ -84,16 +85,44 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert_success(&histima(["init", text(&workspace)]));
     assert_success(&histima(["import", text(&workspace), &source_locator]));
 
-    let first = histima(["run", text(&workspace), text(&script)]);
+    let first = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&first);
     assert!(stdout(&first).contains("native_cache = miss"));
     assert!(stdout(&first).contains("invoke darken"));
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
+    let recipe_id = field(&first, "recipe_id");
+    let content_id = field(&first, "content_id");
+    assert_eq!(recipe_id.len(), 64);
+    assert_eq!(content_id.len(), 64);
+
+    let trace = histima(["trace", text(&workspace), &recipe_id]);
+    assert_success(&trace);
+    assert!(stdout(&trace).contains("source "));
+    assert!(stdout(&trace).contains("invoke decode.ppm"));
+    assert!(stdout(&trace).contains("invoke darken"));
+    assert!(stdout(&trace).contains("invoke encode.ppm"));
+
+    let materialized = histima([
+        "materialize",
+        text(&workspace),
+        &content_id,
+        text(&restored),
+    ]);
+    assert_success(&materialized);
+    assert_eq!(fs::read(&restored).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
+
+    let stats = histima(["stats", text(&workspace)]);
+    assert_success(&stats);
+    assert!(stdout(&stats).contains("contents = 2"));
+    assert!(stdout(&stats).contains("lineage_invocations = 3"));
+    assert!(stdout(&stats).contains("recipe_results = 1"));
 
     fs::remove_file(&output).unwrap();
-    let second = histima(["run", text(&workspace), text(&script)]);
+    let second = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&second);
     assert!(stdout(&second).contains("native_cache = hit"));
+    assert_eq!(field(&second, "recipe_id"), recipe_id);
+    assert_eq!(field(&second, "content_id"), content_id);
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
 }
 
@@ -119,6 +148,14 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn field(output: &Output, name: &str) -> String {
+    stdout(output)
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} = ")))
+        .unwrap_or_else(|| panic!("command did not print {name}:\n{}", stdout(output)))
+        .to_owned()
 }
 
 fn text(path: &Path) -> &str {

@@ -39,7 +39,8 @@ cargo run -p histima -- init build/my-workspace
 cargo run -p histima -- import build/my-workspace examples/tiny.ppm
 cargo run -p histima -- stats build/my-workspace
 cargo run -p histima -- materialize build/my-workspace <content-id> output.ppm
-cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima
+cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
+cargo run -p histima -- trace build/my-workspace <recipe-id>
 ```
 
 Materialization verifies the stored Content ID, publishes through a temporary
@@ -49,8 +50,15 @@ canonical durable text form: 64 lowercase hexadecimal characters.
 `histima run` uses the workspace as Tima's host boundary: `asset(...)` can read
 only locators already imported into that catalog, generated-C artifacts are
 cached under the workspace, and `save(...)` atomically refuses to replace an
-existing output. Transform-result caching is still process-local; durable
-recipes, derived content, and lineage are the next storage milestone.
+existing output. `--record <binding>` persists an invocation-derived immutable
+byte value in the filesystem CAS, stores its Recipe-to-Content mapping and
+normalized semantic lineage in SQLite, and prints the durable identities.
+`histima trace` inspects the derivation after reopening the workspace.
+
+Raw imported blobs and typed Tima byte values intentionally use distinct
+Content ID domains even when their payload bytes match. The catalog records the
+content kind so every CAS read can revalidate the correct semantic identity.
+Durable result-cache reuse and replay are not yet connected to these records.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
