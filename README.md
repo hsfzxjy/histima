@@ -1,9 +1,10 @@
 # Histima / Tima
 
-This repository currently contains the first vertical slice of **Tima**, the
-embedded language for Histima asset pipelines.
+This repository contains the first vertical slice of **Tima**, the embedded
+language for Histima asset pipelines, and the initial durable **Histima** host
+foundation.
 
-The Rust workspace has one `tima` crate with:
+The `tima` crate provides:
 
 - one lexer, parser, expression arena, source-span model, and diagnostic model
   shared by outer code and inner `transform` declarations;
@@ -20,6 +21,16 @@ The Rust workspace has one `tima` crate with:
 - separate native-artifact and transform-result caches keyed by semantic IDs;
 - host-mediated asset and environment observations shared by the outer runtime,
   reference interpreter, and generated-C runtime ABI.
+
+The separate `histima` crate now owns the beginning of the product boundary. A
+configurable workspace combines a migration-managed SQLite catalog with a
+filesystem content-addressed store. SQLite runs with foreign keys and WAL mode,
+stores queryable content/source metadata, preserves immutable source versions,
+and tracks the current observation for each locator. Imported payloads are
+atomically published outside SQLite under their Tima Content IDs; repeat imports
+deduplicate bytes, and every read revalidates stored content before returning
+it. The workspace implements Tima's explicit asset-read capability and never
+falls back to an ambient path that has not been imported.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
