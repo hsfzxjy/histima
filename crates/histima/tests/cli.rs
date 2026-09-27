@@ -29,6 +29,21 @@ fn cli_imports_inspects_and_materializes_across_processes() {
         .to_owned();
     assert_eq!(content_id.len(), 64);
 
+    let assets = histima(["assets", text(&workspace)]);
+    assert_success(&assets);
+    assert!(stdout(&assets).contains("count = 1"));
+    assert!(stdout(&assets).contains("truncated = false"));
+    assert_eq!(field(&assets, "asset[0].locator"), text(&source));
+    assert_eq!(field(&assets, "asset[0].content_id"), content_id);
+
+    let inspected = histima(["inspect", "content", text(&workspace), &content_id]);
+    assert_success(&inspected);
+    assert_eq!(field(&inspected, "kind"), "raw");
+    assert_eq!(field(&inspected, "byte_length"), "16");
+    assert_eq!(field(&inspected, "source_references"), "1");
+    assert_eq!(field(&inspected, "recipe_references"), "0");
+    assert_eq!(field(&inspected, "valid"), "true");
+
     let stats = histima(["stats", text(&workspace)]);
     assert_success(&stats);
     assert!(stdout(&stats).contains("contents = 1"));
@@ -161,6 +176,29 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert!(stdout(&trace).contains("invoke decode.ppm"));
     assert!(stdout(&trace).contains("invoke darken"));
     assert!(stdout(&trace).contains("invoke encode.ppm"));
+
+    let recipes = histima(["recipes", text(&workspace)]);
+    assert_success(&recipes);
+    assert_eq!(field(&recipes, "count"), "1");
+    assert_eq!(field(&recipes, "truncated"), "false");
+    assert_eq!(field(&recipes, "recipe[0].recipe_id"), recipe_id);
+    assert_eq!(field(&recipes, "recipe[0].transform_name"), "encode.ppm");
+    assert_eq!(field(&recipes, "recipe[0].content_id"), content_id);
+
+    let inspected_recipe = histima(["inspect", "recipe", text(&workspace), &recipe_id]);
+    assert_success(&inspected_recipe);
+    assert_eq!(field(&inspected_recipe, "transform_name"), "encode.ppm");
+    assert_eq!(field(&inspected_recipe, "content_valid"), "true");
+    assert_eq!(field(&inspected_recipe, "argument_count"), "1");
+    assert!(field(&inspected_recipe, "argument[0].semantic_identity").starts_with("recipe:"));
+    assert_eq!(field(&inspected_recipe, "observation_count"), "0");
+    assert!(stdout(&inspected_recipe).contains("invoke darken"));
+
+    let inspected_content = histima(["inspect", "content", text(&workspace), &content_id]);
+    assert_success(&inspected_content);
+    assert_eq!(field(&inspected_content, "kind"), "bytes");
+    assert_eq!(field(&inspected_content, "recipe_references"), "1");
+    assert_eq!(field(&inspected_content, "valid"), "true");
 
     let replayed = histima(["replay", text(&workspace), text(&script), &recipe_id]);
     assert_success(&replayed);

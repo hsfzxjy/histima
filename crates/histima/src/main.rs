@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use histima::{RunError, Workspace};
 use tima::backend::native::NativeCacheStatus;
 use tima::identity::{ContentIdentity, RecipeIdentity, content_identity};
+use tima::lineage::{LineageNode, RecordedValue};
 use tima::runtime::{OuterValue, ValueData};
 use tima::source::SourceFile;
 
@@ -73,6 +74,126 @@ fn run() -> Result<(), String> {
                 stats.native_artifact_bundles
             );
             println!("native_artifacts = {}", stats.native_artifacts);
+        }
+        "assets" => {
+            let workspace_path = required(&mut arguments, "workspace path")?;
+            finished(&mut arguments)?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let page = workspace.assets().map_err(|error| error.to_string())?;
+            println!("count = {}", page.items.len());
+            println!("truncated = {}", page.truncated);
+            for (index, asset) in page.items.iter().enumerate() {
+                println!("asset[{index}].locator = {}", asset.locator);
+                println!("asset[{index}].source_id = {}", asset.source_id);
+                println!("asset[{index}].content_id = {}", asset.content_id);
+                println!("asset[{index}].byte_length = {}", asset.byte_len);
+            }
+        }
+        "recipes" => {
+            let workspace_path = required(&mut arguments, "workspace path")?;
+            finished(&mut arguments)?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let page = workspace.recipes().map_err(|error| error.to_string())?;
+            println!("count = {}", page.items.len());
+            println!("truncated = {}", page.truncated);
+            for (index, recipe) in page.items.iter().enumerate() {
+                println!("recipe[{index}].recipe_id = {}", recipe.recipe_id);
+                println!("recipe[{index}].transform_id = {}", recipe.transform_id);
+                println!("recipe[{index}].transform_name = {}", recipe.transform_name);
+                println!("recipe[{index}].content_id = {}", recipe.content_id);
+                println!("recipe[{index}].byte_length = {}", recipe.byte_len);
+            }
+        }
+        "inspect" => {
+            let kind = required(&mut arguments, "inspection kind (content or recipe)")?;
+            let workspace_path = required(&mut arguments, "workspace path")?;
+            let identity_text = required(&mut arguments, "identity")?;
+            finished(&mut arguments)?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            match kind.as_str() {
+                "content" => {
+                    let identity = identity_text
+                        .parse::<ContentIdentity>()
+                        .map_err(|error| format!("invalid Content ID: {error}"))?;
+                    let inspection = workspace
+                        .inspect_content(identity)
+                        .map_err(|error| error.to_string())?;
+                    print_content_inspection(&inspection);
+                }
+                "recipe" => {
+                    let identity = identity_text
+                        .parse::<RecipeIdentity>()
+                        .map_err(|error| format!("invalid Recipe ID: {error}"))?;
+                    let inspection = workspace
+                        .inspect_recipe(identity)
+                        .map_err(|error| error.to_string())?;
+                    println!("recipe_id = {}", inspection.recipe_id);
+                    println!("content_id = {}", inspection.content_id);
+                    let LineageNode::Invocation(invocation) = inspection.lineage.node() else {
+                        return Err(format!(
+                            "recorded recipe {} does not have invocation lineage",
+                            inspection.recipe_id
+                        ));
+                    };
+                    println!("transform_name = {}", invocation.transform_name);
+                    println!("transform_id = {}", invocation.transform_id);
+                    println!("content_valid = {}", inspection.content.valid);
+                    if let Some(error) = &inspection.content.validation_error {
+                        println!("content_validation_error = {error}");
+                    }
+                    println!("argument_count = {}", invocation.arguments.len());
+                    for (index, argument) in invocation.arguments.iter().enumerate() {
+                        println!("argument[{index}].name = {}", argument.name);
+                        println!(
+                            "argument[{index}].semantic_identity = {}",
+                            argument.semantic_identity
+                        );
+                        println!(
+                            "argument[{index}].recorded_value = {}",
+                            display_recorded_value(&argument.value)
+                        );
+                        if let Some(parent) = &argument.lineage {
+                            println!(
+                                "argument[{index}].parent = {}",
+                                lineage_identity(parent.node())
+                            );
+                        }
+                    }
+                    println!("observation_count = {}", invocation.observations.len());
+                    for (index, observation) in invocation.observations.iter().enumerate() {
+                        let LineageNode::ExternalObservation(observation) = observation.node()
+                        else {
+                            return Err(format!(
+                                "recipe {} has a non-external observation",
+                                inspection.recipe_id
+                            ));
+                        };
+                        println!(
+                            "observation[{index}].dependency_id = {}",
+                            observation.dependency_id
+                        );
+                        println!(
+                            "observation[{index}].capability = {}",
+                            observation.capability
+                        );
+                        println!(
+                            "observation[{index}].key = {}",
+                            display_observation_key(&observation.key)
+                        );
+                        println!(
+                            "observation[{index}].content_id = {}",
+                            observation.observed_content
+                        );
+                    }
+                    println!("trace:");
+                    println!("{}", inspection.rendered);
+                }
+                _ => {
+                    return Err(format!(
+                        "unknown inspection kind {kind:?}; expected content or recipe"
+                    ));
+                }
+            }
         }
         "materialize" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
@@ -252,7 +373,7 @@ fn run() -> Result<(), String> {
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, materialize, run, replay, or trace"
+                "unknown command `{command}`; expected init, import, stats, assets, recipes, inspect, materialize, run, replay, or trace"
             ));
         }
     }
@@ -275,10 +396,68 @@ fn print_usage() {
     eprintln!("  histima init <workspace>");
     eprintln!("  histima import <workspace> <source-file>");
     eprintln!("  histima stats <workspace>");
+    eprintln!("  histima assets <workspace>");
+    eprintln!("  histima recipes <workspace>");
+    eprintln!("  histima inspect content <workspace> <content-id>");
+    eprintln!("  histima inspect recipe <workspace> <recipe-id>");
     eprintln!("  histima materialize <workspace> <content-id> <destination>");
     eprintln!("  histima run <workspace> <file.tima> [--record <binding>]");
     eprintln!("  histima replay <workspace> <file.tima> <recipe-id>");
     eprintln!("  histima trace <workspace> <recipe-id>");
+}
+
+fn print_content_inspection(inspection: &histima::ContentInspection) {
+    println!("content_id = {}", inspection.content_id);
+    println!("kind = {}", inspection.kind);
+    println!("byte_length = {}", inspection.byte_len);
+    println!("relative_path = {}", inspection.relative_path);
+    println!("source_references = {}", inspection.source_references);
+    println!("recipe_references = {}", inspection.recipe_references);
+    println!("valid = {}", inspection.valid);
+    if let Some(error) = &inspection.validation_error {
+        println!("validation_error = {error}");
+    }
+}
+
+fn display_recorded_value(value: &RecordedValue) -> String {
+    match value {
+        RecordedValue::Null => "null".to_owned(),
+        RecordedValue::Bool(value) => value.to_string(),
+        RecordedValue::Integer(value) => value.to_string(),
+        RecordedValue::Float(value) => value.to_string(),
+        RecordedValue::String(value) => format!("{value:?}"),
+        RecordedValue::Materialized { kind, content_id } => {
+            format!("{kind}:{content_id}")
+        }
+        RecordedValue::Source { locator, source_id } => {
+            format!("source:{source_id} locator={locator:?}")
+        }
+    }
+}
+
+fn lineage_identity(node: &LineageNode) -> String {
+    match node {
+        LineageNode::Source(source) => source.source_id.map_or_else(
+            || format!("unobserved-source:{:?}", source.locator),
+            |identity| format!("source:{identity}"),
+        ),
+        LineageNode::Invocation(invocation) => format!("recipe:{}", invocation.recipe_id),
+        LineageNode::ExternalObservation(observation) => {
+            format!("dependency:{}", observation.dependency_id)
+        }
+    }
+}
+
+fn display_observation_key(key: &[u8]) -> String {
+    match std::str::from_utf8(key) {
+        Ok(text) => format!("utf8:{text:?}"),
+        Err(_) => format!(
+            "hex:{}",
+            key.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+    }
 }
 
 fn render_run_error(source: &SourceFile, error: RunError) -> String {

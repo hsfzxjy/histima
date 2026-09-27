@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::stored_lineage::StoredRecipe;
 
 const LATEST_SCHEMA_VERSION: i64 = 3;
+pub const CATALOG_LIST_LIMIT: usize = 100;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE contents (
@@ -150,6 +151,29 @@ pub struct NativeArtifactInfo {
     pub bundle_id: ArtifactBundleIdentity,
     pub artifact_ids: Vec<ArtifactIdentity>,
     pub library_content_id: ContentIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogPage<T> {
+    pub items: Vec<T>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetSummary {
+    pub locator: String,
+    pub source_id: SourceIdentity,
+    pub content_id: ContentIdentity,
+    pub byte_len: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipeSummary {
+    pub recipe_id: RecipeIdentity,
+    pub transform_id: TransformIdentity,
+    pub transform_name: String,
+    pub content_id: ContentIdentity,
+    pub byte_len: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,6 +331,139 @@ impl Catalog {
                 })
             })
             .transpose()
+    }
+
+    pub fn assets(&self) -> Result<CatalogPage<AssetSummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT head.locator, head.source_id, source.content_id, content.byte_length
+             FROM source_heads AS head
+             JOIN source_assets AS source
+               ON source.locator = head.locator AND source.source_id = head.source_id
+             JOIN contents AS content ON content.content_id = source.content_id
+             ORDER BY head.locator
+             LIMIT ?1",
+        )?;
+        let limit = i64::try_from(CATALOG_LIST_LIMIT + 1)
+            .map_err(|_| Error::catalog("catalog listing limit does not fit SQLite INTEGER"))?;
+        let rows = statement
+            .query_map([limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut items = rows
+            .into_iter()
+            .map(|(locator, source_id, content_id, byte_len)| {
+                let source_id = source_id.parse::<SourceIdentity>().map_err(|error| {
+                    Error::catalog(format!(
+                        "asset locator {locator:?} has invalid Source ID {source_id:?}: {error}"
+                    ))
+                })?;
+                let content_id = content_id.parse::<ContentIdentity>().map_err(|error| {
+                    Error::catalog(format!(
+                        "asset locator {locator:?} has invalid Content ID {content_id:?}: {error}"
+                    ))
+                })?;
+                let byte_len = u64::try_from(byte_len).map_err(|_| {
+                    Error::catalog(format!(
+                        "content {content_id} has a negative byte length in the catalog"
+                    ))
+                })?;
+                Ok(AssetSummary {
+                    locator,
+                    source_id,
+                    content_id,
+                    byte_len,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(bounded_page(&mut items))
+    }
+
+    pub fn recipes(&self) -> Result<CatalogPage<RecipeSummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT result.recipe_id, invocation.transform_id,
+                    invocation.transform_name, result.content_id, content.byte_length
+             FROM recipe_results AS result
+             JOIN lineage_invocations AS invocation USING (recipe_id)
+             JOIN contents AS content ON content.content_id = result.content_id
+             ORDER BY result.recipe_id
+             LIMIT ?1",
+        )?;
+        let limit = i64::try_from(CATALOG_LIST_LIMIT + 1)
+            .map_err(|_| Error::catalog("catalog listing limit does not fit SQLite INTEGER"))?;
+        let rows = statement
+            .query_map([limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut items = rows
+            .into_iter()
+            .map(
+                |(recipe_id, transform_id, transform_name, content_id, byte_len)| {
+                    let recipe_id = recipe_id.parse::<RecipeIdentity>().map_err(|error| {
+                        Error::catalog(format!(
+                            "catalog has invalid Recipe ID {recipe_id:?}: {error}"
+                        ))
+                    })?;
+                    let transform_id =
+                        transform_id
+                            .parse::<TransformIdentity>()
+                            .map_err(|error| {
+                                Error::catalog(format!(
+                                    "recipe {recipe_id} has invalid Transform ID {transform_id:?}: {error}"
+                                ))
+                            })?;
+                    let content_id = content_id.parse::<ContentIdentity>().map_err(|error| {
+                        Error::catalog(format!(
+                            "recipe {recipe_id} has invalid Content ID {content_id:?}: {error}"
+                        ))
+                    })?;
+                    let byte_len = u64::try_from(byte_len).map_err(|_| {
+                        Error::catalog(format!(
+                            "content {content_id} has a negative byte length in the catalog"
+                        ))
+                    })?;
+                    Ok(RecipeSummary {
+                        recipe_id,
+                        transform_id,
+                        transform_name,
+                        content_id,
+                        byte_len,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        Ok(bounded_page(&mut items))
+    }
+
+    pub fn content_reference_counts(&self, identity: ContentIdentity) -> Result<(u64, u64)> {
+        let identity = identity.to_string();
+        let sources = self.connection.query_row(
+            "SELECT COUNT(*) FROM source_assets WHERE content_id = ?1",
+            [&identity],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let recipes = self.connection.query_row(
+            "SELECT COUNT(*) FROM recipe_results WHERE content_id = ?1",
+            [&identity],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let sources = u64::try_from(sources)
+            .map_err(|_| Error::catalog("source reference count is negative"))?;
+        let recipes = u64::try_from(recipes)
+            .map_err(|_| Error::catalog("recipe reference count is negative"))?;
+        Ok((sources, recipes))
     }
 
     pub fn record_result(
@@ -592,6 +749,15 @@ impl Catalog {
             native_artifact_bundles: count(&self.connection, "native_artifact_bundles")?,
             native_artifacts: count(&self.connection, "native_artifacts")?,
         })
+    }
+}
+
+fn bounded_page<T>(items: &mut Vec<T>) -> CatalogPage<T> {
+    let truncated = items.len() > CATALOG_LIST_LIMIT;
+    items.truncate(CATALOG_LIST_LIMIT);
+    CatalogPage {
+        items: std::mem::take(items),
+        truncated,
     }
 }
 

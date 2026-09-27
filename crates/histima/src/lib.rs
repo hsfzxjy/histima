@@ -17,13 +17,16 @@ use std::path::{Path, PathBuf};
 
 use tima::capability::RuntimeCapabilities;
 use tima::identity::{ContentIdentity, RecipeIdentity, SourceIdentity, source_identity};
-use tima::lineage::LineageNode;
+use tima::lineage::{Lineage, LineageNode};
 use tima::runtime::{OuterValue, ValueData};
 
 use cas::{ContentKind, ContentStore};
 use catalog::Catalog;
 
-pub use catalog::{CatalogInfo, CatalogStats, NativeArtifactInfo};
+pub use catalog::{
+    AssetSummary, CATALOG_LIST_LIMIT, CatalogInfo, CatalogPage, CatalogStats, NativeArtifactInfo,
+    RecipeSummary,
+};
 pub use error::{Error, Result};
 pub use runner::{ProgramExecution, RecipeReplay, RunError};
 
@@ -47,6 +50,27 @@ pub struct DurableTrace {
     pub recipe_id: RecipeIdentity,
     pub content_id: ContentIdentity,
     pub rendered: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentInspection {
+    pub content_id: ContentIdentity,
+    pub kind: String,
+    pub byte_len: u64,
+    pub relative_path: String,
+    pub source_references: u64,
+    pub recipe_references: u64,
+    pub valid: bool,
+    pub validation_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecipeInspection {
+    pub recipe_id: RecipeIdentity,
+    pub content_id: ContentIdentity,
+    pub lineage: Lineage,
+    pub rendered: String,
+    pub content: ContentInspection,
 }
 
 pub struct Workspace {
@@ -127,6 +151,70 @@ impl Workspace {
 
     pub fn content_path(&self, identity: ContentIdentity) -> PathBuf {
         self.content.object_path(identity)
+    }
+
+    pub fn assets(&self) -> Result<CatalogPage<AssetSummary>> {
+        self.catalog.assets()
+    }
+
+    pub fn recipes(&self) -> Result<CatalogPage<RecipeSummary>> {
+        self.catalog.recipes()
+    }
+
+    pub fn inspect_content(&self, identity: ContentIdentity) -> Result<ContentInspection> {
+        let object = self
+            .catalog
+            .content(identity)?
+            .ok_or_else(|| Error::ContentNotFound(identity.to_string()))?;
+        let (source_references, recipe_references) =
+            self.catalog.content_reference_counts(identity)?;
+        let validation_error =
+            match self
+                .content
+                .read_recorded(&object.content_id, &object.relative_path, object.kind)
+            {
+                Ok(bytes) if bytes.len() as u64 == object.byte_len => None,
+                Ok(bytes) => Some(format!(
+                    "catalog length is {}, but stored length is {}",
+                    object.byte_len,
+                    bytes.len()
+                )),
+                Err(error) => Some(error.to_string()),
+            };
+        Ok(ContentInspection {
+            content_id: identity,
+            kind: object.kind.as_str().to_owned(),
+            byte_len: object.byte_len,
+            relative_path: object.relative_path,
+            source_references,
+            recipe_references,
+            valid: validation_error.is_none(),
+            validation_error,
+        })
+    }
+
+    pub fn inspect_recipe(&self, recipe: RecipeIdentity) -> Result<RecipeInspection> {
+        let stored = self
+            .catalog
+            .replay_record(recipe)?
+            .ok_or_else(|| Error::RecipeNotFound(recipe.to_string()))?;
+        let trace = self
+            .catalog
+            .trace(recipe)?
+            .ok_or_else(|| Error::RecipeNotFound(recipe.to_string()))?;
+        if stored.content_id != trace.content_id {
+            return Err(Error::catalog(format!(
+                "recipe {recipe} has inconsistent result content identities"
+            )));
+        }
+        let content = self.inspect_content(stored.content_id)?;
+        Ok(RecipeInspection {
+            recipe_id: recipe,
+            content_id: stored.content_id,
+            lineage: stored.lineage,
+            rendered: trace.rendered,
+            content,
+        })
     }
 
     pub fn materialize_content(
@@ -365,6 +453,29 @@ mod tests {
     }
 
     #[test]
+    fn catalog_asset_listing_is_ordered_and_bounded() {
+        let test = TestDirectory::new("asset-list");
+        let mut workspace = Workspace::open(test.path().join("workspace")).unwrap();
+        for index in (0..=CATALOG_LIST_LIMIT).rev() {
+            workspace
+                .import_bytes(&format!("asset-{index:03}"), b"shared")
+                .unwrap();
+        }
+
+        let page = workspace.assets().unwrap();
+
+        assert_eq!(page.items.len(), CATALOG_LIST_LIMIT);
+        assert!(page.truncated);
+        assert_eq!(page.items.first().unwrap().locator, "asset-000");
+        assert_eq!(page.items.last().unwrap().locator, "asset-099");
+        let inspection = workspace.inspect_content(page.items[0].content_id).unwrap();
+        assert!(inspection.valid);
+        assert_eq!(inspection.kind, "raw");
+        assert_eq!(inspection.source_references, 101);
+        assert_eq!(inspection.recipe_references, 0);
+    }
+
+    #[test]
     fn content_corruption_is_detected_before_reuse() {
         let test = TestDirectory::new("integrity");
         let input = test.path().join("source.bin");
@@ -375,6 +486,14 @@ mod tests {
 
         let error = workspace.read_content(imported.content_id).unwrap_err();
         assert!(matches!(error, Error::Integrity { .. }));
+        let inspection = workspace.inspect_content(imported.content_id).unwrap();
+        assert!(!inspection.valid);
+        assert!(
+            inspection
+                .validation_error
+                .unwrap()
+                .contains("content integrity failure")
+        );
         let error = workspace.import_file(&input).unwrap_err();
         assert!(matches!(error, Error::Integrity { .. }));
     }
