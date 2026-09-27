@@ -307,6 +307,18 @@ fn cli_runs_records_and_replays_a_png_pipeline() {
     );
     let recipe_id = field(&run, "recipe_id");
 
+    let source_text = fs::read_to_string(&script).unwrap();
+    fs::write(
+        &script,
+        source_text.replace("| encode.png\n", "| encode.png(compression=6)\n"),
+    )
+    .unwrap();
+    fs::remove_file(&output).unwrap();
+    let explicit_default = histima(["run", text(&workspace), text(&script), "--record", "out"]);
+    assert_success(&explicit_default);
+    assert_eq!(field(&explicit_default, "recipe_id"), recipe_id);
+    assert!(stdout(&explicit_default).contains("result_cache_hits = 1"));
+
     let trace = histima(["trace", text(&workspace), &recipe_id]);
     assert_success(&trace);
     assert!(stdout(&trace).contains("invoke decode.png"));

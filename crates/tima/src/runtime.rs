@@ -1280,11 +1280,12 @@ impl Interpreter<'_, '_, '_> {
             return self.save(evaluated, span);
         }
         if let Some(host_transform) = HostTransform::find(&name) {
-            let arguments = order_outer_arguments(
+            let arguments = order_outer_arguments_with_defaults(
                 host_transform.name(),
                 host_transform.parameters(),
                 evaluated,
                 span,
+                |index| host_transform.default_argument(index),
             )?;
             return invoke_host_transform_with_lineage(
                 host_transform,
@@ -1480,6 +1481,16 @@ fn order_outer_arguments(
     arguments: Vec<(Option<String>, OuterValue, Span)>,
     call_span: Span,
 ) -> Result<Vec<(OuterValue, Span)>, Diagnostic> {
+    order_outer_arguments_with_defaults(callable, parameters, arguments, call_span, |_| None)
+}
+
+fn order_outer_arguments_with_defaults(
+    callable: &str,
+    parameters: &[&str],
+    arguments: Vec<(Option<String>, OuterValue, Span)>,
+    call_span: Span,
+    default: impl Fn(usize) -> Option<OuterValue>,
+) -> Result<Vec<(OuterValue, Span)>, Diagnostic> {
     let mut ordered: Vec<Option<(OuterValue, Span)>> = vec![None; parameters.len()];
     let mut next_positional = 0;
     for (name, value, argument_span) in arguments {
@@ -1522,12 +1533,14 @@ fn order_outer_arguments(
         .into_iter()
         .enumerate()
         .map(|(index, value)| {
-            value.ok_or_else(|| {
-                Diagnostic::error(
-                    format!("missing argument `{}` for {callable}", parameters[index]),
-                    call_span,
-                )
-            })
+            value
+                .or_else(|| default(index).map(|value| (value, call_span)))
+                .ok_or_else(|| {
+                    Diagnostic::error(
+                        format!("missing argument `{}` for {callable}", parameters[index]),
+                        call_span,
+                    )
+                })
         })
         .collect()
 }
@@ -2999,7 +3012,10 @@ mod tests {
              decoded = source | decode.png\n\
              darkened = decoded | darken(0.5)\n\
              out = darkened | encode.png\n\
+             explicit_default = darkened | encode.png(compression=6)\n\
+             fast = darkened | encode.png(compression=1)\n\
              replayed = replay(out)\n\
+             replayed_fast = replay(fast)\n\
              derivation = trace(out)\n",
         )
         .unwrap();
@@ -3030,6 +3046,44 @@ mod tests {
             execution.bindings["replayed"].data,
             execution.bindings["out"].data
         );
+        assert_eq!(
+            execution.bindings["explicit_default"].data,
+            execution.bindings["out"].data
+        );
+        assert_eq!(
+            execution.bindings["replayed_fast"].data,
+            execution.bindings["fast"].data
+        );
+        let LineageNode::Invocation(defaulted) = execution.bindings["out"]
+            .lineage
+            .as_ref()
+            .expect("encoded output has lineage")
+            .node()
+        else {
+            panic!("expected invocation lineage")
+        };
+        let LineageNode::Invocation(explicit) = execution.bindings["explicit_default"]
+            .lineage
+            .as_ref()
+            .expect("encoded output has lineage")
+            .node()
+        else {
+            panic!("expected invocation lineage")
+        };
+        let LineageNode::Invocation(fast) = execution.bindings["fast"]
+            .lineage
+            .as_ref()
+            .expect("encoded output has lineage")
+            .node()
+        else {
+            panic!("expected invocation lineage")
+        };
+        assert_eq!(defaulted.recipe_id, explicit.recipe_id);
+        assert_ne!(defaulted.recipe_id, fast.recipe_id);
+        assert_eq!(defaulted.arguments.len(), 2);
+        assert_eq!(defaulted.arguments[1].name.as_ref(), "compression");
+        assert_eq!(defaulted.arguments[1].value, RecordedValue::Integer(6));
+        assert_eq!(fast.arguments[1].value, RecordedValue::Integer(1));
         let ValueData::Lineage(lineage) = &execution.bindings["derivation"].data else {
             panic!("expected lineage")
         };

@@ -9,7 +9,9 @@ use crate::runtime::{ImageFormat, ImageValue, OuterValue, ValueData};
 use crate::source::Span;
 
 const PPM_TRANSFORM_VERSION: u32 = 1;
-const PNG_TRANSFORM_VERSION: u32 = 1;
+const PNG_DECODE_TRANSFORM_VERSION: u32 = 1;
+const PNG_ENCODE_TRANSFORM_VERSION: u32 = 2;
+const PNG_DEFAULT_COMPRESSION: i64 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostTransform {
@@ -53,14 +55,25 @@ impl HostTransform {
     pub(crate) const fn parameters(self) -> &'static [&'static str] {
         match self {
             Self::DecodePpm | Self::DecodePng => &["asset"],
-            Self::EncodePpm | Self::EncodePng => &["image"],
+            Self::EncodePpm => &["image"],
+            Self::EncodePng => &["image", "compression"],
+        }
+    }
+
+    pub(crate) fn default_argument(self, index: usize) -> Option<OuterValue> {
+        match (self, index) {
+            (Self::EncodePng, 1) => Some(OuterValue::plain(ValueData::Integer(
+                PNG_DEFAULT_COMPRESSION,
+            ))),
+            _ => None,
         }
     }
 
     pub(crate) fn identity(self) -> TransformIdentity {
         let version = match self {
             Self::DecodePpm | Self::EncodePpm => PPM_TRANSFORM_VERSION,
-            Self::DecodePng | Self::EncodePng => PNG_TRANSFORM_VERSION,
+            Self::DecodePng => PNG_DECODE_TRANSFORM_VERSION,
+            Self::EncodePng => PNG_ENCODE_TRANSFORM_VERSION,
         };
         host_transform_identity(self.name(), version)
     }
@@ -71,9 +84,13 @@ impl HostTransform {
         capabilities: Option<&dyn RuntimeCapabilities>,
         call_span: Span,
     ) -> Result<PreparedHostInvocation, Diagnostic> {
-        if arguments.len() != 1 {
+        if arguments.len() != self.parameters().len() {
             return Err(Diagnostic::error(
-                format!("{} expects exactly one argument", self.name()),
+                format!(
+                    "{} expects exactly {} arguments",
+                    self.name(),
+                    self.parameters().len()
+                ),
                 call_span,
             ));
         }
@@ -149,6 +166,20 @@ impl HostTransform {
                         arguments[0].1,
                     ));
                 }
+                if self == Self::EncodePng {
+                    let ValueData::Integer(compression) = arguments[1].0.data else {
+                        return Err(Diagnostic::error(
+                            "encode.png compression must be an integer from 1 through 9",
+                            arguments[1].1,
+                        ));
+                    };
+                    if !(1..=9).contains(&compression) {
+                        return Err(Diagnostic::error(
+                            "encode.png compression must be an integer from 1 through 9",
+                            arguments[1].1,
+                        ));
+                    }
+                }
                 Ok(PreparedHostInvocation {
                     arguments,
                     decode_bytes: None,
@@ -186,7 +217,10 @@ impl PreparedHostInvocation {
                 let ValueData::Image(image) = &self.arguments[0].0.data else {
                     unreachable!("prepared encode.png argument is an image")
                 };
-                encode_png(image, self.arguments[0].1)
+                let ValueData::Integer(compression) = self.arguments[1].0.data else {
+                    unreachable!("prepared encode.png compression is an integer")
+                };
+                encode_png(image, compression as u8, self.arguments[0].1)
                     .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::from(bytes))))
             }
         }
@@ -389,7 +423,7 @@ fn decode_png(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
     })
 }
 
-fn encode_png(image: &ImageValue, span: Span) -> Result<Vec<u8>, Diagnostic> {
+fn encode_png(image: &ImageValue, compression: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
     let width = u32::try_from(image.width())
         .map_err(|_| Diagnostic::error("encode.png width exceeds PNG limits", span))?;
     let height = u32::try_from(image.height())
@@ -414,7 +448,7 @@ fn encode_png(image: &ImageValue, span: Span) -> Result<Vec<u8>, Diagnostic> {
         let mut encoder = png::Encoder::new(&mut encoded, width, height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_deflate_compression(png::DeflateCompression::Level(6));
+        encoder.set_deflate_compression(png::DeflateCompression::Level(compression));
         encoder.set_filter(png::Filter::Paeth);
         let mut writer = encoder.write_header().map_err(|error| {
             Diagnostic::error(
@@ -458,8 +492,8 @@ mod tests {
         let image =
             ImageValue::new_rgba8(2, 1, 10, vec![1, 2, 3, 4, 200, 150, 100, 50, 99, 100]).unwrap();
 
-        let first = encode_png(&image, Span::default()).unwrap();
-        let second = encode_png(&image, Span::default()).unwrap();
+        let first = encode_png(&image, 6, Span::default()).unwrap();
+        let second = encode_png(&image, 6, Span::default()).unwrap();
         let decoded = decode_png(&first, Span::default()).unwrap();
 
         assert_eq!(first, second);
@@ -472,6 +506,46 @@ mod tests {
             byte_content_identity(&first).to_string(),
             "01d6d2f53cdbc115059b2116ff7b33acbe95f4c5ba138980086b705a9fd0cee0"
         );
+    }
+
+    #[test]
+    fn png_compression_is_source_spanned_and_range_checked() {
+        let image = OuterValue::image(ImageValue::new_rgba8(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
+        let compression_span = Span::new(17, 18);
+
+        for compression in [0, 10] {
+            let diagnostic = match HostTransform::EncodePng.prepare(
+                vec![
+                    (image.clone(), Span::new(0, 5)),
+                    (
+                        OuterValue::plain(ValueData::Integer(compression)),
+                        compression_span,
+                    ),
+                ],
+                None,
+                Span::new(0, 18),
+            ) {
+                Err(diagnostic) => diagnostic,
+                Ok(_) => panic!("out-of-range compression was accepted"),
+            };
+
+            assert_eq!(diagnostic.labels[0].span, compression_span);
+            assert!(diagnostic.message.contains("integer from 1 through 9"));
+        }
+
+        let diagnostic = match HostTransform::EncodePng.prepare(
+            vec![
+                (image, Span::new(0, 5)),
+                (OuterValue::plain(ValueData::Float(6.0)), compression_span),
+            ],
+            None,
+            Span::new(0, 18),
+        ) {
+            Err(diagnostic) => diagnostic,
+            Ok(_) => panic!("non-integer compression was accepted"),
+        };
+        assert_eq!(diagnostic.labels[0].span, compression_span);
+        assert!(diagnostic.message.contains("integer from 1 through 9"));
     }
 
     #[test]
