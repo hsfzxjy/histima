@@ -68,6 +68,11 @@ fn run() -> Result<(), String> {
             println!("source_heads = {}", stats.source_heads);
             println!("lineage_invocations = {}", stats.lineage_invocations);
             println!("recipe_results = {}", stats.recipe_results);
+            println!(
+                "native_artifact_bundles = {}",
+                stats.native_artifact_bundles
+            );
+            println!("native_artifacts = {}", stats.native_artifacts);
         }
         "materialize" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
@@ -136,6 +141,21 @@ fn run() -> Result<(), String> {
             println!("result_cache_hits = {}", result.result_cache.hits);
             println!("result_cache_misses = {}", result.result_cache.misses);
             println!("result_cache_stores = {}", result.result_cache.stores);
+            println!("native_bundle_id = {}", result.native_artifact.bundle_id);
+            println!(
+                "native_artifact_ids = {}",
+                result
+                    .native_artifact
+                    .artifact_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            println!(
+                "native_library_content_id = {}",
+                result.native_artifact.library_content_id
+            );
             let unbound_trace = result.execution.last_value.as_ref().and_then(|last| {
                 let ValueData::Lineage(lineage) = &last.data else {
                     return None;
@@ -193,6 +213,21 @@ fn run() -> Result<(), String> {
             println!("result_cache_hits = {}", replayed.result_cache.hits);
             println!("result_cache_misses = {}", replayed.result_cache.misses);
             println!("result_cache_stores = {}", replayed.result_cache.stores);
+            println!("native_bundle_id = {}", replayed.native_artifact.bundle_id);
+            println!(
+                "native_artifact_ids = {}",
+                replayed
+                    .native_artifact
+                    .artifact_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            println!(
+                "native_library_content_id = {}",
+                replayed.native_artifact.library_content_id
+            );
             println!("recipe_id = {recipe}");
             println!("content_id = {content_id}");
             println!("replayed = {}", display(&replayed.value));

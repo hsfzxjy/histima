@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusqlite::Connection;
+use tima::identity::byte_content_identity;
+
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
@@ -15,7 +18,7 @@ fn cli_imports_inspects_and_materializes_across_processes() {
 
     let initialized = histima(["init", text(&workspace)]);
     assert_success(&initialized);
-    assert!(stdout(&initialized).contains("schema_version = 2"));
+    assert!(stdout(&initialized).contains("schema_version = 3"));
 
     let imported = histima(["import", text(&workspace), text(&source)]);
     assert_success(&imported);
@@ -94,8 +97,63 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
     let recipe_id = field(&first, "recipe_id");
     let content_id = field(&first, "content_id");
+    let native_bundle_id = field(&first, "native_bundle_id");
+    let native_artifact_id = field(&first, "native_artifact_ids");
+    let native_library_content_id = field(&first, "native_library_content_id");
     assert_eq!(recipe_id.len(), 64);
     assert_eq!(content_id.len(), 64);
+    assert_eq!(native_bundle_id.len(), 64);
+    assert_eq!(native_artifact_id.len(), 64);
+    assert_eq!(native_library_content_id.len(), 64);
+
+    let database = Connection::open(workspace.join("catalog.sqlite3")).unwrap();
+    let metadata = database
+        .query_row(
+            "SELECT backend, backend_version, compiler_version, target,
+                    cpu_features, optimization, abi_version, library_content_id,
+                    library_relative_path
+             FROM native_artifact_bundles WHERE bundle_id = ?1",
+            [&native_bundle_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(metadata.0, "c");
+    assert_eq!(metadata.1, "11");
+    assert!(metadata.2.contains("clang"));
+    assert!(!metadata.3.is_empty());
+    assert_eq!(metadata.4, "");
+    assert_eq!(metadata.5, "O2-fno-builtin");
+    assert_eq!(metadata.6, 6);
+    assert_eq!(metadata.7, native_library_content_id);
+    assert_eq!(
+        metadata.8,
+        format!("cache/native/{native_bundle_id}/module.dll")
+    );
+    let recorded_member = database
+        .query_row(
+            "SELECT member.artifact_id, artifact.transform_id
+             FROM native_artifact_bundle_members AS member
+             JOIN native_artifacts AS artifact USING (artifact_id)
+             WHERE member.bundle_id = ?1 AND member.artifact_index = 0",
+            [&native_bundle_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(recorded_member.0, native_artifact_id);
+    assert_eq!(recorded_member.1.len(), 64);
+    drop(database);
 
     let trace = histima(["trace", text(&workspace), &recipe_id]);
     assert_success(&trace);
@@ -109,6 +167,11 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert!(stdout(&replayed).contains("result_cache_hits = 1"));
     assert_eq!(field(&replayed, "recipe_id"), recipe_id);
     assert_eq!(field(&replayed, "content_id"), content_id);
+    assert_eq!(field(&replayed, "native_bundle_id"), native_bundle_id);
+    assert_eq!(
+        field(&replayed, "native_library_content_id"),
+        native_library_content_id
+    );
     assert!(stdout(&replayed).contains("invoke darken"));
 
     let materialized = histima([
@@ -125,6 +188,8 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert!(stdout(&stats).contains("contents = 2"));
     assert!(stdout(&stats).contains("lineage_invocations = 3"));
     assert!(stdout(&stats).contains("recipe_results = 1"));
+    assert!(stdout(&stats).contains("native_artifact_bundles = 1"));
+    assert!(stdout(&stats).contains("native_artifacts = 1"));
 
     let renamed = fs::read_to_string(&script)
         .unwrap()
@@ -173,6 +238,30 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert_ne!(field(&changed, "recipe_id"), recipe_id);
     assert_ne!(field(&changed, "content_id"), content_id);
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n50 40 30\n");
+
+    let database = Connection::open(workspace.join("catalog.sqlite3")).unwrap();
+    let library_relative_path = database
+        .query_row(
+            "SELECT library_relative_path FROM native_artifact_bundles WHERE bundle_id = ?1",
+            [&native_bundle_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    drop(database);
+    let library = workspace.join(library_relative_path);
+    let corrupt = b"corrupt native module";
+    fs::write(&library, corrupt).unwrap();
+    fs::write(
+        library.with_file_name("module.sha256"),
+        byte_content_identity(corrupt).to_string(),
+    )
+    .unwrap();
+    let corrupt_artifact = histima(["run", text(&workspace), text(&script)]);
+    assert!(!corrupt_artifact.status.success());
+    assert!(
+        stderr(&corrupt_artifact)
+            .contains("catalog metadata that does not match the on-disk cache")
+    );
 }
 
 fn histima<const N: usize>(arguments: [&str; N]) -> Output {

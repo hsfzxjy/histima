@@ -26,8 +26,9 @@ The separate `histima` crate now owns the beginning of the product boundary. A
 configurable workspace combines a migration-managed SQLite catalog with a
 filesystem content-addressed store. SQLite runs with foreign keys and WAL mode,
 stores queryable content/source metadata, preserves immutable source versions,
-and tracks the current observation for each locator. Imported payloads are
-atomically published outside SQLite under their Tima Content IDs; repeat imports
+tracks the current observation for each locator, and catalogs native artifacts
+separately from semantic transform results. Imported payloads are atomically
+published outside SQLite under their Tima Content IDs; repeat imports
 deduplicate bytes, and every read revalidates stored content before returning
 it. The workspace implements Tima's explicit asset-read capability and never
 falls back to an ambient path that has not been imported.
@@ -182,6 +183,14 @@ Recipe-ID index over an immutable content-addressed store. Cache hits reconstruc
 lineage from the current semantic invocation rather than recording cache
 execution history; conflicting content for one recipe is rejected as a
 reproducibility failure.
+
+Histima additionally records each native bundle and its ordered Artifact IDs in
+SQLite. The catalog keeps backend and compiler versions, target, CPU-feature
+selection, optimization configuration, ABI version, DLL Content ID, and
+workspace-relative cache location. Each load compares those records with the
+Tima-computed identities and the bytes currently on disk before loading native
+code. These records have no identity relationship to Recipe IDs: changing a
+compiler or backend affects artifact reuse, never semantic lineage.
 
 `replay(value)` now resolves recorded inner and host transforms by semantic
 identity, recursively validates source assets and recorded external

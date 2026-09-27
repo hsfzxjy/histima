@@ -23,7 +23,7 @@ use tima::runtime::{OuterValue, ValueData};
 use cas::{ContentKind, ContentStore};
 use catalog::Catalog;
 
-pub use catalog::{CatalogInfo, CatalogStats};
+pub use catalog::{CatalogInfo, CatalogStats, NativeArtifactInfo};
 pub use error::{Error, Result};
 pub use runner::{ProgramExecution, RecipeReplay, RunError};
 
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(
             workspace.catalog_info().unwrap(),
             CatalogInfo {
-                schema_version: 2,
+                schema_version: 3,
                 foreign_keys_enabled: true,
                 journal_mode: "wal".to_owned(),
             }
@@ -321,6 +321,8 @@ mod tests {
                 source_heads: 2,
                 lineage_invocations: 0,
                 recipe_results: 0,
+                native_artifact_bundles: 0,
+                native_artifacts: 0,
             }
         );
 
@@ -340,6 +342,8 @@ mod tests {
                 source_heads: 2,
                 lineage_invocations: 0,
                 recipe_results: 0,
+                native_artifact_bundles: 0,
+                native_artifacts: 0,
             }
         );
         assert!(

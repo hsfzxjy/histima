@@ -12,7 +12,7 @@ use tima::diagnostic::Diagnostic;
 use tima::identity::{ContentIdentity, RecipeIdentity};
 use tima::runtime::{Execution, OuterValue};
 
-use crate::Workspace;
+use crate::{NativeArtifactInfo, Workspace};
 
 /// The observable result of one Tima program execution in a Histima workspace.
 ///
@@ -22,6 +22,7 @@ use crate::Workspace;
 pub struct ProgramExecution {
     pub execution: Execution,
     pub native_cache: NativeCacheStatus,
+    pub native_artifact: NativeArtifactInfo,
     pub result_cache: CacheStats,
 }
 
@@ -30,6 +31,7 @@ pub struct ProgramExecution {
 pub struct RecipeReplay {
     pub value: OuterValue,
     pub native_cache: NativeCacheStatus,
+    pub native_artifact: NativeArtifactInfo,
     pub result_cache: CacheStats,
 }
 
@@ -46,7 +48,7 @@ impl Workspace {
     /// Executes checked Tima through the generated-C backend with this
     /// workspace as the only host capability provider.
     pub fn execute(&self, program: &CompiledProgram) -> Result<ProgramExecution, RunError> {
-        let (native_cache, native) = self.load_native(program)?;
+        let (native_cache, native_artifact, native) = self.load_native(program)?;
         let mut result_cache = WorkspaceResultCache::new(self);
         let execution = tima::runtime::execute_native_cached_with_capabilities(
             program,
@@ -58,6 +60,7 @@ impl Workspace {
         Ok(ProgramExecution {
             execution,
             native_cache,
+            native_artifact,
             result_cache: result_cache.stats,
         })
     }
@@ -71,7 +74,7 @@ impl Workspace {
         recipe: RecipeIdentity,
     ) -> Result<RecipeReplay, RunError> {
         let target = self.replay_target(recipe).map_err(RunError::Storage)?;
-        let (native_cache, native) = self.load_native(program)?;
+        let (native_cache, native_artifact, native) = self.load_native(program)?;
         let mut result_cache = WorkspaceResultCache::new(self);
         let value = tima::runtime::replay_native_with_capabilities(
             program,
@@ -84,6 +87,7 @@ impl Workspace {
         Ok(RecipeReplay {
             value,
             native_cache,
+            native_artifact,
             result_cache: result_cache.stats,
         })
     }
@@ -91,7 +95,7 @@ impl Workspace {
     fn load_native(
         &self,
         program: &CompiledProgram,
-    ) -> Result<(NativeCacheStatus, NativeModule), RunError> {
+    ) -> Result<(NativeCacheStatus, NativeArtifactInfo, NativeModule), RunError> {
         let generated = CBackend
             .emit(&program.transforms)
             .map_err(RunError::CodeGeneration)?;
@@ -99,9 +103,13 @@ impl Workspace {
         let cached_artifact = ClangCompiler::default()
             .compile_cached(&generated, &transform_ids, self.native_cache_root())
             .map_err(RunError::NativeBuild)?;
+        let artifact_info = self
+            .catalog
+            .record_native_artifact(&cached_artifact, &transform_ids, self.root())
+            .map_err(RunError::Storage)?;
         let native = NativeModule::load(&cached_artifact.artifact, &program.transforms)
             .map_err(RunError::NativeLoad)?;
-        Ok((cached_artifact.status, native))
+        Ok((cached_artifact.status, artifact_info, native))
     }
 }
 
