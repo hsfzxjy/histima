@@ -8,14 +8,18 @@ pub const ASSET_CAPABILITY: &str = "asset";
 
 /// Host-mediated external state available to Tima execution.
 ///
-/// Tima never falls back to the process environment. Histima must provide an
-/// implementation explicitly, which keeps permission and dependency capture
-/// at the runtime boundary.
+/// Tima never falls back to the process environment or filesystem. Histima
+/// must provide an implementation explicitly, which keeps permissions,
+/// dependency capture, and output policy at the runtime boundary.
 pub trait RuntimeCapabilities {
     fn environment(&self, name: &str) -> Result<Vec<u8>, String>;
 
     fn read_asset(&self, locator: &str) -> Result<Vec<u8>, String> {
         Err(format!("asset `{locator}` is unavailable"))
+    }
+
+    fn write_asset(&self, locator: &str, _bytes: &[u8]) -> Result<(), String> {
+        Err(format!("asset output `{locator}` is unavailable"))
     }
 }
 

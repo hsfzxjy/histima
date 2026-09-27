@@ -93,6 +93,13 @@ replay, but remain outside typed inner IR and the generated-C artifact cache.
 The CLI explicitly supplies local-file access; the library has no ambient
 filesystem fallback.
 
+Encoded bytes can be persisted with the outer sink
+`bytes | save("output.ppm")`. Saving requires an explicit host asset-output
+capability and returns the same immutable value with the same derivation
+lineage. It is an execution effect rather than a transform: it is never
+result-cached, and replay reconstructs the derived bytes without unexpectedly
+repeating the write. The CLI maps this capability to a local-file write.
+
 Every checked transform also receives a stable semantic identity derived from
 canonical typed IR and referenced transform identities. Source formatting,
 comments, local names, declaration order, backend, and target do not affect it.

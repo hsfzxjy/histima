@@ -1255,65 +1255,16 @@ impl Interpreter<'_, '_, '_> {
         if name == "replay" {
             return self.replay_call(evaluated, span);
         }
+        if name == "save" {
+            return self.save(evaluated, span);
+        }
         if let Some(host_transform) = HostTransform::find(&name) {
-            let parameters = host_transform.parameters();
-            let mut ordered: Vec<Option<(OuterValue, Span)>> = vec![None; parameters.len()];
-            let mut next_positional = 0;
-            for (argument_name, value, argument_span) in evaluated {
-                let index = if let Some(argument_name) = argument_name {
-                    parameters
-                        .iter()
-                        .position(|parameter| *parameter == argument_name)
-                        .ok_or_else(|| {
-                            Diagnostic::error(
-                                format!(
-                                    "{} has no parameter `{argument_name}`",
-                                    host_transform.name()
-                                ),
-                                argument_span,
-                            )
-                        })?
-                } else {
-                    while next_positional < ordered.len() && ordered[next_positional].is_some() {
-                        next_positional += 1;
-                    }
-                    if next_positional == ordered.len() {
-                        return Err(Diagnostic::error(
-                            format!("too many arguments for {}", host_transform.name()),
-                            argument_span,
-                        ));
-                    }
-                    let index = next_positional;
-                    next_positional += 1;
-                    index
-                };
-                if ordered[index].is_some() {
-                    return Err(Diagnostic::error(
-                        format!(
-                            "parameter `{}` is supplied more than once",
-                            parameters[index]
-                        ),
-                        argument_span,
-                    ));
-                }
-                ordered[index] = Some((value, argument_span));
-            }
-            let arguments = ordered
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    value.ok_or_else(|| {
-                        Diagnostic::error(
-                            format!(
-                                "missing argument `{}` for {}",
-                                parameters[index],
-                                host_transform.name()
-                            ),
-                            span,
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let arguments = order_outer_arguments(
+                host_transform.name(),
+                host_transform.parameters(),
+                evaluated,
+                span,
+            )?;
             return invoke_host_transform_with_lineage(
                 host_transform,
                 self.engine,
@@ -1328,58 +1279,12 @@ impl Interpreter<'_, '_, '_> {
                 callee_expression.span,
             ));
         };
-        let mut ordered: Vec<Option<(OuterValue, Span)>> = vec![None; transform.parameters.len()];
-        let mut next_positional = 0;
-        for (name, value, argument_span) in evaluated {
-            let index = if let Some(name) = name {
-                transform
-                    .parameters
-                    .iter()
-                    .position(|parameter| parameter.name == name)
-                    .ok_or_else(|| {
-                        Diagnostic::error(
-                            format!("transform `{}` has no parameter `{name}`", transform.name),
-                            argument_span,
-                        )
-                    })?
-            } else {
-                while next_positional < ordered.len() && ordered[next_positional].is_some() {
-                    next_positional += 1;
-                }
-                if next_positional == ordered.len() {
-                    return Err(Diagnostic::error(
-                        format!("too many arguments for transform `{}`", transform.name),
-                        argument_span,
-                    ));
-                }
-                let index = next_positional;
-                next_positional += 1;
-                index
-            };
-            if ordered[index].is_some() {
-                return Err(Diagnostic::error(
-                    format!(
-                        "parameter `{}` is supplied more than once",
-                        transform.parameters[index].name
-                    ),
-                    argument_span,
-                ));
-            }
-            ordered[index] = Some((value, argument_span));
-        }
-        let mut values = Vec::new();
-        for (index, value) in ordered.into_iter().enumerate() {
-            let Some(value) = value else {
-                return Err(Diagnostic::error(
-                    format!(
-                        "missing argument `{}` for transform `{}`",
-                        transform.parameters[index].name, transform.name
-                    ),
-                    span,
-                ));
-            };
-            values.push(value);
-        }
+        let parameters = transform
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>();
+        let values = order_outer_arguments(&transform.name, &parameters, evaluated, span)?;
         invoke_transform_with_lineage(
             self.program,
             self.engine,
@@ -1504,6 +1409,99 @@ impl Interpreter<'_, '_, '_> {
             )
         }
     }
+
+    fn save(
+        &self,
+        arguments: Vec<(Option<String>, OuterValue, Span)>,
+        span: Span,
+    ) -> Result<OuterValue, Diagnostic> {
+        let mut arguments = order_outer_arguments("save", &["value", "locator"], arguments, span)?;
+        let (locator, locator_span) = arguments.pop().expect("save has a locator argument");
+        let (value, value_span) = arguments.pop().expect("save has a value argument");
+        let ValueData::Bytes(bytes) = &value.data else {
+            return Err(Diagnostic::error(
+                "save currently requires an encoded byte value",
+                value_span,
+            ));
+        };
+        let ValueData::String(locator) = &locator.data else {
+            return Err(Diagnostic::error(
+                "save output locator must be a string",
+                locator_span,
+            ));
+        };
+        let Some(capabilities) = self.engine.capabilities() else {
+            return Err(
+                Diagnostic::error("asset output is unavailable in this runtime", span)
+                    .with_note("the Histima host must provide an asset-writing capability"),
+            );
+        };
+        capabilities.write_asset(locator, bytes).map_err(|error| {
+            Diagnostic::error(
+                format!("could not write asset output {locator:?}: {error}"),
+                locator_span,
+            )
+        })?;
+        Ok(value)
+    }
+}
+
+fn order_outer_arguments(
+    callable: &str,
+    parameters: &[&str],
+    arguments: Vec<(Option<String>, OuterValue, Span)>,
+    call_span: Span,
+) -> Result<Vec<(OuterValue, Span)>, Diagnostic> {
+    let mut ordered: Vec<Option<(OuterValue, Span)>> = vec![None; parameters.len()];
+    let mut next_positional = 0;
+    for (name, value, argument_span) in arguments {
+        let index = if let Some(name) = name {
+            parameters
+                .iter()
+                .position(|parameter| *parameter == name)
+                .ok_or_else(|| {
+                    Diagnostic::error(
+                        format!("{callable} has no parameter `{name}`"),
+                        argument_span,
+                    )
+                })?
+        } else {
+            while next_positional < ordered.len() && ordered[next_positional].is_some() {
+                next_positional += 1;
+            }
+            if next_positional == ordered.len() {
+                return Err(Diagnostic::error(
+                    format!("too many arguments for {callable}"),
+                    argument_span,
+                ));
+            }
+            let index = next_positional;
+            next_positional += 1;
+            index
+        };
+        if ordered[index].is_some() {
+            return Err(Diagnostic::error(
+                format!(
+                    "parameter `{}` is supplied more than once",
+                    parameters[index]
+                ),
+                argument_span,
+            ));
+        }
+        ordered[index] = Some((value, argument_span));
+    }
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.ok_or_else(|| {
+                Diagnostic::error(
+                    format!("missing argument `{}` for {callable}", parameters[index]),
+                    call_span,
+                )
+            })
+        })
+        .collect()
 }
 
 fn outer_binary(
@@ -2440,6 +2438,7 @@ fn checked_u8(value: i64, span: Span) -> Result<u8, Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2480,11 +2479,17 @@ mod tests {
         }
     }
 
-    struct FixedAssets(BTreeMap<String, Vec<u8>>);
+    struct FixedAssets {
+        inputs: BTreeMap<String, Vec<u8>>,
+        outputs: RefCell<Vec<(String, Vec<u8>)>>,
+    }
 
     impl FixedAssets {
         fn one(locator: &str, bytes: &[u8]) -> Self {
-            Self(BTreeMap::from([(locator.to_owned(), bytes.to_vec())]))
+            Self {
+                inputs: BTreeMap::from([(locator.to_owned(), bytes.to_vec())]),
+                outputs: RefCell::default(),
+            }
         }
     }
 
@@ -2494,10 +2499,17 @@ mod tests {
         }
 
         fn read_asset(&self, locator: &str) -> Result<Vec<u8>, String> {
-            self.0
+            self.inputs
                 .get(locator)
                 .cloned()
                 .ok_or_else(|| format!("asset `{locator}` is unavailable"))
+        }
+
+        fn write_asset(&self, locator: &str, bytes: &[u8]) -> Result<(), String> {
+            self.outputs
+                .borrow_mut()
+                .push((locator.to_owned(), bytes.to_vec()));
+            Ok(())
         }
     }
 
@@ -2846,6 +2858,24 @@ mod tests {
     }
 
     #[test]
+    fn save_requires_an_explicit_asset_output_capability() {
+        let compiled =
+            crate::compile("test.tima", "saved = encoded | save(\"out.ppm\")\n").unwrap();
+        let engine = IrInterpreter {
+            module: &compiled.transforms,
+            capabilities: None,
+        };
+        let bindings = BTreeMap::from([(
+            "encoded".to_owned(),
+            OuterValue::plain(ValueData::Bytes(Arc::from(&b"P3\n"[..]))),
+        )]);
+
+        let diagnostics = execute_with(&compiled, &engine, bindings, None).unwrap_err();
+
+        assert!(diagnostics[0].message.contains("output is unavailable"));
+    }
+
+    #[test]
     fn host_ppm_pipeline_runs_native_transform_with_lineage_cache_and_replay() {
         let compiled = crate::compile(
             "pipeline.tima",
@@ -2861,8 +2891,9 @@ mod tests {
              decoded = source | decode.ppm\n\
              darkened = decoded | darken(0.5)\n\
              out = darkened | encode.ppm\n\
-             replayed = replay(out)\n\
-             derivation = trace(out)\n",
+             saved = out | save(\"cat-dark.ppm\")\n\
+             replayed = replay(saved)\n\
+             derivation = trace(saved)\n",
         )
         .unwrap();
         let generated = CBackend.emit(&compiled.transforms).unwrap();
@@ -2883,6 +2914,11 @@ mod tests {
             panic!("expected encoded bytes")
         };
         assert_eq!(encoded.as_ref(), b"P3\n2 1\n255\n50 25 10 100 50 25\n");
+        assert_eq!(execution.bindings["saved"], execution.bindings["out"]);
+        assert_eq!(
+            assets.outputs.borrow().as_slice(),
+            &[("cat-dark.ppm".to_owned(), encoded.to_vec())]
+        );
         assert_eq!(
             execution.bindings["replayed"].data,
             execution.bindings["out"].data
@@ -2899,18 +2935,19 @@ mod tests {
         let replayed = replay_native_with_capabilities(
             &compiled,
             &native,
-            &execution.bindings["out"],
+            &execution.bindings["saved"],
             &mut TransformResultCache::default(),
             &assets,
         )
         .unwrap();
         assert_eq!(replayed.data, execution.bindings["out"].data);
+        assert_eq!(assets.outputs.borrow().len(), 1);
 
         let changed_assets = FixedAssets::one("cat.ppm", b"P3\n2 1\n255\n101 50 20 200 100 50\n");
         let diagnostic = replay_native_with_capabilities(
             &compiled,
             &native,
-            &execution.bindings["out"],
+            &execution.bindings["saved"],
             &mut cache,
             &changed_assets,
         )

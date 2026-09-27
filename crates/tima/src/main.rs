@@ -124,6 +124,10 @@ impl RuntimeCapabilities for CliCapabilities {
     fn read_asset(&self, locator: &str) -> Result<Vec<u8>, String> {
         fs::read(locator).map_err(|error| error.to_string())
     }
+
+    fn write_asset(&self, locator: &str, bytes: &[u8]) -> Result<(), String> {
+        fs::write(locator, bytes).map_err(|error| error.to_string())
+    }
 }
 
 fn display(value: &OuterValue) -> String {
