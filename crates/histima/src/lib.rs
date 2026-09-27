@@ -16,16 +16,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tima::capability::RuntimeCapabilities;
-use tima::identity::{ContentIdentity, RecipeIdentity, SourceIdentity, source_identity};
+use tima::identity::{
+    ArtifactIdentity, ContentIdentity, RecipeIdentity, SourceIdentity, byte_content_identity,
+    source_identity,
+};
 use tima::lineage::{Lineage, LineageNode};
 use tima::runtime::{OuterValue, ValueData};
 
 use cas::{ContentKind, ContentStore};
-use catalog::Catalog;
+use catalog::{Catalog, validate_artifact_identities};
 
 pub use catalog::{
-    AssetSummary, CATALOG_LIST_LIMIT, CatalogInfo, CatalogPage, CatalogStats, NativeArtifactInfo,
-    RecipeSummary,
+    ArtifactBundleMember, ArtifactSummary, AssetSummary, CATALOG_LIST_LIMIT, CatalogInfo,
+    CatalogPage, CatalogStats, NativeArtifactInfo, RecipeSummary,
 };
 pub use error::{Error, Result};
 pub use runner::{ProgramExecution, RecipeReplay, RunError};
@@ -71,6 +74,33 @@ pub struct RecipeInspection {
     pub lineage: Lineage,
     pub rendered: String,
     pub content: ContentInspection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactBundleInspection {
+    pub bundle_id: tima::identity::ArtifactBundleIdentity,
+    pub backend: String,
+    pub backend_version: String,
+    pub compiler_version: String,
+    pub target: String,
+    pub cpu_features: String,
+    pub optimization: String,
+    pub abi_version: u32,
+    pub library_content_id: ContentIdentity,
+    pub library_byte_len: u64,
+    pub library_relative_path: String,
+    pub members: Vec<ArtifactBundleMember>,
+    pub identity_valid: bool,
+    pub library_valid: bool,
+    pub valid: bool,
+    pub validation_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactInspection {
+    pub requested_id: String,
+    pub artifact: Option<ArtifactSummary>,
+    pub bundles: CatalogPage<ArtifactBundleInspection>,
 }
 
 pub struct Workspace {
@@ -214,6 +244,87 @@ impl Workspace {
             lineage: stored.lineage,
             rendered: trace.rendered,
             content,
+        })
+    }
+
+    /// Searches the supplied digest in both the Artifact-ID and bundle-ID
+    /// namespaces. Both are canonical 256-bit identities, so the CLI can
+    /// inspect either without a separate discriminator.
+    pub fn inspect_artifact(&self, identity: ArtifactIdentity) -> Result<ArtifactInspection> {
+        let requested_id = identity.to_string();
+        let catalog = self.catalog.inspect_artifact(&requested_id)?;
+        if catalog.artifact.is_none() && catalog.bundles.items.is_empty() {
+            return Err(Error::ArtifactNotFound(requested_id));
+        }
+        let bundles = catalog
+            .bundles
+            .items
+            .into_iter()
+            .map(|bundle| {
+                let mut identity_errors = validate_artifact_identities(&bundle);
+                let expected_relative_path =
+                    format!("cache/native/{}/module.dll", bundle.bundle_id);
+                let mut library_errors = Vec::new();
+                if bundle.library_relative_path != expected_relative_path {
+                    library_errors.push(format!(
+                        "library path is {:?}, expected {expected_relative_path:?}",
+                        bundle.library_relative_path
+                    ));
+                } else {
+                    let library_path = self.root.join(Path::new(&bundle.library_relative_path));
+                    match fs::read(&library_path) {
+                        Ok(bytes) => {
+                            let observed_content = byte_content_identity(&bytes);
+                            if observed_content != bundle.library_content_id {
+                                library_errors.push(format!(
+                                    "library Content ID is {observed_content}, expected {}",
+                                    bundle.library_content_id
+                                ));
+                            }
+                            if bytes.len() as u64 != bundle.library_byte_len {
+                                library_errors.push(format!(
+                                    "library byte length is {}, expected {}",
+                                    bytes.len(),
+                                    bundle.library_byte_len
+                                ));
+                            }
+                        }
+                        Err(error) => library_errors.push(format!(
+                            "could not read {}: {error}",
+                            library_path.display()
+                        )),
+                    }
+                }
+                let identity_valid = identity_errors.is_empty();
+                let library_valid = library_errors.is_empty();
+                identity_errors.append(&mut library_errors);
+                Ok(ArtifactBundleInspection {
+                    bundle_id: bundle.bundle_id,
+                    backend: bundle.backend,
+                    backend_version: bundle.backend_version,
+                    compiler_version: bundle.compiler_version,
+                    target: bundle.target,
+                    cpu_features: bundle.cpu_features,
+                    optimization: bundle.optimization,
+                    abi_version: bundle.abi_version,
+                    library_content_id: bundle.library_content_id,
+                    library_byte_len: bundle.library_byte_len,
+                    library_relative_path: bundle.library_relative_path,
+                    members: bundle.members,
+                    identity_valid,
+                    library_valid,
+                    valid: identity_valid && library_valid,
+                    validation_errors: identity_errors,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ArtifactInspection {
+            requested_id,
+            artifact: catalog.artifact,
+            bundles: CatalogPage {
+                items: bundles,
+                truncated: catalog.bundles.truncated,
+            },
         })
     }
 

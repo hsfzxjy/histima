@@ -15,6 +15,7 @@ pub enum Error {
     AssetNotFound(String),
     ContentNotFound(String),
     RecipeNotFound(String),
+    ArtifactNotFound(String),
     ValueNotRecordable(String),
     InvalidMaterializationPath(PathBuf),
     MaterializationExists(PathBuf),
@@ -73,6 +74,10 @@ impl fmt::Display for Error {
                     "recipe {identity} is not recorded in this workspace"
                 )
             }
+            Self::ArtifactNotFound(identity) => write!(
+                formatter,
+                "artifact or native bundle {identity} is not recorded in this workspace"
+            ),
             Self::ValueNotRecordable(message) => formatter.write_str(message),
             Self::InvalidMaterializationPath(path) => write!(
                 formatter,
@@ -109,6 +114,7 @@ impl StdError for Error {
             | Self::AssetNotFound(_)
             | Self::ContentNotFound(_)
             | Self::RecipeNotFound(_)
+            | Self::ArtifactNotFound(_)
             | Self::ValueNotRecordable(_)
             | Self::InvalidMaterializationPath(_)
             | Self::MaterializationExists(_)

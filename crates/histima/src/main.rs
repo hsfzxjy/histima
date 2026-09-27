@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use histima::{RunError, Workspace};
 use tima::backend::native::NativeCacheStatus;
-use tima::identity::{ContentIdentity, RecipeIdentity, content_identity};
+use tima::identity::{ArtifactIdentity, ContentIdentity, RecipeIdentity, content_identity};
 use tima::lineage::{LineageNode, RecordedValue};
 use tima::runtime::{OuterValue, ValueData};
 use tima::source::SourceFile;
@@ -188,9 +188,62 @@ fn run() -> Result<(), String> {
                     println!("trace:");
                     println!("{}", inspection.rendered);
                 }
+                "artifact" => {
+                    let identity = identity_text
+                        .parse::<ArtifactIdentity>()
+                        .map_err(|error| format!("invalid Artifact or bundle ID: {error}"))?;
+                    let inspection = workspace
+                        .inspect_artifact(identity)
+                        .map_err(|error| error.to_string())?;
+                    println!("requested_id = {}", inspection.requested_id);
+                    println!("matched_artifact = {}", inspection.artifact.is_some());
+                    if let Some(artifact) = &inspection.artifact {
+                        println!("artifact_id = {}", artifact.artifact_id);
+                        println!("transform_id = {}", artifact.transform_id);
+                    }
+                    println!("bundle_count = {}", inspection.bundles.items.len());
+                    println!("bundles_truncated = {}", inspection.bundles.truncated);
+                    for (bundle_index, bundle) in inspection.bundles.items.iter().enumerate() {
+                        let prefix = format!("bundle[{bundle_index}]");
+                        println!("{prefix}.bundle_id = {}", bundle.bundle_id);
+                        println!("{prefix}.backend = {}", bundle.backend);
+                        println!("{prefix}.backend_version = {}", bundle.backend_version);
+                        println!("{prefix}.compiler_version = {}", bundle.compiler_version);
+                        println!("{prefix}.target = {}", bundle.target);
+                        println!("{prefix}.cpu_features = {}", bundle.cpu_features);
+                        println!("{prefix}.optimization = {}", bundle.optimization);
+                        println!("{prefix}.abi_version = {}", bundle.abi_version);
+                        println!(
+                            "{prefix}.library_content_id = {}",
+                            bundle.library_content_id
+                        );
+                        println!("{prefix}.library_byte_length = {}", bundle.library_byte_len);
+                        println!(
+                            "{prefix}.library_relative_path = {}",
+                            bundle.library_relative_path
+                        );
+                        println!("{prefix}.identity_valid = {}", bundle.identity_valid);
+                        println!("{prefix}.library_valid = {}", bundle.library_valid);
+                        println!("{prefix}.valid = {}", bundle.valid);
+                        println!("{prefix}.member_count = {}", bundle.members.len());
+                        for member in &bundle.members {
+                            println!(
+                                "{prefix}.member[{}].artifact_id = {}",
+                                member.index, member.artifact_id
+                            );
+                            println!(
+                                "{prefix}.member[{}].transform_id = {}",
+                                member.index, member.transform_id
+                            );
+                        }
+                        for (error_index, error) in bundle.validation_errors.iter().enumerate() {
+                            println!("{prefix}.validation_error[{error_index}] = {error}");
+                        }
+                    }
+                }
                 _ => {
                     return Err(format!(
-                        "unknown inspection kind {kind:?}; expected content or recipe"
+                        "unknown inspection kind {kind:?}; expected content, recipe, or artifact"
                     ));
                 }
             }
@@ -400,6 +453,7 @@ fn print_usage() {
     eprintln!("  histima recipes <workspace>");
     eprintln!("  histima inspect content <workspace> <content-id>");
     eprintln!("  histima inspect recipe <workspace> <recipe-id>");
+    eprintln!("  histima inspect artifact <workspace> <artifact-or-bundle-id>");
     eprintln!("  histima materialize <workspace> <content-id> <destination>");
     eprintln!("  histima run <workspace> <file.tima> [--record <binding>]");
     eprintln!("  histima replay <workspace> <file.tima> <recipe-id>");

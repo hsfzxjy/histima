@@ -5,9 +5,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tima::backend::native::CachedNativeArtifact;
 use tima::identity::{
-    ArtifactBundleIdentity, ArtifactIdentity, ContentIdentity, RecipeIdentity,
-    SemanticValueIdentity, SourceIdentity, TransformIdentity, artifact_bundle_identity,
-    byte_content_identity,
+    ArtifactBundleIdentity, ArtifactConfiguration, ArtifactIdentity, ContentIdentity,
+    RecipeIdentity, SemanticValueIdentity, SourceIdentity, TransformIdentity,
+    artifact_bundle_identity, artifact_identity, byte_content_identity,
 };
 use tima::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
 
@@ -174,6 +174,41 @@ pub struct RecipeSummary {
     pub transform_name: String,
     pub content_id: ContentIdentity,
     pub byte_len: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactSummary {
+    pub artifact_id: ArtifactIdentity,
+    pub transform_id: TransformIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactBundleMember {
+    pub index: u32,
+    pub artifact_id: ArtifactIdentity,
+    pub transform_id: TransformIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogArtifactBundle {
+    pub bundle_id: ArtifactBundleIdentity,
+    pub backend: String,
+    pub backend_version: String,
+    pub compiler_version: String,
+    pub target: String,
+    pub cpu_features: String,
+    pub optimization: String,
+    pub abi_version: u32,
+    pub library_content_id: ContentIdentity,
+    pub library_byte_len: u64,
+    pub library_relative_path: String,
+    pub members: Vec<ArtifactBundleMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogArtifactInspection {
+    pub artifact: Option<ArtifactSummary>,
+    pub bundles: CatalogPage<CatalogArtifactBundle>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -464,6 +499,59 @@ impl Catalog {
         let recipes = u64::try_from(recipes)
             .map_err(|_| Error::catalog("recipe reference count is negative"))?;
         Ok((sources, recipes))
+    }
+
+    pub fn inspect_artifact(&self, identity: &str) -> Result<CatalogArtifactInspection> {
+        let artifact = self
+            .connection
+            .query_row(
+                "SELECT artifact_id, transform_id
+                 FROM native_artifacts WHERE artifact_id = ?1",
+                [identity],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(artifact_id, transform_id)| -> Result<ArtifactSummary> {
+                let artifact_id = artifact_id.parse::<ArtifactIdentity>().map_err(|error| {
+                    Error::catalog(format!(
+                        "catalog has invalid Artifact ID {artifact_id:?}: {error}"
+                    ))
+                })?;
+                let transform_id = transform_id.parse::<TransformIdentity>().map_err(|error| {
+                    Error::catalog(format!(
+                        "artifact {artifact_id} has invalid Transform ID {transform_id:?}: {error}"
+                    ))
+                })?;
+                Ok(ArtifactSummary {
+                    artifact_id,
+                    transform_id,
+                })
+            })
+            .transpose()?;
+
+        let limit = i64::try_from(CATALOG_LIST_LIMIT + 1)
+            .map_err(|_| Error::catalog("catalog listing limit does not fit SQLite INTEGER"))?;
+        let mut statement = self.connection.prepare(
+            "SELECT bundle_id
+             FROM (
+                 SELECT bundle_id FROM native_artifact_bundles WHERE bundle_id = ?1
+                 UNION
+                 SELECT bundle_id FROM native_artifact_bundle_members WHERE artifact_id = ?1
+             )
+             ORDER BY bundle_id = ?1 DESC, bundle_id
+             LIMIT ?2",
+        )?;
+        let bundle_ids = statement
+            .query_map(params![identity, limit], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut bundles = bundle_ids
+            .into_iter()
+            .map(|bundle_id| load_artifact_bundle(&self.connection, &bundle_id))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CatalogArtifactInspection {
+            artifact,
+            bundles: bounded_page(&mut bundles),
+        })
     }
 
     pub fn record_result(
@@ -759,6 +847,165 @@ fn bounded_page<T>(items: &mut Vec<T>) -> CatalogPage<T> {
         items: std::mem::take(items),
         truncated,
     }
+}
+
+fn load_artifact_bundle(
+    connection: &Connection,
+    bundle_identity: &str,
+) -> Result<CatalogArtifactBundle> {
+    let metadata = connection.query_row(
+        "SELECT bundle_id, backend, backend_version, compiler_version, target,
+                cpu_features, optimization, abi_version, library_content_id,
+                library_byte_length, library_relative_path
+         FROM native_artifact_bundles WHERE bundle_id = ?1",
+        [bundle_identity],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        },
+    )?;
+    let bundle_id = metadata
+        .0
+        .parse::<ArtifactBundleIdentity>()
+        .map_err(|error| {
+            Error::catalog(format!(
+                "catalog has invalid artifact bundle ID {:?}: {error}",
+                metadata.0
+            ))
+        })?;
+    let abi_version = u32::try_from(metadata.7).map_err(|_| {
+        Error::catalog(format!(
+            "native bundle {bundle_id} has invalid ABI version {}",
+            metadata.7
+        ))
+    })?;
+    let library_content_id = metadata.8.parse::<ContentIdentity>().map_err(|error| {
+        Error::catalog(format!(
+            "native bundle {bundle_id} has invalid library Content ID {:?}: {error}",
+            metadata.8
+        ))
+    })?;
+    let library_byte_len = u64::try_from(metadata.9).map_err(|_| {
+        Error::catalog(format!(
+            "native bundle {bundle_id} has a negative library byte length"
+        ))
+    })?;
+
+    let mut statement = connection.prepare(
+        "SELECT member.artifact_index, member.artifact_id, artifact.transform_id
+         FROM native_artifact_bundle_members AS member
+         JOIN native_artifacts AS artifact USING (artifact_id)
+         WHERE member.bundle_id = ?1
+         ORDER BY member.artifact_index",
+    )?;
+    let member_rows = statement
+        .query_map([bundle_identity], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let members = member_rows
+        .into_iter()
+        .map(|(index, artifact_id, transform_id)| {
+            let index = u32::try_from(index).map_err(|_| {
+                Error::catalog(format!(
+                    "native bundle {bundle_id} has invalid member index {index}"
+                ))
+            })?;
+            let artifact_id = artifact_id.parse::<ArtifactIdentity>().map_err(|error| {
+                Error::catalog(format!(
+                    "native bundle {bundle_id} has invalid Artifact ID {artifact_id:?}: {error}"
+                ))
+            })?;
+            let transform_id = transform_id.parse::<TransformIdentity>().map_err(|error| {
+                Error::catalog(format!(
+                    "artifact {artifact_id} has invalid Transform ID {transform_id:?}: {error}"
+                ))
+            })?;
+            Ok(ArtifactBundleMember {
+                index,
+                artifact_id,
+                transform_id,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (expected, member) in members.iter().enumerate() {
+        if usize::try_from(member.index).ok() != Some(expected) {
+            return Err(Error::catalog(format!(
+                "native bundle {bundle_id} member indices are not contiguous"
+            )));
+        }
+    }
+
+    Ok(CatalogArtifactBundle {
+        bundle_id,
+        backend: metadata.1,
+        backend_version: metadata.2,
+        compiler_version: metadata.3,
+        target: metadata.4,
+        cpu_features: metadata.5,
+        optimization: metadata.6,
+        abi_version,
+        library_content_id,
+        library_byte_len,
+        library_relative_path: metadata.10,
+        members,
+    })
+}
+
+pub(crate) fn validate_artifact_identities(bundle: &CatalogArtifactBundle) -> Vec<String> {
+    let mut errors = Vec::new();
+    if bundle.cpu_features.is_empty() {
+        let configuration = ArtifactConfiguration {
+            backend: &bundle.backend,
+            backend_version: &bundle.backend_version,
+            compiler_version: &bundle.compiler_version,
+            target: &bundle.target,
+            cpu_features: &[],
+            optimization: &bundle.optimization,
+            abi_version: bundle.abi_version,
+        };
+        for member in &bundle.members {
+            let expected = artifact_identity(member.transform_id, &configuration);
+            if member.artifact_id != expected {
+                errors.push(format!(
+                    "member {} Artifact ID is {}, expected {expected}",
+                    member.index, member.artifact_id
+                ));
+            }
+        }
+    } else {
+        errors.push(
+            "cannot validate non-empty CPU features with the current catalog encoding".to_owned(),
+        );
+    }
+    let artifact_ids = bundle
+        .members
+        .iter()
+        .map(|member| member.artifact_id)
+        .collect::<Vec<_>>();
+    let expected_bundle = artifact_bundle_identity(&artifact_ids);
+    if bundle.bundle_id != expected_bundle {
+        errors.push(format!(
+            "bundle ID is {}, expected {expected_bundle}",
+            bundle.bundle_id
+        ));
+    }
+    errors
 }
 
 fn apply_migrations(connection: &mut Connection) -> Result<()> {

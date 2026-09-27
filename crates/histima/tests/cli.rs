@@ -170,6 +170,51 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert_eq!(recorded_member.1.len(), 64);
     drop(database);
 
+    let inspected_bundle = histima(["inspect", "artifact", text(&workspace), &native_bundle_id]);
+    assert_success(&inspected_bundle);
+    assert_eq!(field(&inspected_bundle, "requested_id"), native_bundle_id);
+    assert_eq!(field(&inspected_bundle, "matched_artifact"), "false");
+    assert_eq!(field(&inspected_bundle, "bundle_count"), "1");
+    assert_eq!(field(&inspected_bundle, "bundles_truncated"), "false");
+    assert_eq!(field(&inspected_bundle, "bundle[0].backend"), "c");
+    assert_eq!(field(&inspected_bundle, "bundle[0].backend_version"), "11");
+    assert!(field(&inspected_bundle, "bundle[0].compiler_version").contains("clang"));
+    assert!(!field(&inspected_bundle, "bundle[0].target").is_empty());
+    assert_eq!(
+        field(&inspected_bundle, "bundle[0].optimization"),
+        "O2-fno-builtin"
+    );
+    assert_eq!(field(&inspected_bundle, "bundle[0].abi_version"), "6");
+    assert_eq!(
+        field(&inspected_bundle, "bundle[0].library_content_id"),
+        native_library_content_id
+    );
+    assert_eq!(field(&inspected_bundle, "bundle[0].identity_valid"), "true");
+    assert_eq!(field(&inspected_bundle, "bundle[0].library_valid"), "true");
+    assert_eq!(field(&inspected_bundle, "bundle[0].valid"), "true");
+    assert_eq!(field(&inspected_bundle, "bundle[0].member_count"), "1");
+    assert_eq!(
+        field(&inspected_bundle, "bundle[0].member[0].artifact_id"),
+        native_artifact_id
+    );
+
+    let inspected_artifact =
+        histima(["inspect", "artifact", text(&workspace), &native_artifact_id]);
+    assert_success(&inspected_artifact);
+    assert_eq!(field(&inspected_artifact, "matched_artifact"), "true");
+    assert_eq!(
+        field(&inspected_artifact, "artifact_id"),
+        native_artifact_id
+    );
+    assert_eq!(
+        field(&inspected_artifact, "transform_id"),
+        recorded_member.1
+    );
+    assert_eq!(
+        field(&inspected_artifact, "bundle[0].bundle_id"),
+        native_bundle_id
+    );
+
     let trace = histima(["trace", text(&workspace), &recipe_id]);
     assert_success(&trace);
     assert!(stdout(&trace).contains("source "));
@@ -300,6 +345,35 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
         stderr(&corrupt_artifact)
             .contains("catalog metadata that does not match the on-disk cache")
     );
+
+    let corrupt_inspection = histima(["inspect", "artifact", text(&workspace), &native_bundle_id]);
+    assert_success(&corrupt_inspection);
+    assert_eq!(
+        field(&corrupt_inspection, "bundle[0].identity_valid"),
+        "true"
+    );
+    assert_eq!(
+        field(&corrupt_inspection, "bundle[0].library_valid"),
+        "false"
+    );
+    assert_eq!(field(&corrupt_inspection, "bundle[0].valid"), "false");
+    assert!(stdout(&corrupt_inspection).contains("library Content ID is"));
+
+    let database = Connection::open(workspace.join("catalog.sqlite3")).unwrap();
+    database
+        .execute(
+            "UPDATE native_artifact_bundles SET optimization = 'O0' WHERE bundle_id = ?1",
+            [&native_bundle_id],
+        )
+        .unwrap();
+    drop(database);
+    let invalid_identity = histima(["inspect", "artifact", text(&workspace), &native_bundle_id]);
+    assert_success(&invalid_identity);
+    assert_eq!(
+        field(&invalid_identity, "bundle[0].identity_valid"),
+        "false"
+    );
+    assert!(stdout(&invalid_identity).contains("Artifact ID is"));
 }
 
 #[test]
