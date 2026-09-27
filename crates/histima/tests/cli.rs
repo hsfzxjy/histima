@@ -88,6 +88,7 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     let first = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&first);
     assert!(stdout(&first).contains("native_cache = miss"));
+    assert!(stdout(&first).contains("result_cache_hits = 0"));
     assert!(stdout(&first).contains("invoke darken"));
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
     let recipe_id = field(&first, "recipe_id");
@@ -117,13 +118,30 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert!(stdout(&stats).contains("lineage_invocations = 3"));
     assert!(stdout(&stats).contains("recipe_results = 1"));
 
+    let renamed = fs::read_to_string(&script)
+        .unwrap()
+        .replace("transform darken", "transform shade")
+        .replace(" | darken(", " | shade(");
+    fs::write(&script, renamed).unwrap();
     fs::remove_file(&output).unwrap();
     let second = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&second);
     assert!(stdout(&second).contains("native_cache = hit"));
+    assert!(stdout(&second).contains("result_cache_hits = 1"));
+    assert!(stdout(&second).contains("invoke shade"));
     assert_eq!(field(&second, "recipe_id"), recipe_id);
     assert_eq!(field(&second, "content_id"), content_id);
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
+
+    fs::write(&source, b"P3\n1 1\n255\n100 80 60\n").unwrap();
+    assert_success(&histima(["import", text(&workspace), &source_locator]));
+    fs::remove_file(&output).unwrap();
+    let changed = histima(["run", text(&workspace), text(&script), "--record", "out"]);
+    assert_success(&changed);
+    assert!(stdout(&changed).contains("result_cache_hits = 0"));
+    assert_ne!(field(&changed, "recipe_id"), recipe_id);
+    assert_ne!(field(&changed, "content_id"), content_id);
+    assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n50 40 30\n");
 }
 
 fn histima<const N: usize>(arguments: [&str; N]) -> Output {

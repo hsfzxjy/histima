@@ -58,7 +58,13 @@ normalized semantic lineage in SQLite, and prints the durable identities.
 Raw imported blobs and typed Tima byte values intentionally use distinct
 Content ID domains even when their payload bytes match. The catalog records the
 content kind so every CAS read can revalidate the correct semantic identity.
-Durable result-cache reuse and replay are not yet connected to these records.
+Recorded byte results now participate in later `histima run` processes through
+a host-provided result-cache layer. Tima computes the current Recipe ID before
+lookup, validates source observations first, and attaches current invocation
+lineage to a hit; cache execution history never enters derivation lineage. The
+CLI reports native and result-cache statistics separately. Transforms whose
+external observations cannot be known before execution are not early-hit by
+this initial adapter. Durable recipe replay remains the next step.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar

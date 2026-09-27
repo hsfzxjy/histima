@@ -5,6 +5,23 @@ use std::fmt;
 use crate::identity::{ContentIdentity, IdentityError, RecipeIdentity, content_identity};
 use crate::runtime::{OuterValue, ValueData};
 
+/// Runtime policy boundary for semantic transform-result caching.
+///
+/// Implementations may be in-memory or durable, but cache behavior must not
+/// alter values or derivation lineage. The runtime attaches current lineage to
+/// every returned value after lookup.
+pub trait ResultCache {
+    fn remember(&mut self, value: &OuterValue) -> Result<ContentIdentity, CacheError>;
+    fn lookup(&mut self, recipe: RecipeIdentity) -> Result<Option<OuterValue>, CacheError>;
+    fn store(
+        &mut self,
+        recipe: RecipeIdentity,
+        value: &OuterValue,
+    ) -> Result<ContentIdentity, CacheError>;
+    fn materialized(&mut self, identity: ContentIdentity)
+    -> Result<Option<OuterValue>, CacheError>;
+}
+
 /// Immutable in-memory content-addressed storage for materialized outer values.
 /// Lineage is intentionally not stored: it is reconstructed from the recipe
 /// that selected the content.
@@ -105,6 +122,31 @@ impl TransformResultCache {
     }
 }
 
+impl ResultCache for TransformResultCache {
+    fn remember(&mut self, value: &OuterValue) -> Result<ContentIdentity, CacheError> {
+        Self::remember(self, value)
+    }
+
+    fn lookup(&mut self, recipe: RecipeIdentity) -> Result<Option<OuterValue>, CacheError> {
+        Self::lookup(self, recipe)
+    }
+
+    fn store(
+        &mut self,
+        recipe: RecipeIdentity,
+        value: &OuterValue,
+    ) -> Result<ContentIdentity, CacheError> {
+        Self::store(self, recipe, value)
+    }
+
+    fn materialized(
+        &mut self,
+        identity: ContentIdentity,
+    ) -> Result<Option<OuterValue>, CacheError> {
+        Ok(self.content.get(identity))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
     pub hits: u64,
@@ -134,6 +176,14 @@ impl CacheError {
             message: format!(
                 "recipe {recipe} produced conflicting content identities {previous} and {actual}"
             ),
+        }
+    }
+
+    /// Adapts a host cache/storage failure without exposing host-specific error
+    /// types in the Tima runtime.
+    pub fn storage(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
         }
     }
 }

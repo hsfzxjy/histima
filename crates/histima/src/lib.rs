@@ -19,7 +19,7 @@ use tima::identity::{ContentIdentity, RecipeIdentity, SourceIdentity, source_ide
 use tima::lineage::LineageNode;
 use tima::runtime::{OuterValue, ValueData};
 
-use cas::ContentStore;
+use cas::{ContentKind, ContentStore};
 use catalog::Catalog;
 
 pub use catalog::{CatalogInfo, CatalogStats};
@@ -175,6 +175,42 @@ impl Workspace {
             content_id: trace.content_id,
             rendered: trace.rendered,
         })
+    }
+
+    fn cached_value(&self, recipe: RecipeIdentity) -> Result<Option<OuterValue>> {
+        let Some(trace) = self.catalog.trace(recipe)? else {
+            return Ok(None);
+        };
+        self.typed_value(trace.content_id)?.map_or_else(
+            || {
+                Err(Error::catalog(format!(
+                    "recipe {recipe} points to unsupported content {}",
+                    trace.content_id
+                )))
+            },
+            |value| Ok(Some(value)),
+        )
+    }
+
+    fn typed_value(&self, identity: ContentIdentity) -> Result<Option<OuterValue>> {
+        let Some(object) = self.catalog.content(identity)? else {
+            return Ok(None);
+        };
+        if object.kind != ContentKind::Bytes {
+            return Ok(None);
+        }
+        let bytes =
+            self.content
+                .read_recorded(&object.content_id, &object.relative_path, object.kind)?;
+        if bytes.len() as u64 != object.byte_len {
+            return Err(Error::catalog(format!(
+                "content {} has catalog length {} but stored length {}",
+                object.content_id,
+                object.byte_len,
+                bytes.len()
+            )));
+        }
+        Ok(Some(OuterValue::plain(ValueData::Bytes(bytes.into()))))
     }
 
     pub fn catalog_info(&self) -> Result<CatalogInfo> {

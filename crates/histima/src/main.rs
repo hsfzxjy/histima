@@ -133,6 +133,9 @@ fn run() -> Result<(), String> {
                     NativeCacheStatus::Miss => "miss",
                 }
             );
+            println!("result_cache_hits = {}", result.result_cache.hits);
+            println!("result_cache_misses = {}", result.result_cache.misses);
+            println!("result_cache_stores = {}", result.result_cache.stores);
             let unbound_trace = result.execution.last_value.as_ref().and_then(|last| {
                 let ValueData::Lineage(lineage) = &last.data else {
                     return None;

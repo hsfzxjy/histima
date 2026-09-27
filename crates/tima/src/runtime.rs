@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::native::{AbiImage, AbiImageView, AbiRuntime, AbiValue, NativeModule};
-use crate::cache::TransformResultCache;
+use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{
     ASSET_CAPABILITY, CapabilitySession, RuntimeCapabilities, observe_dependency,
 };
@@ -259,7 +259,7 @@ pub fn execute(program: &CompiledProgram) -> Result<Execution, Vec<Diagnostic>> 
 
 pub fn execute_cached(
     program: &CompiledProgram,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = IrInterpreter {
         module: &program.transforms,
@@ -281,7 +281,7 @@ pub fn execute_with_capabilities(
 
 pub fn execute_cached_with_capabilities(
     program: &CompiledProgram,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
     capabilities: &dyn RuntimeCapabilities,
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = IrInterpreter {
@@ -309,7 +309,7 @@ pub fn execute_native(
 pub fn execute_native_cached(
     program: &CompiledProgram,
     native: &NativeModule,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = NativeEngine {
         module: &program.transforms,
@@ -335,7 +335,7 @@ pub fn execute_native_with_capabilities(
 pub fn execute_native_cached_with_capabilities(
     program: &CompiledProgram,
     native: &NativeModule,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
     capabilities: &dyn RuntimeCapabilities,
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = NativeEngine {
@@ -366,7 +366,7 @@ pub fn execute_native_with_bindings_cached(
     program: &CompiledProgram,
     native: &NativeModule,
     bindings: BTreeMap<String, OuterValue>,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = NativeEngine {
         module: &program.transforms,
@@ -414,7 +414,7 @@ pub fn invoke_native_transform_cached(
     native: &NativeModule,
     transform: TransformId,
     arguments: Vec<OuterValue>,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
 ) -> Result<OuterValue, Diagnostic> {
     let definition = program.transforms.get(transform);
     if arguments.len() != definition.parameters.len() {
@@ -457,7 +457,7 @@ impl ReplayDependencyResolver for CapabilityReplayResolver<'_> {
 pub fn replay(
     program: &CompiledProgram,
     target: &OuterValue,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
 ) -> Result<OuterValue, Diagnostic> {
     replay_with_dependencies(program, target, cache, None)
 }
@@ -465,7 +465,7 @@ pub fn replay(
 pub fn replay_with_dependencies(
     program: &CompiledProgram,
     target: &OuterValue,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
     dependencies: Option<&dyn ReplayDependencyResolver>,
 ) -> Result<OuterValue, Diagnostic> {
     let engine = IrInterpreter {
@@ -485,7 +485,7 @@ pub fn replay_with_dependencies(
 pub fn replay_with_capabilities(
     program: &CompiledProgram,
     target: &OuterValue,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
     capabilities: &dyn RuntimeCapabilities,
 ) -> Result<OuterValue, Diagnostic> {
     let engine = IrInterpreter {
@@ -507,7 +507,7 @@ pub fn replay_native(
     program: &CompiledProgram,
     native: &NativeModule,
     target: &OuterValue,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
 ) -> Result<OuterValue, Diagnostic> {
     replay_native_with_dependencies(program, native, target, cache, None)
 }
@@ -516,7 +516,7 @@ pub fn replay_native_with_dependencies(
     program: &CompiledProgram,
     native: &NativeModule,
     target: &OuterValue,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
     dependencies: Option<&dyn ReplayDependencyResolver>,
 ) -> Result<OuterValue, Diagnostic> {
     let engine = NativeEngine {
@@ -538,7 +538,7 @@ pub fn replay_native_with_capabilities(
     program: &CompiledProgram,
     native: &NativeModule,
     target: &OuterValue,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
     capabilities: &dyn RuntimeCapabilities,
 ) -> Result<OuterValue, Diagnostic> {
     let engine = NativeEngine {
@@ -557,11 +557,11 @@ pub fn replay_native_with_capabilities(
     )
 }
 
-fn execute_with(
+fn execute_with<'cache>(
     program: &CompiledProgram,
     engine: &dyn TransformEngine,
     bindings: BTreeMap<String, OuterValue>,
-    cache: Option<&mut TransformResultCache>,
+    cache: Option<&'cache mut (dyn ResultCache + 'cache)>,
 ) -> Result<Execution, Vec<Diagnostic>> {
     Interpreter {
         program,
@@ -597,12 +597,12 @@ struct TransformOutcome {
     observations: Vec<Lineage>,
 }
 
-fn invoke_transform_with_lineage(
+fn invoke_transform_with_lineage<'cache>(
     program: &CompiledProgram,
     engine: &dyn TransformEngine,
     id: TransformId,
     arguments: Vec<(OuterValue, Span)>,
-    mut cache: Option<&mut TransformResultCache>,
+    mut cache: Option<&mut (dyn ResultCache + 'cache)>,
 ) -> Result<OuterValue, Diagnostic> {
     let transform = program.transforms.get(id);
     let recorded = transform
@@ -684,11 +684,11 @@ fn invoke_transform_with_lineage(
     Ok(value)
 }
 
-fn invoke_host_transform_with_lineage(
+fn invoke_host_transform_with_lineage<'cache>(
     transform: HostTransform,
     engine: &dyn TransformEngine,
     arguments: Vec<(OuterValue, Span)>,
-    mut cache: Option<&mut TransformResultCache>,
+    mut cache: Option<&mut (dyn ResultCache + 'cache)>,
     span: Span,
 ) -> Result<OuterValue, Diagnostic> {
     let prepared = prepare_host_invocation(transform, arguments, engine.capabilities(), span)?;
@@ -748,7 +748,7 @@ fn replay_with(
     program: &CompiledProgram,
     engine: &dyn TransformEngine,
     target: &OuterValue,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
     dependencies: Option<&dyn ReplayDependencyResolver>,
     span: Span,
 ) -> Result<OuterValue, Diagnostic> {
@@ -788,7 +788,7 @@ fn replay_lineage(
     engine: &dyn TransformEngine,
     lineage: &Lineage,
     expected_content: Option<ContentIdentity>,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
     dependencies: Option<&dyn ReplayDependencyResolver>,
     span: Span,
     depth: usize,
@@ -923,7 +923,7 @@ fn replay_argument(
     program: &CompiledProgram,
     engine: &dyn TransformEngine,
     argument: &LineageArgument,
-    cache: &mut TransformResultCache,
+    cache: &mut dyn ResultCache,
     dependencies: Option<&dyn ReplayDependencyResolver>,
     span: Span,
     depth: usize,
@@ -935,7 +935,10 @@ fn replay_argument(
         RecordedValue::Float(value) => OuterValue::plain(ValueData::Float(*value)),
         RecordedValue::String(value) => OuterValue::plain(ValueData::String(value.clone())),
         RecordedValue::Materialized { content_id, .. } => {
-            if let Some(value) = cache.content().get(*content_id) {
+            if let Some(value) = cache
+                .materialized(*content_id)
+                .map_err(|error| Diagnostic::error(error.to_string(), span))?
+            {
                 value
             } else if let Some(parent) = &argument.lineage {
                 replay_lineage(
@@ -1114,7 +1117,7 @@ struct Interpreter<'program, 'engine, 'cache> {
     program: &'program CompiledProgram,
     engine: &'engine dyn TransformEngine,
     execution: Execution,
-    cache: Option<&'cache mut TransformResultCache>,
+    cache: Option<&'cache mut (dyn ResultCache + 'cache)>,
 }
 
 impl Interpreter<'_, '_, '_> {
@@ -1269,7 +1272,10 @@ impl Interpreter<'_, '_, '_> {
                 host_transform,
                 self.engine,
                 arguments,
-                self.cache.as_deref_mut(),
+                match &mut self.cache {
+                    Some(cache) => Some(&mut **cache),
+                    None => None,
+                },
                 span,
             );
         }
@@ -1290,7 +1296,10 @@ impl Interpreter<'_, '_, '_> {
             self.engine,
             id,
             values,
-            self.cache.as_deref_mut(),
+            match &mut self.cache {
+                Some(cache) => Some(&mut **cache),
+                None => None,
+            },
         )
     }
 
@@ -1388,25 +1397,26 @@ impl Interpreter<'_, '_, '_> {
         let dependencies = resolver
             .as_ref()
             .map(|resolver| resolver as &dyn ReplayDependencyResolver);
-        if let Some(cache) = self.cache.as_deref_mut() {
-            replay_with(
+        match &mut self.cache {
+            Some(cache) => replay_with(
                 self.program,
                 self.engine,
                 &arguments[0].1,
-                cache,
+                &mut **cache,
                 dependencies,
                 span,
-            )
-        } else {
-            let mut cache = TransformResultCache::default();
-            replay_with(
-                self.program,
-                self.engine,
-                &arguments[0].1,
-                &mut cache,
-                dependencies,
-                span,
-            )
+            ),
+            None => {
+                let mut cache = TransformResultCache::default();
+                replay_with(
+                    self.program,
+                    self.engine,
+                    &arguments[0].1,
+                    &mut cache,
+                    dependencies,
+                    span,
+                )
+            }
         }
     }
 
