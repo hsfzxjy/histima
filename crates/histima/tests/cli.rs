@@ -58,6 +58,7 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     let workspace = test.path().join("workspace");
     let source = test.path().join("source.ppm");
     let script = test.path().join("pipeline.tima");
+    let changed_script = test.path().join("changed-transform.tima");
     let output = test.path().join("darkened.ppm");
     let restored = test.path().join("restored.ppm");
     fs::write(&source, b"P3\n1 1\n255\n200 100 50\n").unwrap();
@@ -103,6 +104,13 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert!(stdout(&trace).contains("invoke darken"));
     assert!(stdout(&trace).contains("invoke encode.ppm"));
 
+    let replayed = histima(["replay", text(&workspace), text(&script), &recipe_id]);
+    assert_success(&replayed);
+    assert!(stdout(&replayed).contains("result_cache_hits = 1"));
+    assert_eq!(field(&replayed, "recipe_id"), recipe_id);
+    assert_eq!(field(&replayed, "content_id"), content_id);
+    assert!(stdout(&replayed).contains("invoke darken"));
+
     let materialized = histima([
         "materialize",
         text(&workspace),
@@ -133,8 +141,31 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert_eq!(field(&second, "content_id"), content_id);
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
 
+    let renamed_replay = histima(["replay", text(&workspace), text(&script), &recipe_id]);
+    assert_success(&renamed_replay);
+    assert_eq!(field(&renamed_replay, "content_id"), content_id);
+    assert!(stdout(&renamed_replay).contains("invoke darken"));
+
+    let semantically_changed = fs::read_to_string(&script)
+        .unwrap()
+        .replace("p.r *= factor", "p.r *= 0.25");
+    fs::write(&changed_script, semantically_changed).unwrap();
+    let changed_transform = histima([
+        "replay",
+        text(&workspace),
+        text(&changed_script),
+        &recipe_id,
+    ]);
+    assert!(!changed_transform.status.success());
+    assert!(stderr(&changed_transform).contains("unavailable or has changed"));
+
     fs::write(&source, b"P3\n1 1\n255\n100 80 60\n").unwrap();
     assert_success(&histima(["import", text(&workspace), &source_locator]));
+
+    let changed_source = histima(["replay", text(&workspace), text(&script), &recipe_id]);
+    assert!(!changed_source.status.success());
+    assert!(stderr(&changed_source).contains("replay expected source"));
+
     fs::remove_file(&output).unwrap();
     let changed = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&changed);

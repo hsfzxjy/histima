@@ -25,8 +25,17 @@ pub struct ProgramExecution {
     pub result_cache: CacheStats,
 }
 
+/// The result of replaying one durable semantic recipe.
+#[derive(Debug)]
+pub struct RecipeReplay {
+    pub value: OuterValue,
+    pub native_cache: NativeCacheStatus,
+    pub result_cache: CacheStats,
+}
+
 #[derive(Debug)]
 pub enum RunError {
+    Storage(crate::Error),
     CodeGeneration(Vec<Diagnostic>),
     NativeBuild(NativeBuildError),
     NativeLoad(NativeLoadError),
@@ -37,15 +46,7 @@ impl Workspace {
     /// Executes checked Tima through the generated-C backend with this
     /// workspace as the only host capability provider.
     pub fn execute(&self, program: &CompiledProgram) -> Result<ProgramExecution, RunError> {
-        let generated = CBackend
-            .emit(&program.transforms)
-            .map_err(RunError::CodeGeneration)?;
-        let transform_ids = program.identities.iter().collect::<Vec<_>>();
-        let cached_artifact = ClangCompiler::default()
-            .compile_cached(&generated, &transform_ids, self.native_cache_root())
-            .map_err(RunError::NativeBuild)?;
-        let native = NativeModule::load(&cached_artifact.artifact, &program.transforms)
-            .map_err(RunError::NativeLoad)?;
+        let (native_cache, native) = self.load_native(program)?;
         let mut result_cache = WorkspaceResultCache::new(self);
         let execution = tima::runtime::execute_native_cached_with_capabilities(
             program,
@@ -56,9 +57,51 @@ impl Workspace {
         .map_err(RunError::Runtime)?;
         Ok(ProgramExecution {
             execution,
-            native_cache: cached_artifact.status,
+            native_cache,
             result_cache: result_cache.stats,
         })
+    }
+
+    /// Replays a durable recipe against current transform definitions and
+    /// observed dependencies. Durable cached intermediates remain eligible,
+    /// but only after the complete recorded lineage has been validated.
+    pub fn replay_recipe(
+        &self,
+        program: &CompiledProgram,
+        recipe: RecipeIdentity,
+    ) -> Result<RecipeReplay, RunError> {
+        let target = self.replay_target(recipe).map_err(RunError::Storage)?;
+        let (native_cache, native) = self.load_native(program)?;
+        let mut result_cache = WorkspaceResultCache::new(self);
+        let value = tima::runtime::replay_native_with_capabilities(
+            program,
+            &native,
+            &target,
+            &mut result_cache,
+            self,
+        )
+        .map_err(|diagnostic| RunError::Runtime(vec![diagnostic]))?;
+        Ok(RecipeReplay {
+            value,
+            native_cache,
+            result_cache: result_cache.stats,
+        })
+    }
+
+    fn load_native(
+        &self,
+        program: &CompiledProgram,
+    ) -> Result<(NativeCacheStatus, NativeModule), RunError> {
+        let generated = CBackend
+            .emit(&program.transforms)
+            .map_err(RunError::CodeGeneration)?;
+        let transform_ids = program.identities.iter().collect::<Vec<_>>();
+        let cached_artifact = ClangCompiler::default()
+            .compile_cached(&generated, &transform_ids, self.native_cache_root())
+            .map_err(RunError::NativeBuild)?;
+        let native = NativeModule::load(&cached_artifact.artifact, &program.transforms)
+            .map_err(RunError::NativeLoad)?;
+        Ok((cached_artifact.status, native))
     }
 }
 
@@ -148,6 +191,7 @@ impl ResultCache for WorkspaceResultCache<'_> {
 impl fmt::Display for RunError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Storage(error) => error.fmt(formatter),
             Self::CodeGeneration(diagnostics) => write!(
                 formatter,
                 "generated-C code generation failed with {} diagnostic(s)",
@@ -172,6 +216,7 @@ impl fmt::Display for RunError {
 impl StdError for RunError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
+            Self::Storage(error) => Some(error),
             Self::NativeBuild(error) => Some(error),
             Self::NativeLoad(error) => Some(error),
             Self::CodeGeneration(_) | Self::Runtime(_) => None,

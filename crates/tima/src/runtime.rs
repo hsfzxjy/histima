@@ -782,29 +782,11 @@ enum ReplayTransform {
     Host(HostTransform),
 }
 
-#[allow(clippy::too_many_arguments)]
-fn replay_lineage(
+fn resolve_replay_transform(
     program: &CompiledProgram,
-    engine: &dyn TransformEngine,
-    lineage: &Lineage,
-    expected_content: Option<ContentIdentity>,
-    cache: &mut dyn ResultCache,
-    dependencies: Option<&dyn ReplayDependencyResolver>,
+    invocation: &crate::lineage::InvocationLineage,
     span: Span,
-    depth: usize,
-) -> Result<OuterValue, Diagnostic> {
-    if depth >= 256 {
-        return Err(Diagnostic::error(
-            "replay lineage depth exceeded the runtime limit",
-            span,
-        ));
-    }
-    let LineageNode::Invocation(invocation) = lineage.node() else {
-        return Err(Diagnostic::error(
-            "replay expects transform invocation lineage",
-            span,
-        ));
-    };
+) -> Result<ReplayTransform, Diagnostic> {
     let replay_transform =
         if let Some(transform_id) = program.identities.find_id(invocation.transform_id) {
             ReplayTransform::Inner(transform_id)
@@ -837,7 +819,34 @@ fn replay_lineage(
             span,
         ));
     }
-    validate_replay_dependencies(invocation, dependencies, span)?;
+    Ok(replay_transform)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_lineage(
+    program: &CompiledProgram,
+    engine: &dyn TransformEngine,
+    lineage: &Lineage,
+    expected_content: Option<ContentIdentity>,
+    cache: &mut dyn ResultCache,
+    dependencies: Option<&dyn ReplayDependencyResolver>,
+    span: Span,
+    depth: usize,
+) -> Result<OuterValue, Diagnostic> {
+    if depth >= 256 {
+        return Err(Diagnostic::error(
+            "replay lineage depth exceeded the runtime limit",
+            span,
+        ));
+    }
+    let LineageNode::Invocation(invocation) = lineage.node() else {
+        return Err(Diagnostic::error(
+            "replay expects transform invocation lineage",
+            span,
+        ));
+    };
+    let replay_transform = resolve_replay_transform(program, invocation, span)?;
+    validate_replay_dependencies(program, invocation, dependencies, span, depth)?;
 
     if let Some(mut value) = cache
         .lookup(invocation.recipe_id)
@@ -990,10 +999,18 @@ fn replay_argument(
 }
 
 fn validate_replay_dependencies(
+    program: &CompiledProgram,
     invocation: &crate::lineage::InvocationLineage,
     resolver: Option<&dyn ReplayDependencyResolver>,
     span: Span,
+    depth: usize,
 ) -> Result<(), Diagnostic> {
+    if depth >= 256 {
+        return Err(Diagnostic::error(
+            "replay lineage depth exceeded the runtime limit",
+            span,
+        ));
+    }
     for observation in invocation.observations.iter() {
         let LineageNode::ExternalObservation(observation) = observation.node() else {
             return Err(Diagnostic::error(
@@ -1076,7 +1093,8 @@ fn validate_replay_dependencies(
                 }
             }
             (_, LineageNode::Invocation(parent)) => {
-                validate_replay_dependencies(parent, resolver, span)?;
+                resolve_replay_transform(program, parent, span)?;
+                validate_replay_dependencies(program, parent, resolver, span, depth + 1)?;
             }
             (_, LineageNode::Source(_)) => {}
             (_, LineageNode::ExternalObservation(_)) => {

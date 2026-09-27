@@ -41,6 +41,7 @@ cargo run -p histima -- stats build/my-workspace
 cargo run -p histima -- materialize build/my-workspace <content-id> output.ppm
 cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
 cargo run -p histima -- trace build/my-workspace <recipe-id>
+cargo run -p histima -- replay build/my-workspace examples/image_pipeline.tima <recipe-id>
 ```
 
 Materialization verifies the stored Content ID, publishes through a temporary
@@ -64,7 +65,16 @@ lookup, validates source observations first, and attaches current invocation
 lineage to a hit; cache execution history never enters derivation lineage. The
 CLI reports native and result-cache statistics separately. Transforms whose
 external observations cannot be known before execution are not early-hit by
-this initial adapter. Durable recipe replay remains the next step.
+this initial adapter.
+
+`histima replay` rebuilds normalized lineage records from SQLite, verifies their
+Source, Dependency, Recipe, and argument identities, resolves every recorded
+transform against the supplied current Tima program, and validates all source
+and external observations before accepting a cached result. It then reuses
+valid durable intermediates or executes the generated-C path and verifies the
+expected Content ID. Replay reconstructs the recorded derivation without
+repeating outer `save(...)` effects; ancestor substitution and non-byte result
+serialization remain deferred.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar

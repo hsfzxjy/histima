@@ -7,6 +7,7 @@ use tima::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
 
 use crate::cas::{ContentKind, StoredContent};
 use crate::error::{Error, Result};
+use crate::stored_lineage::StoredRecipe;
 
 const LATEST_SCHEMA_VERSION: i64 = 2;
 
@@ -326,6 +327,10 @@ impl Catalog {
                 })
             })
             .transpose()
+    }
+
+    pub fn replay_record(&self, recipe: RecipeIdentity) -> Result<Option<StoredRecipe>> {
+        crate::stored_lineage::load(&self.connection, recipe)
     }
 
     pub fn info(&self) -> Result<CatalogInfo> {

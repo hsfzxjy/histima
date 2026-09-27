@@ -10,6 +10,7 @@ mod cas;
 mod catalog;
 mod error;
 mod runner;
+mod stored_lineage;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use catalog::Catalog;
 
 pub use catalog::{CatalogInfo, CatalogStats};
 pub use error::{Error, Result};
-pub use runner::{ProgramExecution, RunError};
+pub use runner::{ProgramExecution, RecipeReplay, RunError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedAsset {
@@ -175,6 +176,21 @@ impl Workspace {
             content_id: trace.content_id,
             rendered: trace.rendered,
         })
+    }
+
+    fn replay_target(&self, recipe: RecipeIdentity) -> Result<OuterValue> {
+        let stored = self
+            .catalog
+            .replay_record(recipe)?
+            .ok_or_else(|| Error::RecipeNotFound(recipe.to_string()))?;
+        let mut value = self.typed_value(stored.content_id)?.ok_or_else(|| {
+            Error::catalog(format!(
+                "recipe {recipe} points to unsupported content {}",
+                stored.content_id
+            ))
+        })?;
+        value.lineage = Some(stored.lineage);
+        Ok(value)
     }
 
     fn cached_value(&self, recipe: RecipeIdentity) -> Result<Option<OuterValue>> {

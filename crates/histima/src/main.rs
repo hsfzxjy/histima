@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use histima::{RunError, Workspace};
 use tima::backend::native::NativeCacheStatus;
-use tima::identity::{ContentIdentity, RecipeIdentity};
+use tima::identity::{ContentIdentity, RecipeIdentity, content_identity};
 use tima::runtime::{OuterValue, ValueData};
 use tima::source::SourceFile;
 
@@ -160,6 +160,46 @@ fn run() -> Result<(), String> {
                 println!("byte_length = {}", recorded.byte_len);
             }
         }
+        "replay" => {
+            let workspace_path = required(&mut arguments, "workspace path")?;
+            let script_path = required(&mut arguments, "Tima source path")?;
+            let recipe_text = required(&mut arguments, "Recipe ID")?;
+            finished(&mut arguments)?;
+            let recipe = recipe_text
+                .parse::<RecipeIdentity>()
+                .map_err(|error| format!("invalid Recipe ID: {error}"))?;
+            let text = fs::read_to_string(&script_path)
+                .map_err(|error| format!("could not read {script_path}: {error}"))?;
+            let diagnostic_source = SourceFile::new(script_path.clone(), text.clone());
+            let compiled = tima::compile(script_path, text).map_err(|diagnostics| {
+                format!(
+                    "Tima source was rejected:\n{}",
+                    render_diagnostics(&diagnostic_source, &diagnostics)
+                )
+            })?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let replayed = workspace
+                .replay_recipe(&compiled, recipe)
+                .map_err(|error| render_run_error(&compiled.source, error))?;
+            let content_id = content_identity(&replayed.value)
+                .map_err(|error| format!("replayed value has no content identity: {error}"))?;
+            println!(
+                "native_cache = {}",
+                match replayed.native_cache {
+                    NativeCacheStatus::Hit => "hit",
+                    NativeCacheStatus::Miss => "miss",
+                }
+            );
+            println!("result_cache_hits = {}", replayed.result_cache.hits);
+            println!("result_cache_misses = {}", replayed.result_cache.misses);
+            println!("result_cache_stores = {}", replayed.result_cache.stores);
+            println!("recipe_id = {recipe}");
+            println!("content_id = {content_id}");
+            println!("replayed = {}", display(&replayed.value));
+            if let Some(lineage) = &replayed.value.lineage {
+                println!("{}", lineage.render());
+            }
+        }
         "trace" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
             let recipe_text = required(&mut arguments, "Recipe ID")?;
@@ -177,7 +217,7 @@ fn run() -> Result<(), String> {
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, materialize, run, or trace"
+                "unknown command `{command}`; expected init, import, stats, materialize, run, replay, or trace"
             ));
         }
     }
@@ -202,11 +242,13 @@ fn print_usage() {
     eprintln!("  histima stats <workspace>");
     eprintln!("  histima materialize <workspace> <content-id> <destination>");
     eprintln!("  histima run <workspace> <file.tima> [--record <binding>]");
+    eprintln!("  histima replay <workspace> <file.tima> <recipe-id>");
     eprintln!("  histima trace <workspace> <recipe-id>");
 }
 
 fn render_run_error(source: &SourceFile, error: RunError) -> String {
     match error {
+        RunError::Storage(error) => error.to_string(),
         RunError::CodeGeneration(diagnostics) => format!(
             "generated-C code generation failed:\n{}",
             render_diagnostics(source, &diagnostics)
