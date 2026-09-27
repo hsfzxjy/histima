@@ -8,6 +8,7 @@ mod atomic_file;
 mod cas;
 mod catalog;
 mod error;
+mod runner;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use catalog::Catalog;
 
 pub use catalog::{CatalogInfo, CatalogStats};
 pub use error::{Error, Result};
+pub use runner::{ProgramExecution, RunError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedAsset {
@@ -51,6 +53,11 @@ impl Workspace {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Root for compiled artifacts and future non-semantic execution caches.
+    pub fn native_cache_root(&self) -> PathBuf {
+        self.root.join("cache")
     }
 
     pub fn import_file(&mut self, path: impl AsRef<Path>) -> Result<ImportedAsset> {
@@ -128,6 +135,10 @@ impl RuntimeCapabilities for Workspace {
 
     fn read_asset(&self, locator: &str) -> std::result::Result<Vec<u8>, String> {
         Workspace::read_asset(self, locator).map_err(|error| error.to_string())
+    }
+
+    fn write_asset(&self, locator: &str, bytes: &[u8]) -> std::result::Result<(), String> {
+        atomic_file::write_new(Path::new(locator), bytes).map_err(|error| error.to_string())
     }
 }
 
@@ -281,6 +292,21 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, Error::AssetNotFound(_)));
+    }
+
+    #[test]
+    fn runtime_output_capability_does_not_replace_existing_files() {
+        let test = TestDirectory::new("runtime-output");
+        let workspace = Workspace::open(test.path().join("workspace")).unwrap();
+        let output = test.path().join("output.bin");
+
+        RuntimeCapabilities::write_asset(&workspace, output.to_str().unwrap(), b"first").unwrap();
+        let error =
+            RuntimeCapabilities::write_asset(&workspace, output.to_str().unwrap(), b"replacement")
+                .unwrap_err();
+
+        assert!(error.contains("refusing to replace"));
+        assert_eq!(fs::read(output).unwrap(), b"first");
     }
 
     fn write(path: &Path, bytes: &[u8]) {

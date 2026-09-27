@@ -52,6 +52,51 @@ fn cli_imports_inspects_and_materializes_across_processes() {
     assert_eq!(fs::read(&destination).unwrap(), b"persistent bytes");
 }
 
+#[test]
+fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let source = test.path().join("source.ppm");
+    let script = test.path().join("pipeline.tima");
+    let output = test.path().join("darkened.ppm");
+    fs::write(&source, b"P3\n1 1\n255\n200 100 50\n").unwrap();
+    let source_locator = portable(&source);
+    let output_locator = portable(&output);
+    fs::write(
+        &script,
+        format!(
+            "source = asset({source_locator:?})\n\
+             transform darken(img: Image, factor: f32) -> Image {{\n\
+                 for p in img.pixels {{\n\
+                     p.r *= factor\n\
+                     p.g *= factor\n\
+                     p.b *= factor\n\
+                 }}\n\
+                 return img\n\
+             }}\n\
+             out = source | decode.ppm | darken(0.5) | encode.ppm\n\
+             saved = out | save({output_locator:?})\n\
+             trace(out)\n"
+        ),
+    )
+    .unwrap();
+
+    assert_success(&histima(["init", text(&workspace)]));
+    assert_success(&histima(["import", text(&workspace), &source_locator]));
+
+    let first = histima(["run", text(&workspace), text(&script)]);
+    assert_success(&first);
+    assert!(stdout(&first).contains("native_cache = miss"));
+    assert!(stdout(&first).contains("invoke darken"));
+    assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
+
+    fs::remove_file(&output).unwrap();
+    let second = histima(["run", text(&workspace), text(&script)]);
+    assert_success(&second);
+    assert!(stdout(&second).contains("native_cache = hit"));
+    assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
+}
+
 fn histima<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_histima"))
         .args(arguments)
@@ -78,6 +123,10 @@ fn stderr(output: &Output) -> String {
 
 fn text(path: &Path) -> &str {
     path.to_str().unwrap()
+}
+
+fn portable(path: &Path) -> String {
+    text(path).replace('\\', "/")
 }
 
 struct TestDirectory(PathBuf);

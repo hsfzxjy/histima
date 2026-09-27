@@ -39,11 +39,18 @@ cargo run -p histima -- init build/my-workspace
 cargo run -p histima -- import build/my-workspace examples/tiny.ppm
 cargo run -p histima -- stats build/my-workspace
 cargo run -p histima -- materialize build/my-workspace <content-id> output.ppm
+cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima
 ```
 
 Materialization verifies the stored Content ID, publishes through a temporary
 file, and refuses to replace an existing destination. Tima identities use one
 canonical durable text form: 64 lowercase hexadecimal characters.
+
+`histima run` uses the workspace as Tima's host boundary: `asset(...)` can read
+only locators already imported into that catalog, generated-C artifacts are
+cached under the workspace, and `save(...)` atomically refuses to replace an
+existing output. Transform-result caching is still process-local; durable
+recipes, derived content, and lineage are the next storage milestone.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
