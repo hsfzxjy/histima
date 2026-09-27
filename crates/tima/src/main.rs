@@ -127,7 +127,8 @@ fn display(value: &OuterValue) -> String {
         ),
         ValueData::Asset(asset) => format!("asset({:?})", asset.locator),
         ValueData::Image(image) => format!(
-            "image(width={}, height={}, stride={}, bytes={})",
+            "image(format={}, width={}, height={}, stride={}, bytes={})",
+            image.format(),
             image.width(),
             image.height(),
             image.stride(),

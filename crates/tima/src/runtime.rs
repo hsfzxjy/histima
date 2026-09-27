@@ -85,14 +85,49 @@ impl ImageStorage {
     }
 }
 
+/// The semantic layout of an image's byte storage.
+///
+/// Opaque byte images preserve the initial runtime behavior and may be used by
+/// byte-oriented transforms. RGBA8 is the first pixel-addressable layout: four
+/// interleaved 8-bit channels per pixel, in red, green, blue, alpha order.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageFormat {
+    OpaqueBytes = 0,
+    Rgba8 = 1,
+}
+
+impl ImageFormat {
+    pub(crate) const fn abi_tag(self) -> u32 {
+        self as u32
+    }
+
+    fn from_abi(tag: u32) -> Option<Self> {
+        match tag {
+            0 => Some(Self::OpaqueBytes),
+            1 => Some(Self::Rgba8),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ImageFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpaqueBytes => formatter.write_str("opaque-bytes"),
+            Self::Rgba8 => formatter.write_str("rgba8"),
+        }
+    }
+}
+
 /// Immutable outer image descriptor backed by shareable byte storage.
 ///
 /// `width` and `height` are logical dimensions, while `stride` is the backing
-/// byte count per row. Pixel format is deliberately outside this first
-/// ownership milestone.
+/// byte count per row. The explicit format controls any pixel interpretation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageValue {
     storage: Arc<ImageStorage>,
+    format: ImageFormat,
     width: usize,
     height: usize,
     stride: usize,
@@ -105,13 +140,37 @@ impl ImageValue {
         stride: usize,
         bytes: Vec<u8>,
     ) -> Result<Self, ImageLayoutError> {
-        validate_image_layout(height, stride, bytes.len())?;
+        Self::with_format(ImageFormat::OpaqueBytes, width, height, stride, bytes)
+    }
+
+    pub fn new_rgba8(
+        width: usize,
+        height: usize,
+        stride: usize,
+        bytes: Vec<u8>,
+    ) -> Result<Self, ImageLayoutError> {
+        Self::with_format(ImageFormat::Rgba8, width, height, stride, bytes)
+    }
+
+    fn with_format(
+        format: ImageFormat,
+        width: usize,
+        height: usize,
+        stride: usize,
+        bytes: Vec<u8>,
+    ) -> Result<Self, ImageLayoutError> {
+        validate_image_layout(format, width, height, stride, bytes.len())?;
         Ok(Self {
             storage: Arc::new(ImageStorage::new(bytes)),
+            format,
             width,
             height,
             stride,
         })
+    }
+
+    pub fn format(&self) -> ImageFormat {
+        self.format
     }
 
     pub fn width(&self) -> usize {
@@ -149,10 +208,24 @@ impl fmt::Display for ImageLayoutError {
 impl Error for ImageLayoutError {}
 
 fn validate_image_layout(
+    format: ImageFormat,
+    width: usize,
     height: usize,
     stride: usize,
     byte_len: usize,
 ) -> Result<(), ImageLayoutError> {
+    if format == ImageFormat::Rgba8 {
+        let minimum_stride = width.checked_mul(4).ok_or_else(|| ImageLayoutError {
+            message: "RGBA8 row byte length overflows usize".to_owned(),
+        })?;
+        if stride < minimum_stride {
+            return Err(ImageLayoutError {
+                message: format!(
+                    "RGBA8 image stride {stride} is smaller than width {width} times 4 ({minimum_stride})"
+                ),
+            });
+        }
+    }
     let expected = height.checked_mul(stride).ok_or_else(|| ImageLayoutError {
         message: "image byte length overflows usize".to_owned(),
     })?;
@@ -1313,6 +1386,7 @@ impl InterpretedValue {
 
 struct InterpretedImage {
     storage: ImageStorage,
+    format: ImageFormat,
     width: usize,
     height: usize,
     stride: usize,
@@ -1740,6 +1814,7 @@ fn lower_native_argument(
             let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
             let ImageValue {
                 storage,
+                format,
                 width,
                 height,
                 stride,
@@ -1752,6 +1827,7 @@ fn lower_native_argument(
                     width,
                     height,
                     stride,
+                    format: format.abi_tag(),
                 },
             };
             Ok(LoweredArgument {
@@ -1766,6 +1842,7 @@ fn lower_native_argument(
                     width: image.width,
                     height: image.height,
                     stride: image.stride,
+                    format: image.format.abi_tag(),
                 },
             },
             keep_alive: BoundaryStorage::View(image),
@@ -1815,7 +1892,8 @@ fn freeze_owned_image(
         if candidate.storage.bytes.as_ptr() != returned.data.cast_const() {
             continue;
         }
-        validate_returned_layout(
+        let format = validate_returned_layout(
+            returned.format,
             returned.width,
             returned.height,
             returned.stride,
@@ -1825,6 +1903,7 @@ fn freeze_owned_image(
         let owned = owned.take().expect("matched owned image remains available");
         return Ok(OuterValue::image(ImageValue {
             storage: Arc::new(owned.storage),
+            format,
             width: returned.width,
             height: returned.height,
             stride: returned.stride,
@@ -1849,7 +1928,8 @@ fn freeze_image_view(
         if image.storage.bytes.as_ptr() != returned.data {
             continue;
         }
-        validate_returned_layout(
+        let format = validate_returned_layout(
+            returned.format,
             returned.width,
             returned.height,
             returned.stride,
@@ -1858,6 +1938,7 @@ fn freeze_image_view(
         )?;
         return Ok(OuterValue::image(ImageValue {
             storage: image.storage.clone(),
+            format,
             width: returned.width,
             height: returned.height,
             stride: returned.stride,
@@ -1870,18 +1951,26 @@ fn freeze_image_view(
 }
 
 fn validate_returned_layout(
-    _width: usize,
+    format: u32,
+    width: usize,
     height: usize,
     stride: usize,
     byte_len: usize,
     span: Span,
-) -> Result<(), Diagnostic> {
-    validate_image_layout(height, stride, byte_len).map_err(|error| {
+) -> Result<ImageFormat, Diagnostic> {
+    let format = ImageFormat::from_abi(format).ok_or_else(|| {
+        Diagnostic::error(
+            format!("native transform returned unknown image format tag {format}"),
+            span,
+        )
+    })?;
+    validate_image_layout(format, width, height, stride, byte_len).map_err(|error| {
         Diagnostic::error(
             format!("native transform returned an invalid image: {error}"),
             span,
         )
-    })
+    })?;
+    Ok(format)
 }
 
 fn lower_interpreted_value(
@@ -1906,6 +1995,7 @@ fn lower_interpreted_value(
             let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
             let ImageValue {
                 storage,
+                format,
                 width,
                 height,
                 stride,
@@ -1914,6 +2004,7 @@ fn lower_interpreted_value(
                 .unwrap_or_else(|shared| ImageStorage::new(shared.bytes.clone()));
             Ok(InterpretedValue::Image(InterpretedImage {
                 storage,
+                format,
                 width,
                 height,
                 stride,
@@ -1962,6 +2053,7 @@ fn freeze_interpreted_value(value: InterpretedValue) -> OuterValue {
         InterpretedValue::Scalar(value) => freeze_scalar(value),
         InterpretedValue::Image(image) => OuterValue::image(ImageValue {
             storage: Arc::new(image.storage),
+            format: image.format,
             width: image.width,
             height: image.height,
             stride: image.stride,
@@ -2049,11 +2141,12 @@ mod tests {
     use crate::ir::{TransformId, Type};
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
-        ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver, TransformEngine,
-        ValueData, execute, execute_cached, execute_cached_with_capabilities, execute_native,
-        execute_native_cached_with_capabilities, execute_native_with_bindings_cached, execute_with,
-        invoke_native_transform, lower_native_argument, replay, replay_native,
-        replay_with_capabilities, replay_with_dependencies,
+        ImageFormat, ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver,
+        TransformEngine, ValueData, execute, execute_cached, execute_cached_with_capabilities,
+        execute_native, execute_native_cached_with_capabilities,
+        execute_native_with_bindings_cached, execute_with, invoke_native_transform,
+        lower_native_argument, replay, replay_native, replay_with_capabilities,
+        replay_with_dependencies, validate_returned_layout,
     };
     use crate::source::Span;
 
@@ -2653,7 +2746,7 @@ mod tests {
             .compile(&generated, build_root)
             .unwrap();
         let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
-        let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
+        let input = OuterValue::image(ImageValue::new_rgba8(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
         let input_content = content_identity(&input).unwrap();
         let input = input.with_lineage(Lineage::observed_source("cat.raw", input_content));
         let mut cache = TransformResultCache::default();
@@ -2675,6 +2768,9 @@ mod tests {
         };
         assert!(!original.shares_storage_with(owned));
         assert!(original.shares_storage_with(viewed));
+        assert_eq!(original.format(), ImageFormat::Rgba8);
+        assert_eq!(owned.format(), ImageFormat::Rgba8);
+        assert_eq!(viewed.format(), ImageFormat::Rgba8);
         assert_eq!(original.bytes(), owned.bytes());
         assert_eq!(original.bytes(), viewed.bytes());
         let owned_trace = execution.bindings["owned"]
@@ -3034,5 +3130,13 @@ mod tests {
     fn validates_outer_image_layouts() {
         let error = ImageValue::new(2, 2, 2, vec![0; 3]).unwrap_err();
         assert!(error.to_string().contains("require 4"));
+
+        let rgba = ImageValue::new_rgba8(2, 1, 8, vec![0; 8]).unwrap();
+        assert_eq!(rgba.format(), ImageFormat::Rgba8);
+        let error = ImageValue::new_rgba8(2, 1, 7, vec![0; 7]).unwrap_err();
+        assert!(error.to_string().contains("width 2 times 4"));
+
+        let diagnostic = validate_returned_layout(99, 1, 1, 1, 1, Span::default()).unwrap_err();
+        assert!(diagnostic.message.contains("unknown image format tag 99"));
     }
 }

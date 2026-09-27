@@ -372,6 +372,7 @@ pub(crate) struct AbiImage {
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) stride: usize,
+    pub(crate) format: u32,
 }
 
 /// Read-only image descriptor used by the generated C ABI.
@@ -382,6 +383,7 @@ pub(crate) struct AbiImageView {
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) stride: usize,
+    pub(crate) format: u32,
 }
 
 /// Native-safe payload used only by generated ABI adapters.

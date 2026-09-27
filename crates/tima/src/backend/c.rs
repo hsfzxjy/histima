@@ -9,7 +9,7 @@ use crate::ir::{Constant, RuntimeCall, Terminator, Transform, TypedModule, Value
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "9";
+pub const C_BACKEND_VERSION: &str = "10";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -20,8 +20,10 @@ impl NativeBackend for CBackend {
         writeln!(source, "#include <stdint.h>\n").unwrap();
         writeln!(source, "#define TIMA_ABI_VERSION {}\n", TIMA_ABI_VERSION).unwrap();
         source.push_str(
-            "typedef struct { unsigned char *data; size_t width; size_t height; size_t stride; } TimaImage;\n\
-             typedef struct { const unsigned char *data; size_t width; size_t height; size_t stride; } TimaImageView;\n\
+            "#define TIMA_IMAGE_FORMAT_OPAQUE_BYTES 0u\n\
+             #define TIMA_IMAGE_FORMAT_RGBA8 1u\n\n\
+             typedef struct { unsigned char *data; size_t width; size_t height; size_t stride; uint32_t format; } TimaImage;\n\
+             typedef struct { const unsigned char *data; size_t width; size_t height; size_t stride; uint32_t format; } TimaImageView;\n\
              typedef union { bool boolean; uint8_t u8_value; int64_t i64_value; float f32_value; TimaImage image; TimaImageView image_view; } TimaValue;\n\
              typedef int32_t (*TimaEnvironmentI64Fn)(void *context, uint32_t transform, uint32_t callsite, const unsigned char *name, size_t name_len, int64_t *result);\n\
              typedef struct { void *context; TimaEnvironmentI64Fn environment_i64; int32_t status; } TimaRuntime;\n\n\
@@ -508,6 +510,17 @@ mod tests {
         )
         .unwrap();
         let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(
+            artifact
+                .source
+                .contains("#define TIMA_IMAGE_FORMAT_RGBA8 1u")
+        );
+        assert!(artifact.source.contains(
+            "typedef struct { unsigned char *data; size_t width; size_t height; size_t stride; uint32_t format; } TimaImage;"
+        ));
+        assert!(artifact.source.contains(
+            "typedef struct { const unsigned char *data; size_t width; size_t height; size_t stride; uint32_t format; } TimaImageView;"
+        ));
         assert!(
             artifact
                 .source

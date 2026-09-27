@@ -327,6 +327,7 @@ fn encode_outer_value(
         }
         ValueData::Image(image) => {
             hasher.u8(7);
+            hasher.u32(image.format().abi_tag());
             hasher.u64(image.width() as u64);
             hasher.u64(image.height() as u64);
             hasher.u64(image.stride() as u64);
@@ -944,6 +945,13 @@ mod tests {
         assert_ne!(
             content_identity(&record).unwrap(),
             content_identity(&second).unwrap()
+        );
+
+        let opaque = OuterValue::image(ImageValue::new(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
+        let rgba = OuterValue::image(ImageValue::new_rgba8(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
+        assert_ne!(
+            content_identity(&opaque).unwrap(),
+            content_identity(&rgba).unwrap()
         );
     }
 

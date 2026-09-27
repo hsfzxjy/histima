@@ -3,7 +3,7 @@ use crate::ir::Type;
 /// Increment this when the generated-transform C boundary changes incompatibly.
 /// It is intentionally separate from language and backend versions so it can
 /// later participate in native artifact identity.
-pub const TIMA_ABI_VERSION: u32 = 4;
+pub const TIMA_ABI_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ownership {

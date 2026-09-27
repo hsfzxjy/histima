@@ -13,6 +13,8 @@ The Rust workspace has one `tima` crate with:
   dynamic loading behind IR/backend boundaries;
 - an explicit native ABI distinction between owned `Image` and read-only,
   aliasable `ImageView`;
+- explicit image layout metadata for opaque byte rows and validated interleaved
+  RGBA8 pixels;
 - immutable semantic lineage DAGs kept entirely outside native payloads;
 - separate native-artifact and transform-result caches keyed by semantic IDs;
 - host-mediated environment observations shared by the reference interpreter
@@ -63,6 +65,14 @@ structured `ImageByteMap` IR operation containing its typed scalar instruction
 sequence; both the reference interpreter and generated C execute it once per
 byte. General/nested loop statements, arbitrary indexing, and consuming other
 owned values inside the loop remain deferred.
+
+Images now carry a semantic format through the outer value, ownership boundary,
+reference interpreter, and generated-C ABI. Existing `ImageValue::new` values
+remain opaque byte rows; `ImageValue::new_rgba8` validates four interleaved
+8-bit channels per pixel and row stride. Format participates in content identity
+and is revalidated when a native result is frozen. Byte loops work with either
+layout; a future `img.pixels` surface can now require RGBA8 instead of guessing
+channel meaning from raw bytes.
 
 Every checked transform also receives a stable semantic identity derived from
 canonical typed IR and referenced transform identities. Source formatting,
