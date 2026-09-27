@@ -1,3 +1,5 @@
+mod cli_json;
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -10,18 +12,60 @@ use tima::lineage::{LineageNode, RecordedValue};
 use tima::runtime::{OuterValue, ValueData};
 use tima::source::SourceFile;
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("error: {message}");
-            ExitCode::FAILURE
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    Human,
+    Json,
+}
+
+impl OutputMode {
+    fn emit(self, value: serde_json::Value, human: impl FnOnce()) -> Result<(), String> {
+        match self {
+            Self::Human => human(),
+            Self::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&value)
+                    .map_err(|error| format!("could not encode JSON output: {error}"))?
+            ),
         }
+        Ok(())
     }
 }
 
-fn run() -> Result<(), String> {
-    let mut arguments = env::args().skip(1);
+fn main() -> ExitCode {
+    let mut arguments = env::args().skip(1).collect::<Vec<_>>();
+    let json_flags = arguments
+        .iter()
+        .filter(|argument| argument.as_str() == "--json")
+        .count();
+    let output = if json_flags == 0 {
+        OutputMode::Human
+    } else {
+        OutputMode::Json
+    };
+    if json_flags > 1 {
+        return report_error(output, "--json may be supplied only once".to_owned());
+    }
+    arguments.retain(|argument| argument != "--json");
+    match run(arguments.into_iter(), output) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => report_error(output, message),
+    }
+}
+
+fn report_error(output: OutputMode, message: String) -> ExitCode {
+    match output {
+        OutputMode::Human => eprintln!("error: {message}"),
+        OutputMode::Json => eprintln!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({"error": {"message": message}}))
+                .expect("JSON error values are serializable")
+        ),
+    }
+    ExitCode::FAILURE
+}
+
+fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<(), String> {
     let command = arguments.next().unwrap_or_else(|| "help".to_owned());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         print_usage();
@@ -35,9 +79,11 @@ fn run() -> Result<(), String> {
             let info = workspace
                 .catalog_info()
                 .map_err(|error| error.to_string())?;
-            println!("workspace = {}", workspace.root().display());
-            println!("schema_version = {}", info.schema_version);
-            println!("journal_mode = {}", info.journal_mode);
+            output.emit(cli_json::init(workspace.root(), &info), || {
+                println!("workspace = {}", workspace.root().display());
+                println!("schema_version = {}", info.schema_version);
+                println!("journal_mode = {}", info.journal_mode);
+            })?;
         }
         "import" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
@@ -48,10 +94,12 @@ fn run() -> Result<(), String> {
             let imported = workspace
                 .import_file(&source_path)
                 .map_err(|error| error.to_string())?;
-            println!("locator = {}", imported.locator);
-            println!("content_id = {}", imported.content_id);
-            println!("source_id = {}", imported.source_id);
-            println!("byte_length = {}", imported.byte_len);
+            output.emit(cli_json::imported(&imported), || {
+                println!("locator = {}", imported.locator);
+                println!("content_id = {}", imported.content_id);
+                println!("source_id = {}", imported.source_id);
+                println!("byte_length = {}", imported.byte_len);
+            })?;
         }
         "stats" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
@@ -63,46 +111,52 @@ fn run() -> Result<(), String> {
             let stats = workspace
                 .catalog_stats()
                 .map_err(|error| error.to_string())?;
-            println!("schema_version = {}", info.schema_version);
-            println!("contents = {}", stats.contents);
-            println!("source_versions = {}", stats.source_versions);
-            println!("source_heads = {}", stats.source_heads);
-            println!("lineage_invocations = {}", stats.lineage_invocations);
-            println!("recipe_results = {}", stats.recipe_results);
-            println!(
-                "native_artifact_bundles = {}",
-                stats.native_artifact_bundles
-            );
-            println!("native_artifacts = {}", stats.native_artifacts);
+            output.emit(cli_json::stats(&info, &stats), || {
+                println!("schema_version = {}", info.schema_version);
+                println!("contents = {}", stats.contents);
+                println!("source_versions = {}", stats.source_versions);
+                println!("source_heads = {}", stats.source_heads);
+                println!("lineage_invocations = {}", stats.lineage_invocations);
+                println!("recipe_results = {}", stats.recipe_results);
+                println!(
+                    "native_artifact_bundles = {}",
+                    stats.native_artifact_bundles
+                );
+                println!("native_artifacts = {}", stats.native_artifacts);
+            })?;
         }
         "assets" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let page = workspace.assets().map_err(|error| error.to_string())?;
-            println!("count = {}", page.items.len());
-            println!("truncated = {}", page.truncated);
-            for (index, asset) in page.items.iter().enumerate() {
-                println!("asset[{index}].locator = {}", asset.locator);
-                println!("asset[{index}].source_id = {}", asset.source_id);
-                println!("asset[{index}].content_id = {}", asset.content_id);
-                println!("asset[{index}].byte_length = {}", asset.byte_len);
-            }
+            output.emit(cli_json::assets(&page), || {
+                println!("count = {}", page.items.len());
+                println!("truncated = {}", page.truncated);
+                for (index, asset) in page.items.iter().enumerate() {
+                    println!("asset[{index}].locator = {}", asset.locator);
+                    println!("asset[{index}].source_id = {}", asset.source_id);
+                    println!("asset[{index}].content_id = {}", asset.content_id);
+                    println!("asset[{index}].byte_length = {}", asset.byte_len);
+                }
+            })?;
         }
         "recipes" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let page = workspace.recipes().map_err(|error| error.to_string())?;
-            println!("count = {}", page.items.len());
-            println!("truncated = {}", page.truncated);
-            for (index, recipe) in page.items.iter().enumerate() {
-                println!("recipe[{index}].recipe_id = {}", recipe.recipe_id);
-                println!("recipe[{index}].transform_id = {}", recipe.transform_id);
-                println!("recipe[{index}].transform_name = {}", recipe.transform_name);
-                println!("recipe[{index}].content_id = {}", recipe.content_id);
-                println!("recipe[{index}].byte_length = {}", recipe.byte_len);
-            }
+            output.emit(cli_json::recipes(&page), || {
+                println!("count = {}", page.items.len());
+                println!("truncated = {}", page.truncated);
+                for (index, recipe) in page.items.iter().enumerate() {
+                    println!("recipe[{index}].recipe_id = {}", recipe.recipe_id);
+                    println!("recipe[{index}].transform_id = {}", recipe.transform_id);
+                    println!("recipe[{index}].transform_name = {}", recipe.transform_name);
+                    println!("recipe[{index}].content_id = {}", recipe.content_id);
+                    println!("recipe[{index}].byte_length = {}", recipe.byte_len);
+                }
+            })?;
         }
         "inspect" => {
             let kind = required(&mut arguments, "inspection kind (content or recipe)")?;
@@ -118,7 +172,9 @@ fn run() -> Result<(), String> {
                     let inspection = workspace
                         .inspect_content(identity)
                         .map_err(|error| error.to_string())?;
-                    print_content_inspection(&inspection);
+                    output.emit(cli_json::content(&inspection), || {
+                        print_content_inspection(&inspection);
+                    })?;
                 }
                 "recipe" => {
                     let identity = identity_text
@@ -127,66 +183,63 @@ fn run() -> Result<(), String> {
                     let inspection = workspace
                         .inspect_recipe(identity)
                         .map_err(|error| error.to_string())?;
-                    println!("recipe_id = {}", inspection.recipe_id);
-                    println!("content_id = {}", inspection.content_id);
-                    let LineageNode::Invocation(invocation) = inspection.lineage.node() else {
-                        return Err(format!(
-                            "recorded recipe {} does not have invocation lineage",
-                            inspection.recipe_id
-                        ));
-                    };
-                    println!("transform_name = {}", invocation.transform_name);
-                    println!("transform_id = {}", invocation.transform_id);
-                    println!("content_valid = {}", inspection.content.valid);
-                    if let Some(error) = &inspection.content.validation_error {
-                        println!("content_validation_error = {error}");
-                    }
-                    println!("argument_count = {}", invocation.arguments.len());
-                    for (index, argument) in invocation.arguments.iter().enumerate() {
-                        println!("argument[{index}].name = {}", argument.name);
-                        println!(
-                            "argument[{index}].semantic_identity = {}",
-                            argument.semantic_identity
-                        );
-                        println!(
-                            "argument[{index}].recorded_value = {}",
-                            display_recorded_value(&argument.value)
-                        );
-                        if let Some(parent) = &argument.lineage {
+                    let json = cli_json::recipe(&inspection)?;
+                    output.emit(json, || {
+                        println!("recipe_id = {}", inspection.recipe_id);
+                        println!("content_id = {}", inspection.content_id);
+                        let LineageNode::Invocation(invocation) = inspection.lineage.node() else {
+                            unreachable!("recipe inspection was validated before output")
+                        };
+                        println!("transform_name = {}", invocation.transform_name);
+                        println!("transform_id = {}", invocation.transform_id);
+                        println!("content_valid = {}", inspection.content.valid);
+                        if let Some(error) = &inspection.content.validation_error {
+                            println!("content_validation_error = {error}");
+                        }
+                        println!("argument_count = {}", invocation.arguments.len());
+                        for (index, argument) in invocation.arguments.iter().enumerate() {
+                            println!("argument[{index}].name = {}", argument.name);
                             println!(
-                                "argument[{index}].parent = {}",
-                                lineage_identity(parent.node())
+                                "argument[{index}].semantic_identity = {}",
+                                argument.semantic_identity
+                            );
+                            println!(
+                                "argument[{index}].recorded_value = {}",
+                                display_recorded_value(&argument.value)
+                            );
+                            if let Some(parent) = &argument.lineage {
+                                println!(
+                                    "argument[{index}].parent = {}",
+                                    lineage_identity(parent.node())
+                                );
+                            }
+                        }
+                        println!("observation_count = {}", invocation.observations.len());
+                        for (index, observation) in invocation.observations.iter().enumerate() {
+                            let LineageNode::ExternalObservation(observation) = observation.node()
+                            else {
+                                unreachable!("recipe inspection was validated before output")
+                            };
+                            println!(
+                                "observation[{index}].dependency_id = {}",
+                                observation.dependency_id
+                            );
+                            println!(
+                                "observation[{index}].capability = {}",
+                                observation.capability
+                            );
+                            println!(
+                                "observation[{index}].key = {}",
+                                display_observation_key(&observation.key)
+                            );
+                            println!(
+                                "observation[{index}].content_id = {}",
+                                observation.observed_content
                             );
                         }
-                    }
-                    println!("observation_count = {}", invocation.observations.len());
-                    for (index, observation) in invocation.observations.iter().enumerate() {
-                        let LineageNode::ExternalObservation(observation) = observation.node()
-                        else {
-                            return Err(format!(
-                                "recipe {} has a non-external observation",
-                                inspection.recipe_id
-                            ));
-                        };
-                        println!(
-                            "observation[{index}].dependency_id = {}",
-                            observation.dependency_id
-                        );
-                        println!(
-                            "observation[{index}].capability = {}",
-                            observation.capability
-                        );
-                        println!(
-                            "observation[{index}].key = {}",
-                            display_observation_key(&observation.key)
-                        );
-                        println!(
-                            "observation[{index}].content_id = {}",
-                            observation.observed_content
-                        );
-                    }
-                    println!("trace:");
-                    println!("{}", inspection.rendered);
+                        println!("trace:");
+                        println!("{}", inspection.rendered);
+                    })?;
                 }
                 "artifact" => {
                     let identity = identity_text
@@ -195,51 +248,54 @@ fn run() -> Result<(), String> {
                     let inspection = workspace
                         .inspect_artifact(identity)
                         .map_err(|error| error.to_string())?;
-                    println!("requested_id = {}", inspection.requested_id);
-                    println!("matched_artifact = {}", inspection.artifact.is_some());
-                    if let Some(artifact) = &inspection.artifact {
-                        println!("artifact_id = {}", artifact.artifact_id);
-                        println!("transform_id = {}", artifact.transform_id);
-                    }
-                    println!("bundle_count = {}", inspection.bundles.items.len());
-                    println!("bundles_truncated = {}", inspection.bundles.truncated);
-                    for (bundle_index, bundle) in inspection.bundles.items.iter().enumerate() {
-                        let prefix = format!("bundle[{bundle_index}]");
-                        println!("{prefix}.bundle_id = {}", bundle.bundle_id);
-                        println!("{prefix}.backend = {}", bundle.backend);
-                        println!("{prefix}.backend_version = {}", bundle.backend_version);
-                        println!("{prefix}.compiler_version = {}", bundle.compiler_version);
-                        println!("{prefix}.target = {}", bundle.target);
-                        println!("{prefix}.cpu_features = {}", bundle.cpu_features);
-                        println!("{prefix}.optimization = {}", bundle.optimization);
-                        println!("{prefix}.abi_version = {}", bundle.abi_version);
-                        println!(
-                            "{prefix}.library_content_id = {}",
-                            bundle.library_content_id
-                        );
-                        println!("{prefix}.library_byte_length = {}", bundle.library_byte_len);
-                        println!(
-                            "{prefix}.library_relative_path = {}",
-                            bundle.library_relative_path
-                        );
-                        println!("{prefix}.identity_valid = {}", bundle.identity_valid);
-                        println!("{prefix}.library_valid = {}", bundle.library_valid);
-                        println!("{prefix}.valid = {}", bundle.valid);
-                        println!("{prefix}.member_count = {}", bundle.members.len());
-                        for member in &bundle.members {
-                            println!(
-                                "{prefix}.member[{}].artifact_id = {}",
-                                member.index, member.artifact_id
-                            );
-                            println!(
-                                "{prefix}.member[{}].transform_id = {}",
-                                member.index, member.transform_id
-                            );
+                    output.emit(cli_json::artifact(&inspection), || {
+                        println!("requested_id = {}", inspection.requested_id);
+                        println!("matched_artifact = {}", inspection.artifact.is_some());
+                        if let Some(artifact) = &inspection.artifact {
+                            println!("artifact_id = {}", artifact.artifact_id);
+                            println!("transform_id = {}", artifact.transform_id);
                         }
-                        for (error_index, error) in bundle.validation_errors.iter().enumerate() {
-                            println!("{prefix}.validation_error[{error_index}] = {error}");
+                        println!("bundle_count = {}", inspection.bundles.items.len());
+                        println!("bundles_truncated = {}", inspection.bundles.truncated);
+                        for (bundle_index, bundle) in inspection.bundles.items.iter().enumerate() {
+                            let prefix = format!("bundle[{bundle_index}]");
+                            println!("{prefix}.bundle_id = {}", bundle.bundle_id);
+                            println!("{prefix}.backend = {}", bundle.backend);
+                            println!("{prefix}.backend_version = {}", bundle.backend_version);
+                            println!("{prefix}.compiler_version = {}", bundle.compiler_version);
+                            println!("{prefix}.target = {}", bundle.target);
+                            println!("{prefix}.cpu_features = {}", bundle.cpu_features);
+                            println!("{prefix}.optimization = {}", bundle.optimization);
+                            println!("{prefix}.abi_version = {}", bundle.abi_version);
+                            println!(
+                                "{prefix}.library_content_id = {}",
+                                bundle.library_content_id
+                            );
+                            println!("{prefix}.library_byte_length = {}", bundle.library_byte_len);
+                            println!(
+                                "{prefix}.library_relative_path = {}",
+                                bundle.library_relative_path
+                            );
+                            println!("{prefix}.identity_valid = {}", bundle.identity_valid);
+                            println!("{prefix}.library_valid = {}", bundle.library_valid);
+                            println!("{prefix}.valid = {}", bundle.valid);
+                            println!("{prefix}.member_count = {}", bundle.members.len());
+                            for member in &bundle.members {
+                                println!(
+                                    "{prefix}.member[{}].artifact_id = {}",
+                                    member.index, member.artifact_id
+                                );
+                                println!(
+                                    "{prefix}.member[{}].transform_id = {}",
+                                    member.index, member.transform_id
+                                );
+                            }
+                            for (error_index, error) in bundle.validation_errors.iter().enumerate()
+                            {
+                                println!("{prefix}.validation_error[{error_index}] = {error}");
+                            }
                         }
-                    }
+                    })?;
                 }
                 _ => {
                     return Err(format!(
@@ -260,8 +316,11 @@ fn run() -> Result<(), String> {
             workspace
                 .materialize_content(identity, &destination)
                 .map_err(|error| error.to_string())?;
-            println!("content_id = {identity}");
-            println!("materialized = {}", PathBuf::from(destination).display());
+            let destination = PathBuf::from(destination);
+            output.emit(cli_json::materialized(identity, &destination), || {
+                println!("content_id = {identity}");
+                println!("materialized = {}", destination.display());
+            })?;
         }
         "run" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
@@ -305,54 +364,57 @@ fn run() -> Result<(), String> {
                         .map_err(|error| error.to_string())
                 })
                 .transpose()?;
-            println!(
-                "native_cache = {}",
-                match result.native_cache {
-                    NativeCacheStatus::Hit => "hit",
-                    NativeCacheStatus::Miss => "miss",
+            let json = cli_json::run(&result, record_binding.as_deref().zip(recorded.as_ref()));
+            output.emit(json, || {
+                println!(
+                    "native_cache = {}",
+                    match result.native_cache {
+                        NativeCacheStatus::Hit => "hit",
+                        NativeCacheStatus::Miss => "miss",
+                    }
+                );
+                println!("result_cache_hits = {}", result.result_cache.hits);
+                println!("result_cache_misses = {}", result.result_cache.misses);
+                println!("result_cache_stores = {}", result.result_cache.stores);
+                println!("native_bundle_id = {}", result.native_artifact.bundle_id);
+                println!(
+                    "native_artifact_ids = {}",
+                    result
+                        .native_artifact
+                        .artifact_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                println!(
+                    "native_library_content_id = {}",
+                    result.native_artifact.library_content_id
+                );
+                let unbound_trace = result.execution.last_value.as_ref().and_then(|last| {
+                    let ValueData::Lineage(lineage) = &last.data else {
+                        return None;
+                    };
+                    (!result
+                        .execution
+                        .bindings
+                        .values()
+                        .any(|value| value == last))
+                    .then_some(lineage)
+                });
+                for (name, value) in &result.execution.bindings {
+                    println!("{name} = {}", display(value));
                 }
-            );
-            println!("result_cache_hits = {}", result.result_cache.hits);
-            println!("result_cache_misses = {}", result.result_cache.misses);
-            println!("result_cache_stores = {}", result.result_cache.stores);
-            println!("native_bundle_id = {}", result.native_artifact.bundle_id);
-            println!(
-                "native_artifact_ids = {}",
-                result
-                    .native_artifact
-                    .artifact_ids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            println!(
-                "native_library_content_id = {}",
-                result.native_artifact.library_content_id
-            );
-            let unbound_trace = result.execution.last_value.as_ref().and_then(|last| {
-                let ValueData::Lineage(lineage) = &last.data else {
-                    return None;
-                };
-                (!result
-                    .execution
-                    .bindings
-                    .values()
-                    .any(|value| value == last))
-                .then_some(lineage)
-            });
-            for (name, value) in &result.execution.bindings {
-                println!("{name} = {}", display(value));
-            }
-            if let Some(lineage) = unbound_trace {
-                println!("{}", lineage.render());
-            }
-            if let (Some(name), Some(recorded)) = (record_binding, recorded) {
-                println!("recorded_binding = {name}");
-                println!("recipe_id = {}", recorded.recipe_id);
-                println!("content_id = {}", recorded.content_id);
-                println!("byte_length = {}", recorded.byte_len);
-            }
+                if let Some(lineage) = unbound_trace {
+                    println!("{}", lineage.render());
+                }
+                if let (Some(name), Some(recorded)) = (record_binding, recorded) {
+                    println!("recorded_binding = {name}");
+                    println!("recipe_id = {}", recorded.recipe_id);
+                    println!("content_id = {}", recorded.content_id);
+                    println!("byte_length = {}", recorded.byte_len);
+                }
+            })?;
         }
         "replay" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
@@ -377,37 +439,39 @@ fn run() -> Result<(), String> {
                 .map_err(|error| render_run_error(&compiled.source, error))?;
             let content_id = content_identity(&replayed.value)
                 .map_err(|error| format!("replayed value has no content identity: {error}"))?;
-            println!(
-                "native_cache = {}",
-                match replayed.native_cache {
-                    NativeCacheStatus::Hit => "hit",
-                    NativeCacheStatus::Miss => "miss",
+            output.emit(cli_json::replay(recipe, content_id, &replayed), || {
+                println!(
+                    "native_cache = {}",
+                    match replayed.native_cache {
+                        NativeCacheStatus::Hit => "hit",
+                        NativeCacheStatus::Miss => "miss",
+                    }
+                );
+                println!("result_cache_hits = {}", replayed.result_cache.hits);
+                println!("result_cache_misses = {}", replayed.result_cache.misses);
+                println!("result_cache_stores = {}", replayed.result_cache.stores);
+                println!("native_bundle_id = {}", replayed.native_artifact.bundle_id);
+                println!(
+                    "native_artifact_ids = {}",
+                    replayed
+                        .native_artifact
+                        .artifact_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                println!(
+                    "native_library_content_id = {}",
+                    replayed.native_artifact.library_content_id
+                );
+                println!("recipe_id = {recipe}");
+                println!("content_id = {content_id}");
+                println!("replayed = {}", display(&replayed.value));
+                if let Some(lineage) = &replayed.value.lineage {
+                    println!("{}", lineage.render());
                 }
-            );
-            println!("result_cache_hits = {}", replayed.result_cache.hits);
-            println!("result_cache_misses = {}", replayed.result_cache.misses);
-            println!("result_cache_stores = {}", replayed.result_cache.stores);
-            println!("native_bundle_id = {}", replayed.native_artifact.bundle_id);
-            println!(
-                "native_artifact_ids = {}",
-                replayed
-                    .native_artifact
-                    .artifact_ids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            println!(
-                "native_library_content_id = {}",
-                replayed.native_artifact.library_content_id
-            );
-            println!("recipe_id = {recipe}");
-            println!("content_id = {content_id}");
-            println!("replayed = {}", display(&replayed.value));
-            if let Some(lineage) = &replayed.value.lineage {
-                println!("{}", lineage.render());
-            }
+            })?;
         }
         "trace" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
@@ -420,9 +484,11 @@ fn run() -> Result<(), String> {
             let trace = workspace
                 .trace_recipe(recipe)
                 .map_err(|error| error.to_string())?;
-            println!("recipe_id = {}", trace.recipe_id);
-            println!("content_id = {}", trace.content_id);
-            println!("{}", trace.rendered);
+            output.emit(cli_json::trace(&trace), || {
+                println!("recipe_id = {}", trace.recipe_id);
+                println!("content_id = {}", trace.content_id);
+                println!("{}", trace.rendered);
+            })?;
         }
         _ => {
             return Err(format!(
@@ -446,6 +512,7 @@ fn finished(arguments: &mut impl Iterator<Item = String>) -> Result<(), String> 
 
 fn print_usage() {
     eprintln!("usage:");
+    eprintln!("  histima [--json] <command> ...");
     eprintln!("  histima init <workspace>");
     eprintln!("  histima import <workspace> <source-file>");
     eprintln!("  histima stats <workspace>");
@@ -458,6 +525,7 @@ fn print_usage() {
     eprintln!("  histima run <workspace> <file.tima> [--record <binding>]");
     eprintln!("  histima replay <workspace> <file.tima> <recipe-id>");
     eprintln!("  histima trace <workspace> <recipe-id>");
+    eprintln!("  --json may appear anywhere in the command");
 }
 
 fn print_content_inspection(inspection: &histima::ContentInspection) {

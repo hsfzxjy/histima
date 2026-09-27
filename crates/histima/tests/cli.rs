@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
+use serde_json::Value;
 use tima::identity::byte_content_identity;
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -442,6 +443,184 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
     assert_eq!(field(&replay, "content_id"), field(&run, "content_id"));
 }
 
+#[test]
+fn cli_json_covers_the_workspace_lifecycle() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let source = test.path().join("source.ppm");
+    let script = test.path().join("pipeline.tima");
+    let materialized = test.path().join("result.ppm");
+    fs::write(&source, b"P3\n1 1\n255\n80 40 20\n").unwrap();
+    let source_locator = portable(&source);
+    fs::write(
+        &script,
+        format!(
+            "source = asset({source_locator:?})\n\
+             transform darken(img: Image, factor: f32) -> Image {{\n\
+                 for p in img.pixels {{\n\
+                     p.r *= factor\n\
+                     p.g *= factor\n\
+                     p.b *= factor\n\
+                 }}\n\
+                 return img\n\
+             }}\n\
+             out = source | decode.ppm | darken(0.5) | encode.ppm\n"
+        ),
+    )
+    .unwrap();
+
+    let initialized = histima(["--json", "init", text(&workspace)]);
+    assert_success(&initialized);
+    let initialized = json_output(&initialized);
+    assert_eq!(initialized["schema_version"], 3);
+    assert_eq!(initialized["journal_mode"], "wal");
+
+    let imported = histima(["import", text(&workspace), &source_locator, "--json"]);
+    assert_success(&imported);
+    let imported = json_output(&imported);
+    let source_content_id = json_string(&imported, "content_id");
+    let source_id = json_string(&imported, "source_id");
+    assert_canonical_identity(source_content_id);
+    assert_canonical_identity(source_id);
+
+    let assets = histima(["assets", "--json", text(&workspace)]);
+    assert_success(&assets);
+    let assets = json_output(&assets);
+    assert_eq!(assets["count"], 1);
+    assert_eq!(assets["truncated"], false);
+    assert_eq!(assets["assets"][0]["locator"], source_locator);
+    assert_eq!(assets["assets"][0]["source_id"], source_id);
+
+    let run = histima([
+        "run",
+        text(&workspace),
+        text(&script),
+        "--record",
+        "out",
+        "--json",
+    ]);
+    assert_success(&run);
+    let run = json_output(&run);
+    assert_eq!(run["native_cache"], "miss");
+    assert_eq!(run["result_cache"]["hits"], 0);
+    assert_eq!(run["bindings"]["out"]["type"], "bytes");
+    assert_eq!(run["recorded"]["binding"], "out");
+    let recipe_id = json_string(&run["recorded"], "recipe_id").to_owned();
+    let content_id = json_string(&run["recorded"], "content_id").to_owned();
+    let bundle_id = json_string(&run["native_artifact"], "bundle_id").to_owned();
+    let artifact_id = run["native_artifact"]["artifact_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for identity in [&recipe_id, &content_id, &bundle_id, &artifact_id] {
+        assert_canonical_identity(identity);
+    }
+
+    let recipes = histima(["--json", "recipes", text(&workspace)]);
+    assert_success(&recipes);
+    let recipes = json_output(&recipes);
+    assert_eq!(recipes["count"], 1);
+    assert_eq!(recipes["recipes"][0]["recipe_id"], recipe_id);
+    assert_eq!(recipes["recipes"][0]["transform_name"], "encode.ppm");
+
+    let content = histima([
+        "inspect",
+        "content",
+        text(&workspace),
+        &content_id,
+        "--json",
+    ]);
+    assert_success(&content);
+    let content = json_output(&content);
+    assert_eq!(content["kind"], "bytes");
+    assert_eq!(content["valid"], true);
+    assert_eq!(content["validation_error"], Value::Null);
+
+    let recipe = histima(["--json", "inspect", "recipe", text(&workspace), &recipe_id]);
+    assert_success(&recipe);
+    let recipe = json_output(&recipe);
+    assert_eq!(recipe["transform_name"], "encode.ppm");
+    assert_eq!(
+        recipe["arguments"][0]["semantic_identity"]["kind"],
+        "recipe"
+    );
+    assert_eq!(recipe["observations"].as_array().unwrap().len(), 0);
+    assert!(recipe["trace"].as_str().unwrap().contains("invoke darken"));
+
+    let artifact = histima([
+        "inspect",
+        "artifact",
+        text(&workspace),
+        &bundle_id,
+        "--json",
+    ]);
+    assert_success(&artifact);
+    let artifact = json_output(&artifact);
+    assert_eq!(artifact["matched_artifact"], Value::Null);
+    assert_eq!(artifact["bundles"][0]["valid"], true);
+    assert_eq!(
+        artifact["bundles"][0]["members"][0]["artifact_id"],
+        artifact_id
+    );
+
+    let trace = histima(["trace", text(&workspace), &recipe_id, "--json"]);
+    assert_success(&trace);
+    let trace = json_output(&trace);
+    assert_eq!(trace["recipe_id"], recipe_id);
+    assert!(
+        trace["trace"]
+            .as_str()
+            .unwrap()
+            .contains("invoke encode.ppm")
+    );
+
+    let replay = histima([
+        "--json",
+        "replay",
+        text(&workspace),
+        text(&script),
+        &recipe_id,
+    ]);
+    assert_success(&replay);
+    let replay = json_output(&replay);
+    assert_eq!(replay["content_id"], content_id);
+    assert_eq!(replay["result_cache"]["hits"], 1);
+    assert_eq!(replay["replayed"]["type"], "bytes");
+
+    let materialize = histima([
+        "materialize",
+        text(&workspace),
+        &content_id,
+        text(&materialized),
+        "--json",
+    ]);
+    assert_success(&materialize);
+    assert_eq!(json_output(&materialize)["content_id"], content_id);
+
+    let stats = histima(["stats", text(&workspace), "--json"]);
+    assert_success(&stats);
+    let stats = json_output(&stats);
+    assert_eq!(stats["recipe_results"], 1);
+    assert_eq!(stats["native_artifact_bundles"], 1);
+
+    let invalid = histima([
+        "--json",
+        "inspect",
+        "content",
+        text(&workspace),
+        "not-an-identity",
+    ]);
+    assert!(!invalid.status.success());
+    assert!(stdout(&invalid).is_empty());
+    let error: Value = serde_json::from_str(stderr(&invalid).trim()).unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid Content ID")
+    );
+}
+
 fn histima<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_histima"))
         .args(arguments)
@@ -464,6 +643,26 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn json_output(output: &Output) -> Value {
+    serde_json::from_str(stdout(output).trim())
+        .unwrap_or_else(|error| panic!("invalid JSON output: {error}\n{}", stdout(output)))
+}
+
+fn json_string<'a>(value: &'a Value, field: &str) -> &'a str {
+    value[field]
+        .as_str()
+        .unwrap_or_else(|| panic!("JSON field {field:?} is not a string: {value}"))
+}
+
+fn assert_canonical_identity(identity: &str) {
+    assert_eq!(identity.len(), 64);
+    assert!(
+        identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    );
 }
 
 fn field(output: &Output, name: &str) -> String {
