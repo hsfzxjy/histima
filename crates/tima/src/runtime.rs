@@ -1326,6 +1326,26 @@ impl IrInterpreter<'_> {
         capabilities: &mut CapabilitySession<'_>,
     ) -> Result<OuterValue, Diagnostic> {
         let transform = self.module.get(id);
+        let arguments = transform
+            .parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, (argument, span))| {
+                lower_interpreted_value(argument, parameter.ty, span)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.invoke_lowered_at_depth(id, arguments, depth, capabilities)
+            .map(freeze_interpreted_value)
+    }
+
+    fn invoke_lowered_at_depth(
+        &self,
+        id: TransformId,
+        arguments: Vec<InterpretedValue>,
+        depth: usize,
+        capabilities: &mut CapabilitySession<'_>,
+    ) -> Result<InterpretedValue, Diagnostic> {
+        let transform = self.module.get(id);
         if depth >= 256 {
             return Err(Diagnostic::error(
                 "transform call depth exceeded the interpreter limit",
@@ -1335,9 +1355,8 @@ impl IrInterpreter<'_> {
         let mut values = (0..transform.values.len())
             .map(|_| None)
             .collect::<Vec<_>>();
-        for (parameter, (argument, span)) in transform.parameters.iter().zip(arguments) {
-            values[parameter.value.0 as usize] =
-                Some(lower_interpreted_value(argument, parameter.ty, span)?);
+        for (parameter, argument) in transform.parameters.iter().zip(arguments) {
+            values[parameter.value.0 as usize] = Some(argument);
         }
         let mut current = transform.entry;
         loop {
@@ -1364,22 +1383,22 @@ impl IrInterpreter<'_> {
                         arguments,
                     } => {
                         let callee_transform = self.module.get(*callee);
-                        let call_span = value.span;
                         let call_arguments = arguments
                             .iter()
                             .zip(&callee_transform.parameters)
                             .map(|(argument, parameter)| {
-                                clone_interpreted_argument(
-                                    values[argument.0 as usize].as_ref().unwrap(),
+                                transfer_interpreted_argument(
+                                    &mut values[argument.0 as usize],
                                     parameter.ty,
-                                    value.span,
                                 )
-                                .map(|value| (value, call_span))
                             })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let result =
-                            self.invoke_at_depth(*callee, call_arguments, depth + 1, capabilities)?;
-                        lower_interpreted_value(result, callee_transform.return_type, value.span)?
+                            .collect();
+                        self.invoke_lowered_at_depth(
+                            *callee,
+                            call_arguments,
+                            depth + 1,
+                            capabilities,
+                        )?
                     }
                     ValueKind::ImageZero { image } => {
                         let Some(InterpretedValue::Image(mut image)) =
@@ -1414,9 +1433,7 @@ impl IrInterpreter<'_> {
             }
             match block.terminator {
                 Terminator::Return(value) => {
-                    return Ok(freeze_interpreted_value(
-                        values[value.0 as usize].take().unwrap(),
-                    ));
+                    return Ok(values[value.0 as usize].take().unwrap());
                 }
                 Terminator::Jump(target) => current = target,
                 Terminator::Branch {
@@ -1872,32 +1889,29 @@ fn lower_interpreted_value(
     }
 }
 
-fn clone_interpreted_argument(
-    value: &InterpretedValue,
+fn transfer_interpreted_argument(
+    value: &mut Option<InterpretedValue>,
     expected: Type,
-    span: Span,
-) -> Result<OuterValue, Diagnostic> {
-    match (expected, value) {
+) -> InterpretedValue {
+    match (expected, value.as_ref().unwrap()) {
         (Type::Bool, InterpretedValue::Scalar(NativeScalar::Bool(value))) => {
-            Ok(freeze_scalar(NativeScalar::Bool(*value)))
+            InterpretedValue::Scalar(NativeScalar::Bool(*value))
         }
         (Type::U8, InterpretedValue::Scalar(NativeScalar::U8(value))) => {
-            Ok(freeze_scalar(NativeScalar::U8(*value)))
+            InterpretedValue::Scalar(NativeScalar::U8(*value))
         }
         (Type::I64, InterpretedValue::Scalar(NativeScalar::I64(value))) => {
-            Ok(freeze_scalar(NativeScalar::I64(*value)))
+            InterpretedValue::Scalar(NativeScalar::I64(*value))
         }
         (Type::F32, InterpretedValue::Scalar(NativeScalar::F32(value))) => {
-            Ok(freeze_scalar(NativeScalar::F32(*value)))
+            InterpretedValue::Scalar(NativeScalar::F32(*value))
         }
         (Type::ImageView, InterpretedValue::ImageView(image)) => {
-            Ok(OuterValue::image((**image).clone()))
+            InterpretedValue::ImageView(image.clone())
         }
-        (Type::Image, InterpretedValue::Image(_)) => Err(Diagnostic::error(
-            "owned Image cannot be copied into an inner transform call",
-            span,
-        )
-        .with_note("owned inner-to-inner calls require explicit move lowering")),
+        (Type::Image, InterpretedValue::Image(_)) => value
+            .take()
+            .expect("owned inner argument remains available until transferred"),
         _ => unreachable!("typed inner call arguments match their parameter types"),
     }
 }
@@ -1994,8 +2008,8 @@ mod tests {
     use crate::ir::{TransformId, Type};
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
-        ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver, ValueData, execute,
-        execute_cached, execute_cached_with_capabilities, execute_native,
+        ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver, TransformEngine,
+        ValueData, execute, execute_cached, execute_cached_with_capabilities, execute_native,
         execute_native_cached_with_capabilities, execute_native_with_bindings_cached, execute_with,
         invoke_native_transform, lower_native_argument, replay, replay_native,
         replay_with_capabilities, replay_with_dependencies,
@@ -2721,9 +2735,10 @@ mod tests {
         let compiled = crate::compile(
             "test.tima",
             "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n\
+             transform fill_owned(img: Image, value: u8) -> Image { return fill(img, value) }\n\
              transform keep(value: u8) -> u8 { return value }\n\
              transform before(left: u8, right: u8) -> bool { return left < right }\n\
-             filled = fill(img, amount)\n\
+             filled = fill_owned(img, amount)\n\
              kept = keep(amount)\n\
              ordered = before(amount, larger)\n",
         )
@@ -2839,12 +2854,32 @@ mod tests {
     }
 
     #[test]
-    fn unique_owned_image_storage_transfers_without_copying() {
+    fn unique_owned_image_storage_transfers_through_inner_calls_without_copying() {
         let compiled = crate::compile(
             "test.tima",
-            "transform own(img: Image) -> Image { return img }\n",
+            "transform own(img: Image) -> Image { return img }\n\
+             transform own_inner(img: Image) -> Image { return own(img) }\n",
         )
         .unwrap();
+        let reference = IrInterpreter {
+            module: &compiled.transforms,
+            capabilities: None,
+        };
+        let image = ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap();
+        let original_pointer = image.storage.bytes.as_ptr();
+        let result = reference
+            .invoke(
+                crate::ir::TransformId(1),
+                vec![(OuterValue::image(image), Span::default())],
+            )
+            .unwrap()
+            .value;
+        let ValueData::Image(result) = result.data else {
+            panic!("expected image result")
+        };
+        assert_eq!(result.storage.bytes.as_ptr(), original_pointer);
+        assert_eq!(result.bytes(), &[1, 2, 3, 4]);
+
         let generated = CBackend.emit(&compiled.transforms).unwrap();
         let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -2858,7 +2893,7 @@ mod tests {
         let result = invoke_native_transform(
             &compiled,
             &native,
-            crate::ir::TransformId(0),
+            crate::ir::TransformId(1),
             vec![OuterValue::image(image)],
         )
         .unwrap();

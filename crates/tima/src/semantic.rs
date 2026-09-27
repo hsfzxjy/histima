@@ -553,22 +553,6 @@ impl<'a> Lowerer<'a> {
                     ));
                     return None;
                 };
-                if signature
-                    .parameters
-                    .iter()
-                    .any(|(_, ty)| *ty == Type::Image)
-                {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            "owned Image arguments are not yet supported in inner-to-inner calls",
-                            expression.span,
-                        )
-                        .with_note(
-                            "move/detach lowering is required to preserve non-aliasing across nested native calls",
-                        ),
-                    );
-                    return None;
-                }
                 if arguments.iter().any(|argument| argument.name.is_some()) {
                     self.diagnostics.push(Diagnostic::error(
                         "named arguments are not yet supported inside transforms",
@@ -601,6 +585,9 @@ impl<'a> Lowerer<'a> {
                             argument.span,
                         ));
                         return None;
+                    }
+                    if *expected == Type::Image {
+                        self.moved.insert(value);
                     }
                     lowered.push(value);
                 }
@@ -1035,14 +1022,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_owned_image_inner_calls_until_move_lowering_exists() {
+    fn moves_owned_images_through_inner_calls_and_rejects_aliases() {
+        let compiled = compile(
+            "safe.tima",
+            "transform choose(a: Image, b: Image) -> Image { return a }\n\
+             transform safe(x: Image, y: Image) -> Image {\n\
+                 chosen = choose(x, y)\n\
+                 return chosen\n\
+             }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.transforms.transforms[1].values[2].kind,
+            ir::ValueKind::Call {
+                transform: ir::TransformId(0),
+                ref arguments,
+            } if arguments == &[ir::ValueId(0), ir::ValueId(1)]
+        ));
+
         let diagnostics = compile(
             "test.tima",
             "transform choose(a: Image, b: Image) -> Image { return a }\n\
              transform unsafe_alias(x: Image) -> Image { return choose(x, x) }\n",
         )
         .unwrap_err();
-        assert!(diagnostics[0].message.contains("owned Image arguments"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("already been moved"))
+        );
+
+        let diagnostics = compile(
+            "moved.tima",
+            "transform consume(img: Image) -> Image { return img }\n\
+             transform bad(img: Image) -> Image {\n\
+                 result = consume(img)\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("already been moved"))
+        );
     }
 
     #[test]

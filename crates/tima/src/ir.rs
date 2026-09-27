@@ -102,6 +102,8 @@ pub enum ValueKind {
         left: ValueId,
         right: ValueId,
     },
+    /// Calls another checked transform. Arguments with owned types are
+    /// consumed; their type makes the ownership transfer backend-neutral.
     Call {
         transform: TransformId,
         arguments: Vec<ValueId>,

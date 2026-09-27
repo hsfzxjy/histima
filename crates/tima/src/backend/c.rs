@@ -383,6 +383,27 @@ mod tests {
     }
 
     #[test]
+    fn emits_owned_image_moves_through_inner_calls() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform clear(img: Image) -> Image { return image_zero(img) }\n\
+             transform clear_owned(img: Image) -> Image { return clear(img) }\n",
+        )
+        .unwrap();
+        let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(
+            artifact
+                .source
+                .contains("TimaImage tima_transform_1(TimaRuntime *runtime, TimaImage p0)")
+        );
+        assert!(
+            artifact
+                .source
+                .contains("v1 = tima_transform_0(runtime, p0);")
+        );
+    }
+
+    #[test]
     fn expresses_owned_and_view_image_abi_separately() {
         let compiled = crate::compile(
             "test.tima",

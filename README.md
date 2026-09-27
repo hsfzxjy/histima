@@ -35,8 +35,9 @@ Host-provided immutable images can cross the native boundary: `Image` acquires
 unique mutable storage by transfer or detach, multiple owned arguments cannot
 alias, `ImageView` shares storage zero-copy, and returned descriptors are frozen
 only when they reference storage retained by the invocation. Inner-to-inner
-calls with owned images remain disabled until the IR has explicit move/detach
-lowering. Native `i64` arithmetic is also held back until its overflow and
+calls transfer owned `Image` arguments without returning through the outer
+representation; passing the same owned value twice or using it after the call
+is rejected. Native `i64` arithmetic is still held back until its overflow and
 division-error semantics are specified.
 
 The first concrete owned-image operation is the inner-only
