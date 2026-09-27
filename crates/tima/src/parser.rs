@@ -154,10 +154,25 @@ impl Parser {
                 span: start.join(end),
             });
         }
+        if self.eat(|kind| matches!(kind, TokenKind::For)) {
+            let start = self.previous().span;
+            let (binding, binding_span) = self.identifier("a loop binding")?;
+            self.expect(|kind| matches!(kind, TokenKind::In), "`in`")?;
+            let iterable = self.expression()?;
+            self.expect(|kind| matches!(kind, TokenKind::LeftBrace), "`{`")?;
+            let (body, end) = self.inner_block()?;
+            return Ok(InnerStmt::For {
+                binding,
+                binding_span,
+                iterable,
+                body,
+                span: start.join(end),
+            });
+        }
         if self.at_binding() {
             return self.binding().map(InnerStmt::Binding);
         }
-        Err(self.expected("a local binding, `if`, or `return` inside the transform"))
+        Err(self.expected("a local binding, `if`, `for`, or `return` inside the transform"))
     }
 
     fn type_ref(&mut self) -> Result<TypeRef, Diagnostic> {
@@ -244,48 +259,63 @@ impl Parser {
 
     fn postfix(&mut self) -> Result<ExprId, Diagnostic> {
         let mut expression = self.primary()?;
-        while self.eat(|kind| matches!(kind, TokenKind::LeftParen)) {
-            let mut arguments = Vec::new();
-            self.inline_newlines();
-            if !self.at(|kind| matches!(kind, TokenKind::RightParen)) {
-                loop {
-                    let start = self.current().span;
-                    let name = if matches!(self.current().kind, TokenKind::Identifier(_))
-                        && self
-                            .tokens
-                            .get(self.position + 1)
-                            .is_some_and(|token| matches!(token.kind, TokenKind::Equal))
-                    {
-                        let (name, span) = self.identifier("an argument name")?;
-                        self.bump();
-                        Some((name, span))
-                    } else {
-                        None
-                    };
-                    let value = self.expression()?;
-                    arguments.push(Argument {
-                        name,
-                        value,
-                        span: start.join(self.expr(value).span),
-                    });
-                    self.inline_newlines();
-                    if !self.eat(|kind| matches!(kind, TokenKind::Comma)) {
-                        break;
+        loop {
+            if self.eat(|kind| matches!(kind, TokenKind::LeftParen)) {
+                let mut arguments = Vec::new();
+                self.inline_newlines();
+                if !self.at(|kind| matches!(kind, TokenKind::RightParen)) {
+                    loop {
+                        let start = self.current().span;
+                        let name = if matches!(self.current().kind, TokenKind::Identifier(_))
+                            && self
+                                .tokens
+                                .get(self.position + 1)
+                                .is_some_and(|token| matches!(token.kind, TokenKind::Equal))
+                        {
+                            let (name, span) = self.identifier("an argument name")?;
+                            self.bump();
+                            Some((name, span))
+                        } else {
+                            None
+                        };
+                        let value = self.expression()?;
+                        arguments.push(Argument {
+                            name,
+                            value,
+                            span: start.join(self.expr(value).span),
+                        });
+                        self.inline_newlines();
+                        if !self.eat(|kind| matches!(kind, TokenKind::Comma)) {
+                            break;
+                        }
+                        self.inline_newlines();
                     }
-                    self.inline_newlines();
                 }
+                let end = self
+                    .expect(|kind| matches!(kind, TokenKind::RightParen), "`)`")?
+                    .span;
+                let span = self.expr(expression).span.join(end);
+                expression = self.alloc(
+                    ExprKind::Call {
+                        callee: expression,
+                        arguments,
+                    },
+                    span,
+                );
+            } else if self.eat(|kind| matches!(kind, TokenKind::Dot)) {
+                let (name, name_span) = self.identifier("a member name after `.`")?;
+                let span = self.expr(expression).span.join(name_span);
+                expression = self.alloc(
+                    ExprKind::Member {
+                        receiver: expression,
+                        name,
+                        name_span,
+                    },
+                    span,
+                );
+            } else {
+                break;
             }
-            let end = self
-                .expect(|kind| matches!(kind, TokenKind::RightParen), "`)`")?
-                .span;
-            let span = self.expr(expression).span.join(end);
-            expression = self.alloc(
-                ExprKind::Call {
-                    callee: expression,
-                    arguments,
-                },
-                span,
-            );
         }
         Ok(expression)
     }
@@ -480,6 +510,43 @@ mod tests {
         };
         assert!(matches!(transform.body[0], InnerStmt::Binding(_)));
         assert!(matches!(transform.body[1], InnerStmt::Return { .. }));
+    }
+
+    #[test]
+    fn parses_owned_image_byte_iteration_in_the_shared_tree() {
+        let source = SourceFile::new(
+            "test.tima",
+            "transform fill(img: Image, value: u8) -> Image {\n\
+                 for byte in img.bytes {\n\
+                     byte = value\n\
+                 }\n\
+                 return img\n\
+             }\n",
+        );
+        let program = parse(&source).unwrap();
+        let Item::Transform(transform) = &program.items[0] else {
+            panic!("expected transform")
+        };
+        let InnerStmt::For {
+            binding,
+            iterable,
+            body,
+            ..
+        } = &transform.body[0]
+        else {
+            panic!("expected for statement")
+        };
+        assert_eq!(binding, "byte");
+        assert!(matches!(
+            &program.expr(*iterable).kind,
+            ExprKind::Member { receiver, name, .. }
+                if name == "bytes"
+                    && matches!(&program.expr(*receiver).kind, ExprKind::Name(name) if name == "img")
+        ));
+        assert!(matches!(
+            &body[..],
+            [InnerStmt::Binding(Binding { name, .. })] if name == "byte"
+        ));
     }
 
     #[test]

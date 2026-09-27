@@ -955,6 +955,12 @@ impl Interpreter<'_, '_, '_> {
             ExprKind::Call { callee, arguments } => {
                 self.call(*callee, arguments, None, expression.span)?
             }
+            ExprKind::Member { .. } => {
+                return Err(Diagnostic::error(
+                    "member access is not yet executable in outer code",
+                    expression.span,
+                ));
+            }
             ExprKind::Pipeline { input, stage } => {
                 let input = self.expression(*input)?;
                 match &self.program.syntax.expr(*stage).kind {
@@ -2735,7 +2741,11 @@ mod tests {
         let compiled = crate::compile(
             "test.tima",
             "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n\
-             transform fill_owned(img: Image, value: u8) -> Image { return fill(img, value) }\n\
+             transform fill_loop(img: Image, value: u8) -> Image {\n\
+                 for byte in img.bytes { byte = value }\n\
+                 return img\n\
+             }\n\
+             transform fill_owned(img: Image, value: u8) -> Image { return fill_loop(img, value) }\n\
              transform keep(value: u8) -> u8 { return value }\n\
              transform before(left: u8, right: u8) -> bool { return left < right }\n\
              filled = fill_owned(img, amount)\n\

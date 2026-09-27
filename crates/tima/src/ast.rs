@@ -67,6 +67,13 @@ pub enum InnerStmt {
         else_body: Vec<InnerStmt>,
         span: Span,
     },
+    For {
+        binding: String,
+        binding_span: Span,
+        iterable: ExprId,
+        body: Vec<InnerStmt>,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +95,11 @@ pub enum ExprKind {
     Call {
         callee: ExprId,
         arguments: Vec<Argument>,
+    },
+    Member {
+        receiver: ExprId,
+        name: String,
+        name_span: Span,
     },
     Binary {
         op: BinaryOp,

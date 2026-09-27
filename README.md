@@ -29,8 +29,7 @@ and `if` statements with required `else` arms. Either branch may return early
 or fall through to a continuation; branch-local bindings do not escape that
 join. The typed IR represents control flow as explicit basic-block branches and
 jumps consumed by both the reference interpreter and C backend. Merged branch
-values, rebinding, loops, and general user-authored mutation remain intentionally
-unsupported.
+values, rebinding, and general loop bodies remain intentionally unsupported.
 Host-provided immutable images can cross the native boundary: `Image` acquires
 unique mutable storage by transfer or detach, multiple owned arguments cannot
 alias, `ImageView` shares storage zero-copy, and returned descriptors are frozen
@@ -54,6 +53,13 @@ is a native-safe `u8`. Outer integers cross a `u8` parameter only after a
 conversions or `u8` arithmetic are intentionally deferred. `u8` equality and
 ordering are statically checked and execute consistently in the reference and C
 paths.
+
+The first constrained loop surface is
+`for byte in img.bytes { byte = value }` over an owned `Image`. The body must be
+exactly one loop-invariant `u8` assignment; semantic lowering canonicalizes it
+to the same backend-neutral `ImageFill` operation as `image_fill`, so equivalent
+source forms share Transform identity. Reading the byte, nested/general loop
+bodies, and arbitrary indexed mutation are the next language steps.
 
 Every checked transform also receives a stable semantic identity derived from
 canonical typed IR and referenced transform identities. Source formatting,

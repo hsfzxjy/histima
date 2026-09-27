@@ -17,6 +17,8 @@ pub enum TokenKind {
     Return,
     If,
     Else,
+    For,
+    In,
     True,
     False,
     Null,
@@ -29,6 +31,7 @@ pub enum TokenKind {
     Comma,
     Colon,
     Semicolon,
+    Dot,
     Equal,
     EqualEqual,
     BangEqual,
@@ -91,6 +94,7 @@ impl Lexer<'_> {
                 b',' => self.single(TokenKind::Comma, start),
                 b':' => self.single(TokenKind::Colon, start),
                 b';' => self.single(TokenKind::Semicolon, start),
+                b'.' => self.single(TokenKind::Dot, start),
                 b'=' if self.peek() == Some(b'=') => self.double(TokenKind::EqualEqual, start),
                 b'=' => self.single(TokenKind::Equal, start),
                 b'!' if self.peek() == Some(b'=') => self.double(TokenKind::BangEqual, start),
@@ -166,6 +170,8 @@ impl Lexer<'_> {
             "return" => TokenKind::Return,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
+            "for" => TokenKind::For,
+            "in" => TokenKind::In,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "null" => TokenKind::Null,
@@ -259,6 +265,7 @@ mod tests {
         let source = SourceFile::new(
             "test",
             "transform f(flag: bool, x: f32) -> f32 { if flag { return x } else { return x } }\n\
+             transform fill(img: Image, value: u8) -> Image { for byte in img.bytes { byte = value }; return img }\n\
              y = 1 | f\n comparisons = a == b != c < d <= e > f >= g",
         );
         let tokens = lex(&source).unwrap();
@@ -271,6 +278,9 @@ mod tests {
         assert!(tokens.iter().any(|token| token.kind == TokenKind::Arrow));
         assert!(tokens.iter().any(|token| token.kind == TokenKind::If));
         assert!(tokens.iter().any(|token| token.kind == TokenKind::Else));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::For));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::In));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Dot));
         assert!(
             tokens
                 .iter()

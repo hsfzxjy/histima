@@ -292,9 +292,145 @@ impl<'a> Lowerer<'a> {
                 } => {
                     terminated = self.conditional(*condition, then_body, else_body);
                 }
+                InnerStmt::For {
+                    binding,
+                    binding_span,
+                    iterable,
+                    body,
+                    span,
+                } => self.image_byte_loop(binding, *binding_span, *iterable, body, *span),
             }
         }
         terminated
+    }
+
+    fn image_byte_loop(
+        &mut self,
+        binding: &str,
+        binding_span: crate::source::Span,
+        iterable: ExprId,
+        body: &[InnerStmt],
+        span: crate::source::Span,
+    ) {
+        if let Some((_, previous_span)) = self.environment.get(binding) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("inner loop binding `{binding}` would shadow an existing value"),
+                    binding_span,
+                )
+                .with_label(*previous_span, "existing value is here")
+                .with_note("inner bindings cannot shadow parameters or earlier locals"),
+            );
+            return;
+        }
+
+        let iterable_expression = self.program.expr(iterable);
+        let ExprKind::Member {
+            receiver,
+            name,
+            name_span,
+        } = &iterable_expression.kind
+        else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "initial inner `for` requires an owned image `.bytes` iterator",
+                    iterable_expression.span,
+                )
+                .with_note("example: for byte in img.bytes { byte = value }"),
+            );
+            return;
+        };
+        if name != "bytes" {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("Image has no iterable member `{name}` in the initial language"),
+                    *name_span,
+                )
+                .with_note("the first supported inner iterator is owned `Image.bytes`"),
+            );
+            return;
+        }
+        let ExprKind::Name(image_name) = &self.program.expr(*receiver).kind else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "image byte iteration requires a directly named owned Image",
+                    self.program.expr(*receiver).span,
+                )
+                .with_note("bind the owned image to a local before iterating it"),
+            );
+            return;
+        };
+        let Some(image) = self.expression(*receiver) else {
+            return;
+        };
+        let actual_image = self.values[image.0 as usize].ty;
+        if actual_image != Type::Image {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "image byte iteration requires owned Image, not {}",
+                        actual_image.name()
+                    ),
+                    iterable_expression.span,
+                )
+                .with_note("ImageView is read-only and may alias"),
+            );
+            return;
+        }
+
+        let [InnerStmt::Binding(assignment)] = body else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "initial image byte loop body must contain exactly one byte assignment",
+                    span,
+                )
+                .with_note(format!(
+                    "expected `{binding} = value`; general loop bodies are not implemented yet"
+                )),
+            );
+            return;
+        };
+        if assignment.name != binding {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "image byte loop must assign its `{binding}` binding, not `{}`",
+                        assignment.name
+                    ),
+                    assignment.name_span,
+                )
+                .with_note("ordinary inner locals remain immutable"),
+            );
+            return;
+        }
+        let Some(value) = self.expression(assignment.value) else {
+            return;
+        };
+        let actual_value = self.values[value.0 as usize].ty;
+        if actual_value != Type::U8 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "image byte assignment requires u8, not {}",
+                        actual_value.name()
+                    ),
+                    self.program.expr(assignment.value).span,
+                )
+                .with_note("the initial loop supports a loop-invariant u8 fill value"),
+            );
+            return;
+        }
+
+        let image_name_span = self.environment[image_name].1;
+        self.moved.insert(image);
+        let filled = self.alloc(
+            Type::Image,
+            ValueKind::ImageFill { image, value },
+            span,
+            true,
+        );
+        self.environment
+            .insert(image_name.clone(), (filled, image_name_span));
     }
 
     fn local_binding(&mut self, binding: &ast::Binding) {
@@ -605,6 +741,7 @@ impl<'a> Lowerer<'a> {
             | ExprKind::String(_)
             | ExprKind::List(_)
             | ExprKind::Record(_)
+            | ExprKind::Member { .. }
             | ExprKind::Pipeline { .. } => {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -759,7 +896,9 @@ impl<'a> Lowerer<'a> {
 fn inner_statement_span(statement: &InnerStmt) -> crate::source::Span {
     match statement {
         InnerStmt::Binding(binding) => binding.span,
-        InnerStmt::Return { span, .. } | InnerStmt::If { span, .. } => *span,
+        InnerStmt::Return { span, .. }
+        | InnerStmt::If { span, .. }
+        | InnerStmt::For { span, .. } => *span,
     }
 }
 
@@ -1167,6 +1306,73 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("requires u8 fill value"))
+        );
+    }
+
+    #[test]
+    fn normalizes_initial_image_byte_loop_to_owned_fill_ir() {
+        let compiled = compile(
+            "loop.tima",
+            "transform fill(img: Image, value: u8) -> Image {\n\
+                 for byte in img.bytes { byte = value }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let transform = &compiled.transforms.transforms[0];
+        assert!(matches!(
+            transform.values[2].kind,
+            ir::ValueKind::ImageFill {
+                image: ir::ValueId(0),
+                value: ir::ValueId(1),
+            }
+        ));
+        assert!(matches!(
+            transform.blocks[0].terminator,
+            ir::Terminator::Return(ir::ValueId(2))
+        ));
+
+        let diagnostics = compile(
+            "view.tima",
+            "transform bad(img: ImageView, value: u8) -> ImageView {\n\
+                 for byte in img.bytes { byte = value }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("requires owned Image"))
+        );
+
+        let diagnostics = compile(
+            "body.tima",
+            "transform bad(img: Image, value: u8) -> Image {\n\
+                 for byte in img.bytes { other = value }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("must assign its `byte`"))
+        );
+
+        let diagnostics = compile(
+            "alias.tima",
+            "transform bad(img: Image, value: u8) -> Image {\n\
+                 alias = img\n\
+                 for byte in img.bytes { byte = value }\n\
+                 return alias\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("already been moved"))
         );
     }
 

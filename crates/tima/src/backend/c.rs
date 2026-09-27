@@ -383,6 +383,22 @@ mod tests {
     }
 
     #[test]
+    fn emits_normalized_owned_image_byte_loop() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform fill(img: Image, value: u8) -> Image {\n\
+                 for byte in img.bytes { byte = value }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(artifact.source.contains("image.data[index] = value;"));
+        assert!(artifact.source.contains("v2 = tima_image_fill(p0, p1);"));
+        assert!(artifact.source.contains("return v2;"));
+    }
+
+    #[test]
     fn emits_owned_image_moves_through_inner_calls() {
         let compiled = crate::compile(
             "test.tima",

@@ -847,6 +847,27 @@ mod tests {
     }
 
     #[test]
+    fn normalized_image_byte_loop_has_fill_semantic_identity() {
+        let builtin = crate::compile(
+            "builtin.tima",
+            "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n",
+        )
+        .unwrap();
+        let loop_surface = crate::compile(
+            "loop.tima",
+            "transform fill(img: Image, value: u8) -> Image {\n\
+                 for byte in img.bytes { byte = value }\n\
+                 return img\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            builtin.identities.get(TransformId(0)),
+            loop_surface.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
     fn capability_operation_and_key_are_part_of_transform_identity() {
         let first = crate::compile(
             "one.tima",
