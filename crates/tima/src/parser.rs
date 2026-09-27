@@ -169,10 +169,44 @@ impl Parser {
                 span: start.join(end),
             });
         }
+        if self.at_member_assignment() {
+            let target = self.postfix()?;
+            let op = if self.eat(|kind| matches!(kind, TokenKind::StarEqual)) {
+                AssignmentOp::Multiply
+            } else {
+                self.expect(|kind| matches!(kind, TokenKind::Equal), "`=` or `*=`")?;
+                AssignmentOp::Assign
+            };
+            let value = self.expression()?;
+            let span = self.expr(target).span.join(self.expr(value).span);
+            return Ok(InnerStmt::Assignment {
+                target,
+                op,
+                value,
+                span,
+            });
+        }
         if self.at_binding() {
             return self.binding().map(InnerStmt::Binding);
         }
-        Err(self.expected("a local binding, `if`, `for`, or `return` inside the transform"))
+        Err(self
+            .expected("a local binding, assignment, `if`, `for`, or `return` inside the transform"))
+    }
+
+    fn at_member_assignment(&self) -> bool {
+        matches!(self.current().kind, TokenKind::Identifier(_))
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Dot))
+            && self
+                .tokens
+                .get(self.position + 2)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Identifier(_)))
+            && self
+                .tokens
+                .get(self.position + 3)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Equal | TokenKind::StarEqual))
     }
 
     fn type_ref(&mut self) -> Result<TypeRef, Diagnostic> {
@@ -546,6 +580,43 @@ mod tests {
         assert!(matches!(
             &body[..],
             [InnerStmt::Binding(Binding { name, .. })] if name == "byte"
+        ));
+    }
+
+    #[test]
+    fn parses_rgba8_pixel_channel_scale_assignments() {
+        let source = SourceFile::new(
+            "test.tima",
+            "transform darken(img: Image, factor: f32) -> Image {\n\
+                 for p in img.pixels {\n\
+                     p.r *= factor\n\
+                     p.g *= factor\n\
+                     p.b *= factor\n\
+                 }\n\
+                 return img\n\
+             }\n",
+        );
+        let program = parse(&source).unwrap();
+        let Item::Transform(transform) = &program.items[0] else {
+            panic!("expected transform")
+        };
+        let InnerStmt::For { body, .. } = &transform.body[0] else {
+            panic!("expected for statement")
+        };
+        assert_eq!(body.len(), 3);
+        let InnerStmt::Assignment {
+            target,
+            op: AssignmentOp::Multiply,
+            ..
+        } = body[0]
+        else {
+            panic!("expected multiply assignment")
+        };
+        assert!(matches!(
+            &program.expr(target).kind,
+            ExprKind::Member { receiver, name, .. }
+                if name == "r"
+                    && matches!(&program.expr(*receiver).kind, ExprKind::Name(name) if name == "p")
         ));
     }
 

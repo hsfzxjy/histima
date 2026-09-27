@@ -74,6 +74,18 @@ pub enum InnerStmt {
         body: Vec<InnerStmt>,
         span: Span,
     },
+    Assignment {
+        target: ExprId,
+        op: AssignmentOp,
+        value: ExprId,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssignmentOp {
+    Assign,
+    Multiply,
 }
 
 #[derive(Clone, Debug)]

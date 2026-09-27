@@ -44,6 +44,7 @@ pub enum TokenKind {
     Plus,
     Minus,
     Star,
+    StarEqual,
     Slash,
     Newline,
     Eof,
@@ -104,6 +105,7 @@ impl Lexer<'_> {
                 b'>' => self.single(TokenKind::Greater, start),
                 b'|' => self.single(TokenKind::Pipe, start),
                 b'+' => self.single(TokenKind::Plus, start),
+                b'*' if self.peek() == Some(b'=') => self.double(TokenKind::StarEqual, start),
                 b'*' => self.single(TokenKind::Star, start),
                 b'/' => self.single(TokenKind::Slash, start),
                 b'-' if self.peek() == Some(b'>') => {
@@ -266,6 +268,7 @@ mod tests {
             "test",
             "transform f(flag: bool, x: f32) -> f32 { if flag { return x } else { return x } }\n\
              transform fill(img: Image, value: u8) -> Image { for byte in img.bytes { byte = value }; return img }\n\
+             transform darken(img: Image, factor: f32) -> Image { for p in img.pixels { p.r *= factor }; return img }\n\
              y = 1 | f\n comparisons = a == b != c < d <= e > f >= g",
         );
         let tokens = lex(&source).unwrap();
@@ -281,6 +284,11 @@ mod tests {
         assert!(tokens.iter().any(|token| token.kind == TokenKind::For));
         assert!(tokens.iter().any(|token| token.kind == TokenKind::In));
         assert!(tokens.iter().any(|token| token.kind == TokenKind::Dot));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::StarEqual)
+        );
         assert!(
             tokens
                 .iter()

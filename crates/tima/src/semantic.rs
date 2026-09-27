@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ast::{self, ExprId, ExprKind, InnerStmt, Item};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    BasicBlock, BlockId, Constant, Parameter, RuntimeCall, Terminator, Transform, TransformId,
-    Type, TypedModule, Value, ValueId, ValueKind,
+    BasicBlock, BlockId, Constant, Parameter, Rgba8Channel, RuntimeCall, Terminator, Transform,
+    TransformId, Type, TypedModule, Value, ValueId, ValueKind,
 };
 
 pub fn check(program: &ast::Program) -> Result<TypedModule, Vec<Diagnostic>> {
@@ -299,6 +299,13 @@ impl<'a> Lowerer<'a> {
                     body,
                     span,
                 } => self.image_byte_loop(binding, *binding_span, *iterable, body, *span),
+                InnerStmt::Assignment { span, .. } => self.diagnostics.push(
+                    Diagnostic::error(
+                        "inner field assignment is only available inside an image pixel loop",
+                        *span,
+                    )
+                    .with_note("example: for p in img.pixels { p.r *= factor }"),
+                ),
             }
         }
         terminated
@@ -333,20 +340,26 @@ impl<'a> Lowerer<'a> {
         else {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "initial inner `for` requires an owned image `.bytes` iterator",
+                    "initial inner `for` requires an owned image `.bytes` or `.pixels` iterator",
                     iterable_expression.span,
                 )
-                .with_note("example: for byte in img.bytes { byte = value }"),
+                .with_note(
+                    "examples: for byte in img.bytes { byte = value }; for p in img.pixels { p.r *= factor }",
+                ),
             );
             return;
         };
+        if name == "pixels" {
+            self.image_pixel_loop(binding, binding_span, *receiver, body, span);
+            return;
+        }
         if name != "bytes" {
             self.diagnostics.push(
                 Diagnostic::error(
                     format!("Image has no iterable member `{name}` in the initial language"),
                     *name_span,
                 )
-                .with_note("the first supported inner iterator is owned `Image.bytes`"),
+                .with_note("supported inner iterators are owned `Image.bytes` and `Image.pixels`"),
             );
             return;
         }
@@ -469,6 +482,172 @@ impl<'a> Lowerer<'a> {
         );
         self.environment
             .insert(image_name.clone(), (mapped, image_name_span));
+    }
+
+    fn image_pixel_loop(
+        &mut self,
+        binding: &str,
+        _binding_span: crate::source::Span,
+        receiver: ExprId,
+        body: &[InnerStmt],
+        span: crate::source::Span,
+    ) {
+        let ExprKind::Name(image_name) = &self.program.expr(receiver).kind else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "image pixel iteration requires a directly named owned Image",
+                    self.program.expr(receiver).span,
+                )
+                .with_note("bind the owned image to a local before iterating it"),
+            );
+            return;
+        };
+        let Some(image) = self.expression(receiver) else {
+            return;
+        };
+        let actual_image = self.values[image.0 as usize].ty;
+        if actual_image != Type::Image {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "image pixel iteration requires owned Image, not {}",
+                        actual_image.name()
+                    ),
+                    self.program.expr(receiver).span,
+                )
+                .with_note("ImageView is read-only and may alias"),
+            );
+            return;
+        }
+        if body.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error("image pixel loop body cannot be empty", span)
+                    .with_note("scale at least one channel, for example `p.r *= factor`"),
+            );
+            return;
+        }
+
+        let moved_before = self.moved.clone();
+        let mut seen = BTreeSet::new();
+        let mut channels = Vec::new();
+        for statement in body {
+            let InnerStmt::Assignment {
+                target,
+                op,
+                value,
+                span: assignment_span,
+            } = statement
+            else {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "initial image pixel loop body accepts only channel scale assignments",
+                        inner_statement_span(statement),
+                    )
+                    .with_note("supported form: `p.r *= factor`"),
+                );
+                return;
+            };
+            if *op != ast::AssignmentOp::Multiply {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "initial image pixel assignment requires `*=`, not `=`",
+                        *assignment_span,
+                    )
+                    .with_note("general channel replacement and conversion semantics are deferred"),
+                );
+                return;
+            }
+            let ExprKind::Member {
+                receiver: pixel,
+                name,
+                name_span,
+            } = &self.program.expr(*target).kind
+            else {
+                unreachable!("parser admits only member assignment targets")
+            };
+            if !matches!(&self.program.expr(*pixel).kind, ExprKind::Name(name) if name == binding) {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("pixel loop assignment must target `{binding}.<channel>`"),
+                    self.program.expr(*target).span,
+                ));
+                return;
+            }
+            let channel = match name.as_str() {
+                "r" => Rgba8Channel::Red,
+                "g" => Rgba8Channel::Green,
+                "b" => Rgba8Channel::Blue,
+                "a" => Rgba8Channel::Alpha,
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!("RGBA8 pixel has no channel `{name}`"),
+                            *name_span,
+                        )
+                        .with_note("available channels are r, g, b, and a"),
+                    );
+                    return;
+                }
+            };
+            if !seen.insert(channel) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("RGBA8 channel `{name}` is scaled more than once in this loop"),
+                        *name_span,
+                    )
+                    .with_note("the initial pixel loop permits one scale per channel"),
+                );
+                return;
+            }
+            if expression_mentions_name(self.program, *value, binding) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "pixel scale factor cannot read the pixel binding yet",
+                        self.program.expr(*value).span,
+                    )
+                    .with_note("this slice supports only `p.<channel> *= f32`"),
+                );
+                return;
+            }
+            let Some(factor) = self.expression(*value) else {
+                return;
+            };
+            let actual = self.values[factor.0 as usize].ty;
+            if actual != Type::F32 {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "RGBA8 channel scale factor must be f32, not {}",
+                            actual.name()
+                        ),
+                        self.program.expr(*value).span,
+                    )
+                    .with_note("pass an f32 parameter or expression as the scale factor"),
+                );
+                return;
+            }
+            channels.push((channel, factor));
+        }
+        if self.moved.iter().any(|moved| !moved_before.contains(moved)) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "image pixel scale factor cannot consume an owned value",
+                    span,
+                )
+                .with_note("pixel-loop factors are evaluated once before iteration"),
+            );
+            return;
+        }
+
+        self.moved.insert(image);
+        let scaled = self.alloc(
+            Type::Image,
+            ValueKind::ImageRgba8Scale { image, channels },
+            span,
+            true,
+        );
+        let image_name_span = self.environment[image_name].1;
+        self.environment
+            .insert(image_name.clone(), (scaled, image_name_span));
     }
 
     fn require_byte_loop_result(&mut self, value: ValueId, syntax: ExprId) -> bool {
@@ -954,7 +1133,8 @@ fn inner_statement_span(statement: &InnerStmt) -> crate::source::Span {
         InnerStmt::Binding(binding) => binding.span,
         InnerStmt::Return { span, .. }
         | InnerStmt::If { span, .. }
-        | InnerStmt::For { span, .. } => *span,
+        | InnerStmt::For { span, .. }
+        | InnerStmt::Assignment { span, .. } => *span,
     }
 }
 
@@ -1508,6 +1688,53 @@ mod tests {
                 .message
                 .contains("cannot consume another owned value")
         }));
+    }
+
+    #[test]
+    fn lowers_constrained_rgba8_pixel_scaling_and_rejects_broader_mutation() {
+        let compiled = compile(
+            "darken.tima",
+            "transform darken(img: Image, factor: f32) -> Image {\n\
+                 for p in img.pixels {\n\
+                     p.r *= factor\n\
+                     p.g *= factor\n\
+                     p.b *= factor\n\
+                 }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let transform = &compiled.transforms.transforms[0];
+        assert!(matches!(
+            &transform.values[2].kind,
+            ir::ValueKind::ImageRgba8Scale { image, channels }
+                if *image == ir::ValueId(0)
+                    && channels == &[
+                        (ir::Rgba8Channel::Red, ir::ValueId(1)),
+                        (ir::Rgba8Channel::Green, ir::ValueId(1)),
+                        (ir::Rgba8Channel::Blue, ir::ValueId(1)),
+                    ]
+        ));
+
+        let diagnostics = compile(
+            "replace.tima",
+            "transform replace(img: Image, factor: f32) -> Image {\n\
+                 for p in img.pixels { p.r = factor }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics[0].message.contains("requires `*=`"));
+
+        let diagnostics = compile(
+            "view.tima",
+            "transform bad(img: ImageView, factor: f32) -> ImageView {\n\
+                 for p in img.pixels { p.r *= factor }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics[0].message.contains("requires owned Image"));
     }
 
     #[test]

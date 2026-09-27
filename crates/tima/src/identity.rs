@@ -239,6 +239,15 @@ impl TransformIdentityResolver<'_> {
                     }
                     hasher.u32(result.0);
                 }
+                ValueKind::ImageRgba8Scale { image, channels } => {
+                    hasher.u8(9);
+                    hasher.u32(image.0);
+                    hasher.u32(channels.len() as u32);
+                    for (channel, factor) in channels {
+                        hasher.u8(channel.offset() as u8);
+                        hasher.u32(factor.0);
+                    }
+                }
                 ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
                     hasher.u8(4);
                     hasher.u8(0);
@@ -898,6 +907,30 @@ mod tests {
             "second.tima",
             "transform keep(img: Image) -> Image {\n\
                  for element in img.bytes { element = element }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first.identities.get(TransformId(0)),
+            second.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
+    fn rgba8_pixel_scale_identity_ignores_loop_binding_name() {
+        let first = crate::compile(
+            "first.tima",
+            "transform darken(img: Image, factor: f32) -> Image {\n\
+                 for p in img.pixels { p.r *= factor }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let second = crate::compile(
+            "second.tima",
+            "transform darken(img: Image, factor: f32) -> Image {\n\
+                 for pixel in img.pixels { pixel.r *= factor }\n\
                  return img\n\
              }\n",
         )

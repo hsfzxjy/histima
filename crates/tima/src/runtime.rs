@@ -1558,6 +1558,35 @@ impl IrInterpreter<'_> {
                 }
                 InterpretedValue::Image(image)
             }
+            ValueKind::ImageRgba8Scale { image, channels } => {
+                let Some(InterpretedValue::Image(mut image)) = values[image.0 as usize].take()
+                else {
+                    unreachable!("typed RGBA8 scale input is an available owned image")
+                };
+                if image.format != ImageFormat::Rgba8 {
+                    return Err(Diagnostic::error(
+                        "image pixel iteration requires RGBA8 format",
+                        value.span,
+                    )
+                    .with_note(format!("received {} image storage", image.format)));
+                }
+                for y in 0..image.height {
+                    for x in 0..image.width {
+                        let pixel = y * image.stride + x * 4;
+                        for (channel, factor) in channels {
+                            let NativeScalar::F32(factor) =
+                                values[factor.0 as usize].as_ref().unwrap().scalar()
+                            else {
+                                unreachable!("typed RGBA8 scale factor is f32")
+                            };
+                            let offset = pixel + channel.offset();
+                            image.storage.bytes[offset] =
+                                scale_rgba8_channel(image.storage.bytes[offset], factor);
+                        }
+                    }
+                }
+                InterpretedValue::Image(image)
+            }
             ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
                 InterpretedValue::Scalar(NativeScalar::I64(
                     capabilities.environment_i64(name, value.span)?,
@@ -1617,10 +1646,27 @@ impl TransformEngine for NativeEngine<'_> {
             context: (&mut capability_context as *mut NativeCapabilityContext<'_>).cast(),
             environment_i64: native_environment_i64,
             status: 0,
+            error_transform: u32::MAX,
+            error_value: u32::MAX,
         };
         let result = match self.native.invoke(id, &mut abi_runtime, &abi_arguments) {
             Ok(result) => result,
             Err(error) => {
+                if abi_runtime.status == -7 {
+                    let span = self
+                        .module
+                        .transforms
+                        .get(abi_runtime.error_transform as usize)
+                        .and_then(|transform| {
+                            transform.values.get(abi_runtime.error_value as usize)
+                        })
+                        .map_or(transform.span, |value| value.span);
+                    return Err(Diagnostic::error(
+                        "image pixel iteration requires RGBA8 format",
+                        span,
+                    )
+                    .with_note("opaque byte images have no pixel channel interpretation"));
+                }
                 return Err(capability_context
                     .error
                     .take()
@@ -2071,6 +2117,17 @@ fn freeze_scalar(value: NativeScalar) -> OuterValue {
     })
 }
 
+fn scale_rgba8_channel(channel: u8, factor: f32) -> u8 {
+    let scaled = f32::from(channel) * factor;
+    if !matches!(scaled.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+        0
+    } else if scaled >= 255.0 {
+        255
+    } else {
+        scaled as u8
+    }
+}
+
 fn native_binary(
     op: BinaryOp,
     left: NativeScalar,
@@ -2146,7 +2203,7 @@ mod tests {
         execute_native, execute_native_cached_with_capabilities,
         execute_native_with_bindings_cached, execute_with, invoke_native_transform,
         lower_native_argument, replay, replay_native, replay_with_capabilities,
-        replay_with_dependencies, validate_returned_layout,
+        replay_with_dependencies, scale_rgba8_channel, validate_returned_layout,
     };
     use crate::source::Span;
 
@@ -3073,6 +3130,119 @@ mod tests {
             panic!("expected replayed image")
         };
         assert_eq!(replayed.bytes(), &[9, 2, 9, 3]);
+    }
+
+    #[test]
+    fn rgba8_pixel_scaling_matches_reference_and_native_execution() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform darken(img: Image, factor: f32) -> Image {\n\
+                 for p in img.pixels {\n\
+                     p.r *= factor\n\
+                     p.g *= factor\n\
+                     p.b *= factor\n\
+                 }\n\
+                 return img\n\
+             }\n\
+             darkened = darken(img, factor)\n",
+        )
+        .unwrap();
+        let input_bytes = vec![100, 51, 25, 255, 200, 101, 50, 128, 7, 8];
+        let input =
+            OuterValue::image(ImageValue::new_rgba8(2, 1, 10, input_bytes.clone()).unwrap());
+        let input_content = content_identity(&input).unwrap();
+        let input = input.with_lineage(Lineage::observed_source("pixels.rgba", input_content));
+        let bindings = BTreeMap::from([
+            ("img".to_owned(), input.clone()),
+            (
+                "factor".to_owned(),
+                OuterValue::plain(ValueData::Float(0.5)),
+            ),
+        ]);
+
+        let reference_engine = IrInterpreter {
+            module: &compiled.transforms,
+            capabilities: None,
+        };
+        let reference = execute_with(&compiled, &reference_engine, bindings.clone(), None).unwrap();
+        let ValueData::Image(reference_image) = &reference.bindings["darkened"].data else {
+            panic!("expected reference image")
+        };
+        assert_eq!(
+            reference_image.bytes(),
+            &[50, 25, 12, 255, 100, 50, 25, 128, 7, 8]
+        );
+        assert_eq!(reference_image.format(), ImageFormat::Rgba8);
+
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let mut cache = TransformResultCache::default();
+        let execution =
+            execute_native_with_bindings_cached(&compiled, &native, bindings, &mut cache).unwrap();
+        let ValueData::Image(native_image) = &execution.bindings["darkened"].data else {
+            panic!("expected native image")
+        };
+        assert_eq!(native_image.bytes(), reference_image.bytes());
+        let ValueData::Image(original) = &execution.bindings["img"].data else {
+            panic!("expected original image")
+        };
+        assert_eq!(original.bytes(), input_bytes);
+        assert_eq!(
+            reference.bindings["darkened"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id(),
+            execution.bindings["darkened"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id()
+        );
+
+        let recorded = execution.bindings["darkened"].clone();
+        let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
+        cache.invalidate_recipe(recipe);
+        let replayed = replay_native(&compiled, &native, &recorded, &mut cache).unwrap();
+        let ValueData::Image(replayed) = replayed.data else {
+            panic!("expected replayed image")
+        };
+        assert_eq!(replayed.bytes(), reference_image.bytes());
+
+        let opaque = OuterValue::image(ImageValue::new(2, 1, 10, vec![0; 10]).unwrap());
+        let opaque_bindings = BTreeMap::from([
+            ("img".to_owned(), opaque),
+            (
+                "factor".to_owned(),
+                OuterValue::plain(ValueData::Float(0.5)),
+            ),
+        ]);
+        let diagnostics =
+            execute_with(&compiled, &reference_engine, opaque_bindings.clone(), None).unwrap_err();
+        assert!(diagnostics[0].message.contains("requires RGBA8"));
+        let diagnostics = execute_native_with_bindings_cached(
+            &compiled,
+            &native,
+            opaque_bindings,
+            &mut TransformResultCache::default(),
+        )
+        .unwrap_err();
+        assert!(diagnostics[0].message.contains("requires RGBA8"));
+    }
+
+    #[test]
+    fn rgba8_channel_scaling_saturates_and_truncates() {
+        assert_eq!(scale_rgba8_channel(101, 0.5), 50);
+        assert_eq!(scale_rgba8_channel(200, 2.0), 255);
+        assert_eq!(scale_rgba8_channel(200, -1.0), 0);
+        assert_eq!(scale_rgba8_channel(200, f32::NAN), 0);
+        assert_eq!(scale_rgba8_channel(1, f32::INFINITY), 255);
     }
 
     #[test]

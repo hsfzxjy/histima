@@ -91,6 +91,25 @@ pub struct Value {
     pub span: Span,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Rgba8Channel {
+    Red,
+    Green,
+    Blue,
+    Alpha,
+}
+
+impl Rgba8Channel {
+    pub const fn offset(self) -> usize {
+        match self {
+            Self::Red => 0,
+            Self::Green => 1,
+            Self::Blue => 2,
+            Self::Alpha => 3,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ValueKind {
     Parameter {
@@ -129,6 +148,12 @@ pub enum ValueKind {
         element: ValueId,
         instructions: Vec<ValueId>,
         result: ValueId,
+    },
+    /// Consumes one RGBA8 image and scales selected channels in logical pixels.
+    /// Factors are evaluated once before iteration; padding bytes are untouched.
+    ImageRgba8Scale {
+        image: ValueId,
+        channels: Vec<(Rgba8Channel, ValueId)>,
     },
     RuntimeCall(RuntimeCall),
 }

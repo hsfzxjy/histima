@@ -419,6 +419,8 @@ pub(crate) struct AbiRuntime {
     pub(crate) context: *mut c_void,
     pub(crate) environment_i64: EnvironmentI64Fn,
     pub(crate) status: i32,
+    pub(crate) error_transform: u32,
+    pub(crate) error_value: u32,
 }
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;

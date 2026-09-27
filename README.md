@@ -71,8 +71,17 @@ reference interpreter, and generated-C ABI. Existing `ImageValue::new` values
 remain opaque byte rows; `ImageValue::new_rgba8` validates four interleaved
 8-bit channels per pixel and row stride. Format participates in content identity
 and is revalidated when a native result is frozen. Byte loops work with either
-layout; a future `img.pixels` surface can now require RGBA8 instead of guessing
-channel meaning from raw bytes.
+layout.
+
+The first RGBA8 pixel surface supports the target-shaped loop
+`for p in img.pixels { p.r *= factor }` over an owned `Image`. A loop may scale
+each of `r`, `g`, `b`, and `a` at most once by an `f32` expression evaluated
+before iteration. Scaling operates on stored channel bytes, truncates fractional
+results, saturates above 255, and maps non-positive or NaN results to zero.
+Unmentioned channels and row padding remain unchanged. Both execution engines
+reject opaque-byte images with a source-spanned format diagnostic. General
+channel expressions, replacement assignment, and a general pixel value type
+remain intentionally deferred.
 
 Every checked transform also receives a stable semantic identity derived from
 canonical typed IR and referenced transform identities. Source formatting,
@@ -112,6 +121,7 @@ Try the vertical slice:
 
 ```text
 cargo run -p tima -- check examples/first.tima
+cargo run -p tima -- check examples/darken.tima
 cargo run -p tima -- run examples/first.tima
 cargo run -p tima -- emit-c examples/first.tima
 ```

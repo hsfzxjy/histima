@@ -9,7 +9,7 @@ use crate::ir::{Constant, RuntimeCall, Terminator, Transform, TypedModule, Value
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "10";
+pub const C_BACKEND_VERSION: &str = "11";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -26,7 +26,7 @@ impl NativeBackend for CBackend {
              typedef struct { const unsigned char *data; size_t width; size_t height; size_t stride; uint32_t format; } TimaImageView;\n\
              typedef union { bool boolean; uint8_t u8_value; int64_t i64_value; float f32_value; TimaImage image; TimaImageView image_view; } TimaValue;\n\
              typedef int32_t (*TimaEnvironmentI64Fn)(void *context, uint32_t transform, uint32_t callsite, const unsigned char *name, size_t name_len, int64_t *result);\n\
-             typedef struct { void *context; TimaEnvironmentI64Fn environment_i64; int32_t status; } TimaRuntime;\n\n\
+             typedef struct { void *context; TimaEnvironmentI64Fn environment_i64; int32_t status; uint32_t error_transform; uint32_t error_value; } TimaRuntime;\n\n\
              #if defined(_WIN32)\n\
              #define TIMA_EXPORT __declspec(dllexport)\n\
              int _fltused = 0;\n\
@@ -48,6 +48,22 @@ impl NativeBackend for CBackend {
                  if (runtime->environment_i64 == NULL) { runtime->status = -2; return 0; }\n\
                  runtime->status = runtime->environment_i64(runtime->context, transform, callsite, name, name_len, &result);\n\
                  return runtime->status == 0 ? result : 0;\n\
+                 }\n\n",
+            );
+        }
+
+        if module.transforms.iter().any(|transform| {
+            transform
+                .values
+                .iter()
+                .any(|value| matches!(value.kind, ValueKind::ImageRgba8Scale { .. }))
+        }) {
+            source.push_str(
+                "static uint8_t tima_scale_rgba8_channel(uint8_t channel, float factor) {\n\
+                 float scaled = (float)channel * factor;\n\
+                 if (!(scaled > 0.0f)) return 0;\n\
+                 if (scaled >= 255.0f) return 255;\n\
+                 return (uint8_t)scaled;\n\
                  }\n\n",
             );
         }
@@ -162,6 +178,51 @@ fn emit_instruction(
     transform_index: usize,
     id: ValueId,
 ) {
+    if let ValueKind::ImageRgba8Scale { image, channels } = &transform.value(id).kind {
+        writeln!(output, "    v{} = {};", id.0, value_name(transform, *image)).unwrap();
+        output.push_str("    if (runtime->status == 0) {\n");
+        writeln!(
+            output,
+            "        if (v{}.format != TIMA_IMAGE_FORMAT_RGBA8) {{ runtime->status = -7; runtime->error_transform = {transform_index}; runtime->error_value = {}; }} else {{",
+            id.0, id.0,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "        for (size_t tima_y_{} = 0; tima_y_{} < v{}.height; ++tima_y_{}) {{",
+            id.0, id.0, id.0, id.0,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "            for (size_t tima_x_{} = 0; tima_x_{} < v{}.width; ++tima_x_{}) {{",
+            id.0, id.0, id.0, id.0,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "                size_t tima_pixel_{} = tima_y_{} * v{}.stride + tima_x_{} * 4;",
+            id.0, id.0, id.0, id.0,
+        )
+        .unwrap();
+        for (channel, factor) in channels {
+            writeln!(
+                output,
+                "                v{}.data[tima_pixel_{} + {}] = tima_scale_rgba8_channel(v{}.data[tima_pixel_{} + {}], {});",
+                id.0,
+                id.0,
+                channel.offset(),
+                id.0,
+                id.0,
+                channel.offset(),
+                value_name(transform, *factor),
+            )
+            .unwrap();
+        }
+        output.push_str("            }\n        }\n    }\n    }\n");
+        writeln!(output, "    (void)v{};", id.0).unwrap();
+        return;
+    }
     if let ValueKind::ImageByteMap {
         image,
         element,
@@ -219,7 +280,9 @@ fn abi_adapter(output: &mut String, index: usize, transform: &Transform) {
         "TIMA_EXPORT int32_t tima_invoke_{index}(TimaRuntime *runtime, const TimaValue *args, TimaValue *result) {{"
     )
     .unwrap();
-    output.push_str("    if (runtime == NULL) return -1;\n    runtime->status = 0;\n");
+    output.push_str(
+        "    if (runtime == NULL) return -1;\n    runtime->status = 0;\n    runtime->error_transform = UINT32_MAX;\n    runtime->error_value = UINT32_MAX;\n",
+    );
     if transform.parameters.is_empty() {
         output.push_str("    (void)args;\n");
     }
@@ -315,7 +378,9 @@ fn expression(transform: &Transform, transform_index: usize, id: ValueId) -> Str
             value_name(transform, *image),
             value_name(transform, *value)
         ),
-        ValueKind::ImageByteElement | ValueKind::ImageByteMap { .. } => {
+        ValueKind::ImageByteElement
+        | ValueKind::ImageByteMap { .. }
+        | ValueKind::ImageRgba8Scale { .. } => {
             unreachable!("structured byte-loop values are emitted by emit_instruction")
         }
         ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
@@ -478,6 +543,42 @@ mod tests {
                 .contains("v4 = tima_transform_0(runtime, v3, p1, p2);")
         );
         assert!(artifact.source.contains("v5.data[tima_byte_index_5] = v4;"));
+    }
+
+    #[test]
+    fn emits_rgba8_pixel_scaling_from_backend_neutral_ir() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform darken(img: Image, factor: f32) -> Image {\n\
+                 for p in img.pixels {\n\
+                     p.r *= factor\n\
+                     p.g *= factor\n\
+                     p.b *= factor\n\
+                 }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(
+            artifact
+                .source
+                .contains("static uint8_t tima_scale_rgba8_channel")
+        );
+        assert!(
+            artifact
+                .source
+                .contains("v2.format != TIMA_IMAGE_FORMAT_RGBA8")
+        );
+        assert!(
+            artifact
+                .source
+                .contains("tima_y_2 * v2.stride + tima_x_2 * 4")
+        );
+        assert!(artifact.source.contains("v2.data[tima_pixel_2 + 0]"));
+        assert!(artifact.source.contains("v2.data[tima_pixel_2 + 1]"));
+        assert!(artifact.source.contains("v2.data[tima_pixel_2 + 2]"));
+        assert!(!artifact.source.contains("v2.data[tima_pixel_2 + 3] ="));
     }
 
     #[test]

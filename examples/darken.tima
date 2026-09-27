@@ -1,0 +1,9 @@
+transform darken(img: Image, factor: f32) -> Image {
+    for p in img.pixels {
+        p.r *= factor
+        p.g *= factor
+        p.b *= factor
+    }
+
+    return img
+}
