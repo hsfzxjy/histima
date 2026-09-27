@@ -3014,9 +3014,14 @@ mod tests {
              out = darkened | encode.png\n\
              explicit_default = darkened | encode.png(compression=6)\n\
              fast = darkened | encode.png(compression=1)\n\
+             webp_default = darkened | encode.webp\n\
+             webp_explicit = darkened | encode.webp(quality=85)\n\
+             webp_low = darkened | encode.webp(quality=25)\n\
              replayed = replay(out)\n\
              replayed_fast = replay(fast)\n\
-             derivation = trace(out)\n",
+             replayed_webp = replay(webp_low)\n\
+             derivation = trace(out)\n\
+             webp_derivation = trace(webp_default)\n",
         )
         .unwrap();
         let generated = CBackend.emit(&compiled.transforms).unwrap();
@@ -3084,6 +3089,53 @@ mod tests {
         assert_eq!(defaulted.arguments[1].name.as_ref(), "compression");
         assert_eq!(defaulted.arguments[1].value, RecordedValue::Integer(6));
         assert_eq!(fast.arguments[1].value, RecordedValue::Integer(1));
+        let ValueData::Bytes(webp_bytes) = &execution.bindings["webp_default"].data else {
+            panic!("expected WebP bytes")
+        };
+        assert_eq!(&webp_bytes[..4], b"RIFF");
+        assert_eq!(&webp_bytes[8..12], b"WEBP");
+        let decoded_webp = webp_rust::decode(webp_bytes).unwrap();
+        assert_eq!(decoded_webp.width, 2);
+        assert_eq!(decoded_webp.height, 1);
+        assert_eq!(decoded_webp.rgba[3], 255);
+        assert_eq!(decoded_webp.rgba[7], 128);
+        assert_eq!(
+            execution.bindings["replayed_webp"].data,
+            execution.bindings["webp_low"].data
+        );
+        let LineageNode::Invocation(webp_default) = execution.bindings["webp_default"]
+            .lineage
+            .as_ref()
+            .expect("WebP output has lineage")
+            .node()
+        else {
+            panic!("expected invocation lineage")
+        };
+        let LineageNode::Invocation(webp_explicit) = execution.bindings["webp_explicit"]
+            .lineage
+            .as_ref()
+            .expect("WebP output has lineage")
+            .node()
+        else {
+            panic!("expected invocation lineage")
+        };
+        let LineageNode::Invocation(webp_low) = execution.bindings["webp_low"]
+            .lineage
+            .as_ref()
+            .expect("WebP output has lineage")
+            .node()
+        else {
+            panic!("expected invocation lineage")
+        };
+        assert_eq!(webp_default.recipe_id, webp_explicit.recipe_id);
+        assert_ne!(webp_default.recipe_id, webp_low.recipe_id);
+        assert_eq!(webp_default.arguments[1].name.as_ref(), "quality");
+        assert_eq!(webp_default.arguments[1].value, RecordedValue::Integer(85));
+        assert_eq!(webp_low.arguments[1].value, RecordedValue::Integer(25));
+        let ValueData::Lineage(webp_lineage) = &execution.bindings["webp_derivation"].data else {
+            panic!("expected lineage")
+        };
+        assert!(webp_lineage.render().contains("invoke encode.webp"));
         let ValueData::Lineage(lineage) = &execution.bindings["derivation"].data else {
             panic!("expected lineage")
         };

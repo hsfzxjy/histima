@@ -265,12 +265,12 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
 }
 
 #[test]
-fn cli_runs_records_and_replays_a_png_pipeline() {
+fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");
     let source = test.path().join("source.png");
     let script = test.path().join("pipeline.tima");
-    let output = test.path().join("darkened.png");
+    let output = test.path().join("darkened.webp");
     fs::write(
         &source,
         encode_test_png(2, 1, &[100, 50, 20, 255, 200, 100, 50, 128]),
@@ -290,7 +290,7 @@ fn cli_runs_records_and_replays_a_png_pipeline() {
                  }}\n\
                  return img\n\
              }}\n\
-             out = source | decode.png | darken(0.5) | encode.png\n\
+             out = source | decode.png | darken(0.5) | encode.webp\n\
              saved = out | save({output_locator:?})\n"
         ),
     )
@@ -301,16 +301,15 @@ fn cli_runs_records_and_replays_a_png_pipeline() {
     let run = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&run);
     assert!(stdout(&run).contains("native_cache = miss"));
-    assert_eq!(
-        decode_test_png(&fs::read(&output).unwrap()),
-        vec![50, 25, 10, 255, 100, 50, 25, 128]
-    );
+    let encoded = fs::read(&output).unwrap();
+    assert_eq!(&encoded[..4], b"RIFF");
+    assert_eq!(&encoded[8..12], b"WEBP");
     let recipe_id = field(&run, "recipe_id");
 
     let source_text = fs::read_to_string(&script).unwrap();
     fs::write(
         &script,
-        source_text.replace("| encode.png\n", "| encode.png(compression=6)\n"),
+        source_text.replace("| encode.webp\n", "| encode.webp(quality=85)\n"),
     )
     .unwrap();
     fs::remove_file(&output).unwrap();
@@ -323,7 +322,7 @@ fn cli_runs_records_and_replays_a_png_pipeline() {
     assert_success(&trace);
     assert!(stdout(&trace).contains("invoke decode.png"));
     assert!(stdout(&trace).contains("invoke darken"));
-    assert!(stdout(&trace).contains("invoke encode.png"));
+    assert!(stdout(&trace).contains("invoke encode.webp"));
 
     let replay = histima(["replay", text(&workspace), text(&script), &recipe_id]);
     assert_success(&replay);
@@ -382,17 +381,6 @@ fn encode_test_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
         writer.finish().unwrap();
     }
     encoded
-}
-
-fn decode_test_png(encoded: &[u8]) -> Vec<u8> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(encoded));
-    let mut reader = decoder.read_info().unwrap();
-    let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
-    let output = reader.next_frame(&mut pixels).unwrap();
-    assert_eq!(output.color_type, png::ColorType::Rgba);
-    assert_eq!(output.bit_depth, png::BitDepth::Eight);
-    pixels.truncate(output.buffer_size());
-    pixels
 }
 
 struct TestDirectory(PathBuf);

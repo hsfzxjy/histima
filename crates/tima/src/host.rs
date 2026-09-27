@@ -12,6 +12,8 @@ const PPM_TRANSFORM_VERSION: u32 = 1;
 const PNG_DECODE_TRANSFORM_VERSION: u32 = 1;
 const PNG_ENCODE_TRANSFORM_VERSION: u32 = 2;
 const PNG_DEFAULT_COMPRESSION: i64 = 6;
+const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 1;
+const WEBP_DEFAULT_QUALITY: i64 = 85;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostTransform {
@@ -19,6 +21,7 @@ pub(crate) enum HostTransform {
     EncodePpm,
     DecodePng,
     EncodePng,
+    EncodeWebp,
 }
 
 impl HostTransform {
@@ -28,6 +31,7 @@ impl HostTransform {
             "encode.ppm" => Some(Self::EncodePpm),
             "decode.png" => Some(Self::DecodePng),
             "encode.png" => Some(Self::EncodePng),
+            "encode.webp" => Some(Self::EncodeWebp),
             _ => None,
         }
     }
@@ -38,6 +42,7 @@ impl HostTransform {
             Self::EncodePpm,
             Self::DecodePng,
             Self::EncodePng,
+            Self::EncodeWebp,
         ]
         .into_iter()
         .find(|transform| transform.identity() == identity)
@@ -49,6 +54,7 @@ impl HostTransform {
             Self::EncodePpm => "encode.ppm",
             Self::DecodePng => "decode.png",
             Self::EncodePng => "encode.png",
+            Self::EncodeWebp => "encode.webp",
         }
     }
 
@@ -57,6 +63,7 @@ impl HostTransform {
             Self::DecodePpm | Self::DecodePng => &["asset"],
             Self::EncodePpm => &["image"],
             Self::EncodePng => &["image", "compression"],
+            Self::EncodeWebp => &["image", "quality"],
         }
     }
 
@@ -65,6 +72,9 @@ impl HostTransform {
             (Self::EncodePng, 1) => Some(OuterValue::plain(ValueData::Integer(
                 PNG_DEFAULT_COMPRESSION,
             ))),
+            (Self::EncodeWebp, 1) => {
+                Some(OuterValue::plain(ValueData::Integer(WEBP_DEFAULT_QUALITY)))
+            }
             _ => None,
         }
     }
@@ -74,6 +84,7 @@ impl HostTransform {
             Self::DecodePpm | Self::EncodePpm => PPM_TRANSFORM_VERSION,
             Self::DecodePng => PNG_DECODE_TRANSFORM_VERSION,
             Self::EncodePng => PNG_ENCODE_TRANSFORM_VERSION,
+            Self::EncodeWebp => WEBP_ENCODE_TRANSFORM_VERSION,
         };
         host_transform_identity(self.name(), version)
     }
@@ -153,7 +164,7 @@ impl HostTransform {
                     decode_bytes: Some(bytes),
                 })
             }
-            Self::EncodePpm | Self::EncodePng => {
+            Self::EncodePpm | Self::EncodePng | Self::EncodeWebp => {
                 let ValueData::Image(image) = &arguments[0].0.data else {
                     return Err(Diagnostic::error(
                         format!("{} expects an image value", self.name()),
@@ -176,6 +187,20 @@ impl HostTransform {
                     if !(1..=9).contains(&compression) {
                         return Err(Diagnostic::error(
                             "encode.png compression must be an integer from 1 through 9",
+                            arguments[1].1,
+                        ));
+                    }
+                }
+                if self == Self::EncodeWebp {
+                    let ValueData::Integer(quality) = arguments[1].0.data else {
+                        return Err(Diagnostic::error(
+                            "encode.webp quality must be an integer from 0 through 100",
+                            arguments[1].1,
+                        ));
+                    };
+                    if !(0..=100).contains(&quality) {
+                        return Err(Diagnostic::error(
+                            "encode.webp quality must be an integer from 0 through 100",
                             arguments[1].1,
                         ));
                     }
@@ -221,6 +246,16 @@ impl PreparedHostInvocation {
                     unreachable!("prepared encode.png compression is an integer")
                 };
                 encode_png(image, compression as u8, self.arguments[0].1)
+                    .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::from(bytes))))
+            }
+            HostTransform::EncodeWebp => {
+                let ValueData::Image(image) = &self.arguments[0].0.data else {
+                    unreachable!("prepared encode.webp argument is an image")
+                };
+                let ValueData::Integer(quality) = self.arguments[1].0.data else {
+                    unreachable!("prepared encode.webp quality is an integer")
+                };
+                encode_webp(image, quality as u8, self.arguments[0].1)
                     .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::from(bytes))))
             }
         }
@@ -469,6 +504,47 @@ fn encode_png(image: &ImageValue, compression: u8, span: Span) -> Result<Vec<u8>
     Ok(encoded)
 }
 
+fn encode_webp(image: &ImageValue, quality: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
+    const MAX_DIMENSION: usize = 16_383;
+    if image.width() == 0
+        || image.height() == 0
+        || image.width() > MAX_DIMENSION
+        || image.height() > MAX_DIMENSION
+    {
+        return Err(Diagnostic::error(
+            "encode.webp dimensions must each be from 1 through 16383",
+            span,
+        ));
+    }
+    let row_length = image
+        .width()
+        .checked_mul(4)
+        .ok_or_else(|| Diagnostic::error("encode.webp row byte length overflows usize", span))?;
+    let packed_length = row_length
+        .checked_mul(image.height())
+        .ok_or_else(|| Diagnostic::error("encode.webp image byte length overflows usize", span))?;
+    let mut packed = Vec::with_capacity(packed_length);
+    for row in 0..image.height() {
+        let start = row
+            .checked_mul(image.stride())
+            .ok_or_else(|| Diagnostic::error("encode.webp row offset overflows usize", span))?;
+        packed.extend_from_slice(&image.bytes()[start..start + row_length]);
+    }
+
+    let input = webp_rust::ImageBuffer {
+        width: image.width(),
+        height: image.height(),
+        rgba: packed,
+    };
+    let config = webp_rust::LossyEncodingConfig {
+        quality: f32::from(quality),
+        ..webp_rust::LossyEncodingConfig::default()
+    };
+    webp_rust::encode_lossy_with_config(&input, &config, None).map_err(|error| {
+        Diagnostic::error(format!("encode.webp could not encode image: {error}"), span)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +622,67 @@ mod tests {
         };
         assert_eq!(diagnostic.labels[0].span, compression_span);
         assert!(diagnostic.message.contains("integer from 1 through 9"));
+    }
+
+    #[test]
+    fn webp_encoding_is_deterministic_preserves_alpha_and_ignores_row_padding() {
+        let image =
+            ImageValue::new_rgba8(2, 1, 10, vec![1, 2, 3, 4, 200, 150, 100, 50, 99, 100]).unwrap();
+
+        let first = encode_webp(&image, 85, Span::default()).unwrap();
+        let second = encode_webp(&image, 85, Span::default()).unwrap();
+        let low_quality = encode_webp(&image, 25, Span::default()).unwrap();
+        let decoded = webp_rust::decode(&first).unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(first, low_quality);
+        assert_eq!(&first[..4], b"RIFF");
+        assert_eq!(&first[8..12], b"WEBP");
+        assert_eq!(decoded.width, 2);
+        assert_eq!(decoded.height, 1);
+        assert_eq!(decoded.rgba[3], 4);
+        assert_eq!(decoded.rgba[7], 50);
+        assert_eq!(
+            byte_content_identity(&first).to_string(),
+            "6400962f906dc5e89d77e8683feef279f5515e2d346423e763feffb207b22c74"
+        );
+    }
+
+    #[test]
+    fn webp_quality_is_source_spanned_and_range_checked() {
+        let image = OuterValue::image(ImageValue::new_rgba8(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
+        let quality_span = Span::new(17, 20);
+
+        for quality in [-1, 101] {
+            let diagnostic = match HostTransform::EncodeWebp.prepare(
+                vec![
+                    (image.clone(), Span::new(0, 5)),
+                    (OuterValue::plain(ValueData::Integer(quality)), quality_span),
+                ],
+                None,
+                Span::new(0, 20),
+            ) {
+                Err(diagnostic) => diagnostic,
+                Ok(_) => panic!("out-of-range quality was accepted"),
+            };
+
+            assert_eq!(diagnostic.labels[0].span, quality_span);
+            assert!(diagnostic.message.contains("integer from 0 through 100"));
+        }
+
+        let diagnostic = match HostTransform::EncodeWebp.prepare(
+            vec![
+                (image, Span::new(0, 5)),
+                (OuterValue::plain(ValueData::Float(85.0)), quality_span),
+            ],
+            None,
+            Span::new(0, 20),
+        ) {
+            Err(diagnostic) => diagnostic,
+            Ok(_) => panic!("non-integer quality was accepted"),
+        };
+        assert_eq!(diagnostic.labels[0].span, quality_span);
+        assert!(diagnostic.message.contains("integer from 0 through 100"));
     }
 
     #[test]

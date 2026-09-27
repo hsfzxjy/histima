@@ -161,6 +161,13 @@ recipe that replay restores exactly. Fixed-setting or codec changes must bump
 the encoder host-transform implementation version so existing Recipe IDs cannot
 silently acquire different output semantics.
 
+Lossy still-image WebP output is available as `encode.webp(quality=85)`.
+Quality is an integer from 0 through 100 with a canonical default of 85.
+Encoding preserves alpha losslessly, removes row padding, emits no inherited
+metadata, and uses an exactly pinned pure-Rust codec with fixed configuration
+defaults. Omitted and explicit default quality produce the same Recipe ID;
+other qualities are distinct recorded recipes. WebP decoding remains deferred.
+
 Encoded bytes can be persisted with the outer sink
 `bytes | save("output.ppm")`. Saving requires an explicit host asset-output
 capability and returns the same immutable value with the same derivation

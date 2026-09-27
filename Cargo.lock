@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "bin-rs"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23f756521115a60a84bc45722261eaf03aa6a59d886c9c3b41d08ac1c39e3e24"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -306,6 +312,7 @@ name = "tima"
 version = "0.1.0"
 dependencies = [
  "png",
+ "webp-rust",
 ]
 
 [[package]]
@@ -363,6 +370,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "webp-rust"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9c8776fe97ff9083d2c7ebb62dd98f643124c2ce94cb50a7bbf1dfea5deb5a0"
+dependencies = [
+ "bin-rs",
 ]
 
 [[package]]
