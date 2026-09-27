@@ -403,34 +403,90 @@ impl<'a> Lowerer<'a> {
             );
             return;
         }
-        let Some(value) = self.expression(assignment.value) else {
-            return;
-        };
-        let actual_value = self.values[value.0 as usize].ty;
-        if actual_value != Type::U8 {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    format!(
-                        "image byte assignment requires u8, not {}",
-                        actual_value.name()
-                    ),
-                    self.program.expr(assignment.value).span,
-                )
-                .with_note("the initial loop supports a loop-invariant u8 fill value"),
+        let image_name_span = self.environment[image_name].1;
+        if !expression_mentions_name(self.program, assignment.value, binding) {
+            let Some(value) = self.expression(assignment.value) else {
+                return;
+            };
+            if !self.require_byte_loop_result(value, assignment.value) {
+                return;
+            }
+            self.moved.insert(image);
+            let filled = self.alloc(
+                Type::Image,
+                ValueKind::ImageFill { image, value },
+                span,
+                true,
             );
+            self.environment
+                .insert(image_name.clone(), (filled, image_name_span));
             return;
         }
 
-        let image_name_span = self.environment[image_name].1;
+        let moved_before = self.moved.clone();
         self.moved.insert(image);
-        let filled = self.alloc(
+        let element = self.alloc(Type::U8, ValueKind::ImageByteElement, binding_span, false);
+        self.environment
+            .insert(binding.to_owned(), (element, binding_span));
+        let instruction_start = self.blocks[self.current_block.0 as usize]
+            .instructions
+            .len();
+        let value = self.expression(assignment.value);
+        let instructions = self.blocks[self.current_block.0 as usize]
+            .instructions
+            .split_off(instruction_start);
+        self.environment.remove(binding);
+        let Some(value) = value else {
+            return;
+        };
+        if !self.require_byte_loop_result(value, assignment.value) {
+            return;
+        }
+        if self
+            .moved
+            .iter()
+            .any(|moved| *moved != image && !moved_before.contains(moved))
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "image byte loop expression cannot consume another owned value",
+                    self.program.expr(assignment.value).span,
+                )
+                .with_note("loop-carried ownership for additional values is not implemented yet"),
+            );
+            return;
+        }
+        let mapped = self.alloc(
             Type::Image,
-            ValueKind::ImageFill { image, value },
+            ValueKind::ImageByteMap {
+                image,
+                element,
+                instructions,
+                result: value,
+            },
             span,
             true,
         );
         self.environment
-            .insert(image_name.clone(), (filled, image_name_span));
+            .insert(image_name.clone(), (mapped, image_name_span));
+    }
+
+    fn require_byte_loop_result(&mut self, value: ValueId, syntax: ExprId) -> bool {
+        let actual_value = self.values[value.0 as usize].ty;
+        if actual_value == Type::U8 {
+            return true;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "image byte assignment requires u8, not {}",
+                    actual_value.name()
+                ),
+                self.program.expr(syntax).span,
+            )
+            .with_note("the loop assignment must produce one byte for each input byte"),
+        );
+        false
     }
 
     fn local_binding(&mut self, binding: &ast::Binding) {
@@ -899,6 +955,35 @@ fn inner_statement_span(statement: &InnerStmt) -> crate::source::Span {
         InnerStmt::Return { span, .. }
         | InnerStmt::If { span, .. }
         | InnerStmt::For { span, .. } => *span,
+    }
+}
+
+fn expression_mentions_name(program: &ast::Program, expression: ExprId, name: &str) -> bool {
+    match &program.expr(expression).kind {
+        ExprKind::Name(candidate) => candidate == name,
+        ExprKind::List(values) => values
+            .iter()
+            .any(|value| expression_mentions_name(program, *value, name)),
+        ExprKind::Record(fields) => fields
+            .iter()
+            .any(|field| expression_mentions_name(program, field.value, name)),
+        ExprKind::Call { arguments, .. } => arguments
+            .iter()
+            .any(|argument| expression_mentions_name(program, argument.value, name)),
+        ExprKind::Member { receiver, .. } => expression_mentions_name(program, *receiver, name),
+        ExprKind::Binary { left, right, .. } => {
+            expression_mentions_name(program, *left, name)
+                || expression_mentions_name(program, *right, name)
+        }
+        ExprKind::Pipeline { input, stage } => {
+            expression_mentions_name(program, *input, name)
+                || expression_mentions_name(program, *stage, name)
+        }
+        ExprKind::Null
+        | ExprKind::Bool(_)
+        | ExprKind::Integer(_)
+        | ExprKind::Float(_)
+        | ExprKind::String(_) => false,
     }
 }
 
@@ -1374,6 +1459,55 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("already been moved"))
         );
+    }
+
+    #[test]
+    fn lowers_byte_dependent_image_loop_to_structured_map_ir() {
+        let compiled = compile(
+            "map.tima",
+            "transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
+                 if current == target { return replacement } else { return current }\n\
+             }\n\
+             transform replace(img: Image, target: u8, replacement: u8) -> Image {\n\
+                 for byte in img.bytes { byte = choose(byte, target, replacement) }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let transform = &compiled.transforms.transforms[1];
+        assert_eq!(transform.blocks[0].instructions, [ir::ValueId(5)]);
+        assert!(matches!(
+            &transform.values[3].kind,
+            ir::ValueKind::ImageByteElement
+        ));
+        assert!(matches!(
+            &transform.values[5].kind,
+            ir::ValueKind::ImageByteMap {
+                image: ir::ValueId(0),
+                element: ir::ValueId(3),
+                instructions,
+                result: ir::ValueId(4),
+            } if instructions == &[ir::ValueId(4)]
+        ));
+        assert!(matches!(
+            transform.blocks[0].terminator,
+            ir::Terminator::Return(ir::ValueId(5))
+        ));
+
+        let diagnostics = compile(
+            "consume.tima",
+            "transform steal(img: Image, value: u8) -> u8 { return value }\n\
+             transform bad(img: Image, other: Image, value: u8) -> Image {\n\
+                 for byte in img.bytes { byte = steal(other, byte) }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot consume another owned value")
+        }));
     }
 
     #[test]

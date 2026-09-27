@@ -9,7 +9,7 @@ use crate::ir::{Constant, RuntimeCall, Terminator, Transform, TypedModule, Value
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CBackend;
 
-pub const C_BACKEND_VERSION: &str = "8";
+pub const C_BACKEND_VERSION: &str = "9";
 
 impl NativeBackend for CBackend {
     fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>> {
@@ -113,14 +113,7 @@ impl NativeBackend for CBackend {
             for (block_index, block) in transform.blocks.iter().enumerate() {
                 writeln!(source, "tima_t{index}_b{block_index}:").unwrap();
                 for id in &block.instructions {
-                    writeln!(
-                        source,
-                        "    v{} = {};",
-                        id.0,
-                        expression(transform, index, *id)
-                    )
-                    .unwrap();
-                    writeln!(source, "    (void)v{};", id.0).unwrap();
+                    emit_instruction(&mut source, transform, index, *id);
                 }
                 match block.terminator {
                     Terminator::Return(value) => {
@@ -159,6 +152,63 @@ impl NativeBackend for CBackend {
             source,
         })
     }
+}
+
+fn emit_instruction(
+    output: &mut String,
+    transform: &Transform,
+    transform_index: usize,
+    id: ValueId,
+) {
+    if let ValueKind::ImageByteMap {
+        image,
+        element,
+        instructions,
+        result,
+    } = &transform.value(id).kind
+    {
+        writeln!(output, "    v{} = {};", id.0, value_name(transform, *image)).unwrap();
+        writeln!(
+            output,
+            "    for (size_t tima_byte_index_{} = 0, tima_byte_len_{} = v{}.height * v{}.stride; tima_byte_index_{} < tima_byte_len_{}; ++tima_byte_index_{}) {{",
+            id.0, id.0, id.0, id.0, id.0, id.0, id.0,
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "        v{} = v{}.data[tima_byte_index_{}];",
+            element.0, id.0, id.0,
+        )
+        .unwrap();
+        for instruction in instructions {
+            writeln!(
+                output,
+                "        v{} = {};",
+                instruction.0,
+                expression(transform, transform_index, *instruction),
+            )
+            .unwrap();
+        }
+        writeln!(
+            output,
+            "        v{}.data[tima_byte_index_{}] = {};",
+            id.0,
+            id.0,
+            value_name(transform, *result),
+        )
+        .unwrap();
+        output.push_str("    }\n");
+        writeln!(output, "    (void)v{};", id.0).unwrap();
+        return;
+    }
+    writeln!(
+        output,
+        "    v{} = {};",
+        id.0,
+        expression(transform, transform_index, id)
+    )
+    .unwrap();
+    writeln!(output, "    (void)v{};", id.0).unwrap();
 }
 
 fn abi_adapter(output: &mut String, index: usize, transform: &Transform) {
@@ -263,6 +313,9 @@ fn expression(transform: &Transform, transform_index: usize, id: ValueId) -> Str
             value_name(transform, *image),
             value_name(transform, *value)
         ),
+        ValueKind::ImageByteElement | ValueKind::ImageByteMap { .. } => {
+            unreachable!("structured byte-loop values are emitted by emit_instruction")
+        }
         ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
             let bytes = name
                 .as_bytes()
@@ -396,6 +449,33 @@ mod tests {
         assert!(artifact.source.contains("image.data[index] = value;"));
         assert!(artifact.source.contains("v2 = tima_image_fill(p0, p1);"));
         assert!(artifact.source.contains("return v2;"));
+    }
+
+    #[test]
+    fn emits_structured_byte_dependent_image_loop() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
+                 if current == target { return replacement } else { return current }\n\
+             }\n\
+             transform replace(img: Image, target: u8, replacement: u8) -> Image {\n\
+                 for byte in img.bytes { byte = choose(byte, target, replacement) }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let artifact = super::CBackend.emit(&compiled.transforms).unwrap();
+        assert!(artifact.source.contains("v5 = p0;"));
+        assert!(artifact.source.contains(
+            "for (size_t tima_byte_index_5 = 0, tima_byte_len_5 = v5.height * v5.stride;"
+        ));
+        assert!(artifact.source.contains("v3 = v5.data[tima_byte_index_5];"));
+        assert!(
+            artifact
+                .source
+                .contains("v4 = tima_transform_0(runtime, v3, p1, p2);")
+        );
+        assert!(artifact.source.contains("v5.data[tima_byte_index_5] = v4;"));
     }
 
     #[test]

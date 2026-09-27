@@ -119,6 +119,17 @@ pub enum ValueKind {
         image: ValueId,
         value: ValueId,
     },
+    /// Per-iteration `u8` value supplied by an enclosing `ImageByteMap`.
+    /// It is not an ordinary block instruction or a native boundary value.
+    ImageByteElement,
+    /// Consumes one uniquely owned image and evaluates a scalar instruction
+    /// sequence once per byte, storing the `u8` result back into that byte.
+    ImageByteMap {
+        image: ValueId,
+        element: ValueId,
+        instructions: Vec<ValueId>,
+        result: ValueId,
+    },
     RuntimeCall(RuntimeCall),
 }
 

@@ -13,7 +13,7 @@ use crate::cache::TransformResultCache;
 use crate::capability::{CapabilitySession, RuntimeCapabilities, observe_dependency};
 use crate::diagnostic::Diagnostic;
 use crate::identity::{ContentIdentity, content_identity};
-use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueKind};
+use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueId, ValueKind};
 use crate::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
 use crate::source::Span;
 
@@ -1368,73 +1368,8 @@ impl IrInterpreter<'_> {
         loop {
             let block = &transform.blocks[current.0 as usize];
             for id in &block.instructions {
-                let value = transform.value(*id);
-                let evaluated = match &value.kind {
-                    ValueKind::Parameter { .. } => unreachable!(),
-                    ValueKind::Constant(constant) => InterpretedValue::Scalar(match constant {
-                        Constant::Bool(value) => NativeScalar::Bool(*value),
-                        Constant::I64(value) => NativeScalar::I64(*value),
-                        Constant::F32(value) => NativeScalar::F32(*value),
-                    }),
-                    ValueKind::Binary { op, left, right } => {
-                        InterpretedValue::Scalar(native_binary(
-                            *op,
-                            values[left.0 as usize].as_ref().unwrap().scalar(),
-                            values[right.0 as usize].as_ref().unwrap().scalar(),
-                            value.span,
-                        )?)
-                    }
-                    ValueKind::Call {
-                        transform: callee,
-                        arguments,
-                    } => {
-                        let callee_transform = self.module.get(*callee);
-                        let call_arguments = arguments
-                            .iter()
-                            .zip(&callee_transform.parameters)
-                            .map(|(argument, parameter)| {
-                                transfer_interpreted_argument(
-                                    &mut values[argument.0 as usize],
-                                    parameter.ty,
-                                )
-                            })
-                            .collect();
-                        self.invoke_lowered_at_depth(
-                            *callee,
-                            call_arguments,
-                            depth + 1,
-                            capabilities,
-                        )?
-                    }
-                    ValueKind::ImageZero { image } => {
-                        let Some(InterpretedValue::Image(mut image)) =
-                            values[image.0 as usize].take()
-                        else {
-                            unreachable!("typed image_zero input is an available owned image")
-                        };
-                        image.storage.bytes.fill(0);
-                        InterpretedValue::Image(image)
-                    }
-                    ValueKind::ImageFill { image, value: fill } => {
-                        let NativeScalar::U8(fill) =
-                            values[fill.0 as usize].as_ref().unwrap().scalar()
-                        else {
-                            unreachable!("typed image_fill value is u8")
-                        };
-                        let Some(InterpretedValue::Image(mut image)) =
-                            values[image.0 as usize].take()
-                        else {
-                            unreachable!("typed image_fill input is an available owned image")
-                        };
-                        image.storage.bytes.fill(fill);
-                        InterpretedValue::Image(image)
-                    }
-                    ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
-                        InterpretedValue::Scalar(NativeScalar::I64(
-                            capabilities.environment_i64(name, value.span)?,
-                        ))
-                    }
-                };
+                let evaluated =
+                    self.evaluate_instruction(transform, *id, &mut values, depth, capabilities)?;
                 values[id.0 as usize] = Some(evaluated);
             }
             match block.terminator {
@@ -1455,6 +1390,106 @@ impl IrInterpreter<'_> {
                 }
             }
         }
+    }
+
+    fn evaluate_instruction(
+        &self,
+        transform: &crate::ir::Transform,
+        id: ValueId,
+        values: &mut [Option<InterpretedValue>],
+        depth: usize,
+        capabilities: &mut CapabilitySession<'_>,
+    ) -> Result<InterpretedValue, Diagnostic> {
+        let value = transform.value(id);
+        Ok(match &value.kind {
+            ValueKind::Parameter { .. } | ValueKind::ImageByteElement => unreachable!(),
+            ValueKind::Constant(constant) => InterpretedValue::Scalar(match constant {
+                Constant::Bool(value) => NativeScalar::Bool(*value),
+                Constant::I64(value) => NativeScalar::I64(*value),
+                Constant::F32(value) => NativeScalar::F32(*value),
+            }),
+            ValueKind::Binary { op, left, right } => InterpretedValue::Scalar(native_binary(
+                *op,
+                values[left.0 as usize].as_ref().unwrap().scalar(),
+                values[right.0 as usize].as_ref().unwrap().scalar(),
+                value.span,
+            )?),
+            ValueKind::Call {
+                transform: callee,
+                arguments,
+            } => {
+                let callee_transform = self.module.get(*callee);
+                let call_arguments = arguments
+                    .iter()
+                    .zip(&callee_transform.parameters)
+                    .map(|(argument, parameter)| {
+                        transfer_interpreted_argument(
+                            &mut values[argument.0 as usize],
+                            parameter.ty,
+                        )
+                    })
+                    .collect();
+                self.invoke_lowered_at_depth(*callee, call_arguments, depth + 1, capabilities)?
+            }
+            ValueKind::ImageZero { image } => {
+                let Some(InterpretedValue::Image(mut image)) = values[image.0 as usize].take()
+                else {
+                    unreachable!("typed image_zero input is an available owned image")
+                };
+                image.storage.bytes.fill(0);
+                InterpretedValue::Image(image)
+            }
+            ValueKind::ImageFill { image, value: fill } => {
+                let NativeScalar::U8(fill) = values[fill.0 as usize].as_ref().unwrap().scalar()
+                else {
+                    unreachable!("typed image_fill value is u8")
+                };
+                let Some(InterpretedValue::Image(mut image)) = values[image.0 as usize].take()
+                else {
+                    unreachable!("typed image_fill input is an available owned image")
+                };
+                image.storage.bytes.fill(fill);
+                InterpretedValue::Image(image)
+            }
+            ValueKind::ImageByteMap {
+                image,
+                element,
+                instructions,
+                result,
+            } => {
+                let Some(InterpretedValue::Image(mut image)) = values[image.0 as usize].take()
+                else {
+                    unreachable!("typed image byte map input is an available owned image")
+                };
+                for index in 0..image.storage.bytes.len() {
+                    values[element.0 as usize] = Some(InterpretedValue::Scalar(NativeScalar::U8(
+                        image.storage.bytes[index],
+                    )));
+                    for instruction in instructions {
+                        let evaluated = self.evaluate_instruction(
+                            transform,
+                            *instruction,
+                            values,
+                            depth,
+                            capabilities,
+                        )?;
+                        values[instruction.0 as usize] = Some(evaluated);
+                    }
+                    let NativeScalar::U8(mapped) =
+                        values[result.0 as usize].as_ref().unwrap().scalar()
+                    else {
+                        unreachable!("typed image byte map result is u8")
+                    };
+                    image.storage.bytes[index] = mapped;
+                }
+                InterpretedValue::Image(image)
+            }
+            ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
+                InterpretedValue::Scalar(NativeScalar::I64(
+                    capabilities.environment_i64(name, value.span)?,
+                ))
+            }
+        })
     }
 }
 
@@ -2861,6 +2896,87 @@ mod tests {
         )
         .unwrap_err();
         assert!(diagnostics[0].message.contains("parameter type u8"));
+    }
+
+    #[test]
+    fn byte_dependent_image_loop_matches_reference_and_native_execution() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
+                 if current == target { return replacement } else { return current }\n\
+             }\n\
+             transform replace(img: Image, target: u8, replacement: u8) -> Image {\n\
+                 for byte in img.bytes { byte = choose(byte, target, replacement) }\n\
+                 return img\n\
+             }\n\
+             mapped = replace(img, target, replacement)\n",
+        )
+        .unwrap();
+        let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 1, 3]).unwrap());
+        let input_content = content_identity(&input).unwrap();
+        let input = input.with_lineage(Lineage::observed_source("bytes.raw", input_content));
+        let bindings = BTreeMap::from([
+            ("img".to_owned(), input.clone()),
+            (
+                "target".to_owned(),
+                OuterValue::plain(ValueData::Integer(1)),
+            ),
+            (
+                "replacement".to_owned(),
+                OuterValue::plain(ValueData::Integer(9)),
+            ),
+        ]);
+
+        let reference_engine = IrInterpreter {
+            module: &compiled.transforms,
+            capabilities: None,
+        };
+        let reference = execute_with(&compiled, &reference_engine, bindings.clone(), None).unwrap();
+        let ValueData::Image(reference_image) = &reference.bindings["mapped"].data else {
+            panic!("expected reference image")
+        };
+        assert_eq!(reference_image.bytes(), &[9, 2, 9, 3]);
+
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let mut cache = TransformResultCache::default();
+        let execution =
+            execute_native_with_bindings_cached(&compiled, &native, bindings, &mut cache).unwrap();
+        let ValueData::Image(native_image) = &execution.bindings["mapped"].data else {
+            panic!("expected native image")
+        };
+        assert_eq!(native_image.bytes(), reference_image.bytes());
+        let ValueData::Image(original) = &execution.bindings["img"].data else {
+            panic!("expected original image")
+        };
+        assert_eq!(original.bytes(), &[1, 2, 1, 3]);
+        assert_eq!(
+            reference.bindings["mapped"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id(),
+            execution.bindings["mapped"]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .recipe_id()
+        );
+
+        let recorded = execution.bindings["mapped"].clone();
+        let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
+        cache.invalidate_recipe(recipe);
+        let replayed = replay_native(&compiled, &native, &recorded, &mut cache).unwrap();
+        let ValueData::Image(replayed) = replayed.data else {
+            panic!("expected replayed image")
+        };
+        assert_eq!(replayed.bytes(), &[9, 2, 9, 3]);
     }
 
     #[test]

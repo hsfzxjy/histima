@@ -56,10 +56,13 @@ paths.
 
 The first constrained loop surface is
 `for byte in img.bytes { byte = value }` over an owned `Image`. The body must be
-exactly one loop-invariant `u8` assignment; semantic lowering canonicalizes it
+exactly one assignment producing `u8`. A loop-invariant assignment canonicalizes
 to the same backend-neutral `ImageFill` operation as `image_fill`, so equivalent
-source forms share Transform identity. Reading the byte, nested/general loop
-bodies, and arbitrary indexed mutation are the next language steps.
+source forms share Transform identity. A byte-dependent assignment lowers to a
+structured `ImageByteMap` IR operation containing its typed scalar instruction
+sequence; both the reference interpreter and generated C execute it once per
+byte. General/nested loop statements, arbitrary indexing, and consuming other
+owned values inside the loop remain deferred.
 
 Every checked transform also receives a stable semantic identity derived from
 canonical typed IR and referenced transform identities. Source formatting,

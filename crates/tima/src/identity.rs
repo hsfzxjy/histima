@@ -223,6 +223,22 @@ impl TransformIdentityResolver<'_> {
                     hasher.u32(image.0);
                     hasher.u32(value.0);
                 }
+                ValueKind::ImageByteElement => hasher.u8(7),
+                ValueKind::ImageByteMap {
+                    image,
+                    element,
+                    instructions,
+                    result,
+                } => {
+                    hasher.u8(8);
+                    hasher.u32(image.0);
+                    hasher.u32(element.0);
+                    hasher.u32(instructions.len() as u32);
+                    for instruction in instructions {
+                        hasher.u32(instruction.0);
+                    }
+                    hasher.u32(result.0);
+                }
                 ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
                     hasher.u8(4);
                     hasher.u8(0);
@@ -864,6 +880,30 @@ mod tests {
         assert_eq!(
             builtin.identities.get(TransformId(0)),
             loop_surface.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
+    fn image_byte_map_identity_ignores_loop_binding_name() {
+        let first = crate::compile(
+            "first.tima",
+            "transform keep(img: Image) -> Image {\n\
+                 for byte in img.bytes { byte = byte }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let second = crate::compile(
+            "second.tima",
+            "transform keep(img: Image) -> Image {\n\
+                 for element in img.bytes { element = element }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first.identities.get(TransformId(0)),
+            second.identities.get(TransformId(0))
         );
     }
 
