@@ -10,8 +10,11 @@ use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::native::{AbiImage, AbiImageView, AbiRuntime, AbiValue, NativeModule};
 use crate::cache::TransformResultCache;
-use crate::capability::{CapabilitySession, RuntimeCapabilities, observe_dependency};
+use crate::capability::{
+    ASSET_CAPABILITY, CapabilitySession, RuntimeCapabilities, observe_dependency,
+};
 use crate::diagnostic::Diagnostic;
+use crate::host::{HostTransform, prepare_host_invocation};
 use crate::identity::{ContentIdentity, content_identity};
 use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueId, ValueKind};
 use crate::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
@@ -52,6 +55,7 @@ pub enum ValueData {
     Integer(i64),
     Float(f32),
     String(Arc<str>),
+    Bytes(Arc<[u8]>),
     List(Arc<[OuterValue]>),
     Record(Arc<BTreeMap<String, OuterValue>>),
     Asset(Arc<AssetValue>),
@@ -582,6 +586,10 @@ trait TransformEngine {
     fn may_observe_dependencies(&self, _id: TransformId) -> bool {
         false
     }
+
+    fn capabilities(&self) -> Option<&dyn RuntimeCapabilities> {
+        None
+    }
 }
 
 struct TransformOutcome {
@@ -676,6 +684,66 @@ fn invoke_transform_with_lineage(
     Ok(value)
 }
 
+fn invoke_host_transform_with_lineage(
+    transform: HostTransform,
+    engine: &dyn TransformEngine,
+    arguments: Vec<(OuterValue, Span)>,
+    mut cache: Option<&mut TransformResultCache>,
+    span: Span,
+) -> Result<OuterValue, Diagnostic> {
+    let prepared = prepare_host_invocation(transform, arguments, engine.capabilities(), span)?;
+    let recorded = transform
+        .parameters()
+        .iter()
+        .zip(&prepared.arguments)
+        .map(|(name, (argument, argument_span))| {
+            LineageArgument::record(*name, argument).map_err(|error| {
+                Diagnostic::error(
+                    format!("cannot record argument `{name}` for host transform lineage: {error}"),
+                    *argument_span,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(cache) = cache.as_deref_mut() {
+        for (recorded, (argument, argument_span)) in recorded.iter().zip(&prepared.arguments) {
+            let RecordedValue::Materialized { content_id, .. } = recorded.value else {
+                continue;
+            };
+            let remembered = cache
+                .remember(argument)
+                .map_err(|error| Diagnostic::error(error.to_string(), *argument_span))?;
+            if remembered != content_id {
+                return Err(Diagnostic::error(
+                    "recorded host-transform argument does not match stored content",
+                    *argument_span,
+                ));
+            }
+        }
+    }
+    let lineage = Lineage::invocation(transform.name(), transform.identity(), recorded, vec![])
+        .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+    let recipe = lineage
+        .recipe_id()
+        .expect("host invocation lineage has a recipe identity");
+    if let Some(cache) = cache.as_deref_mut()
+        && let Some(mut value) = cache
+            .lookup(recipe)
+            .map_err(|error| Diagnostic::error(error.to_string(), span))?
+    {
+        value.lineage = Some(lineage);
+        return Ok(value);
+    }
+    let mut value = prepared.execute(transform)?;
+    if let Some(cache) = cache {
+        cache
+            .store(recipe, &value)
+            .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+    }
+    value.lineage = Some(lineage);
+    Ok(value)
+}
+
 fn replay_with(
     program: &CompiledProgram,
     engine: &dyn TransformEngine,
@@ -708,6 +776,12 @@ fn replay_with(
     )
 }
 
+#[derive(Clone, Copy)]
+enum ReplayTransform {
+    Inner(TransformId),
+    Host(HostTransform),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn replay_lineage(
     program: &CompiledProgram,
@@ -731,23 +805,34 @@ fn replay_lineage(
             span,
         ));
     };
-    let Some(transform_id) = program.identities.find_id(invocation.transform_id) else {
-        return Err(Diagnostic::error(
-            format!(
-                "recorded transform definition {} is unavailable or has changed",
-                invocation.transform_id
-            ),
-            span,
-        ));
+    let replay_transform =
+        if let Some(transform_id) = program.identities.find_id(invocation.transform_id) {
+            ReplayTransform::Inner(transform_id)
+        } else if let Some(host) = HostTransform::from_identity(invocation.transform_id) {
+            ReplayTransform::Host(host)
+        } else {
+            return Err(Diagnostic::error(
+                format!(
+                    "recorded transform definition {} is unavailable or has changed",
+                    invocation.transform_id
+                ),
+                span,
+            ));
+        };
+    let (transform_name, parameter_count) = match replay_transform {
+        ReplayTransform::Inner(id) => {
+            let transform = program.transforms.get(id);
+            (transform.name.as_str(), transform.parameters.len())
+        }
+        ReplayTransform::Host(host) => (host.name(), host.parameters().len()),
     };
-    let transform = program.transforms.get(transform_id);
-    if transform.parameters.len() != invocation.arguments.len() {
+    if parameter_count != invocation.arguments.len() {
         return Err(Diagnostic::error(
             format!(
                 "recorded invocation has {} arguments, but transform `{}` now expects {}",
                 invocation.arguments.len(),
-                transform.name,
-                transform.parameters.len()
+                transform_name,
+                parameter_count
             ),
             span,
         ));
@@ -779,17 +864,39 @@ fn replay_lineage(
         .into_iter()
         .map(|argument| (argument, span))
         .collect::<Vec<_>>();
-    let TransformOutcome {
-        mut value,
-        observations,
-    } = engine.invoke(transform_id, runtime_arguments)?;
-    let observed_lineage = Lineage::invocation(
-        transform.name.as_str(),
-        program.identities.get(transform_id),
-        invocation.arguments.to_vec(),
-        observations,
-    )
-    .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+    let (mut value, observed_lineage) = match replay_transform {
+        ReplayTransform::Inner(transform_id) => {
+            let transform = program.transforms.get(transform_id);
+            let TransformOutcome {
+                value,
+                observations,
+            } = engine.invoke(transform_id, runtime_arguments)?;
+            let lineage = Lineage::invocation(
+                transform.name.as_str(),
+                program.identities.get(transform_id),
+                invocation.arguments.to_vec(),
+                observations,
+            )
+            .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+            (value, lineage)
+        }
+        ReplayTransform::Host(host) => {
+            let prepared =
+                prepare_host_invocation(host, runtime_arguments, engine.capabilities(), span)?;
+            let arguments = host
+                .parameters()
+                .iter()
+                .zip(&prepared.arguments)
+                .map(|(name, (value, argument_span))| {
+                    LineageArgument::record(*name, value)
+                        .map_err(|error| Diagnostic::error(error.to_string(), *argument_span))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let lineage = Lineage::invocation(host.name(), host.identity(), arguments, vec![])
+                .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+            (prepared.execute(host)?, lineage)
+        }
+    };
     let observed_recipe = observed_lineage
         .recipe_id()
         .expect("invocation lineage always has a recipe identity");
@@ -926,6 +1033,57 @@ fn validate_replay_dependencies(
             ));
         }
     }
+    for argument in invocation.arguments.iter() {
+        let Some(lineage) = &argument.lineage else {
+            continue;
+        };
+        match (&argument.value, lineage.node()) {
+            (RecordedValue::Source { .. }, LineageNode::Source(source)) => {
+                let Some(expected) = source.observed_content else {
+                    return Err(Diagnostic::error(
+                        format!("replay source {:?} was never observed", source.locator),
+                        span,
+                    ));
+                };
+                let Some(resolver) = resolver else {
+                    return Err(Diagnostic::error(
+                        format!(
+                            "replay requires an asset resolver for source {:?}",
+                            source.locator
+                        ),
+                        span,
+                    ));
+                };
+                let observed = resolver
+                    .observe(ASSET_CAPABILITY, source.locator.as_bytes())
+                    .map_err(|error| {
+                        Diagnostic::error(
+                            format!("could not validate source {:?}: {error}", source.locator),
+                            span,
+                        )
+                    })?;
+                if observed != expected {
+                    return Err(Diagnostic::error(
+                        format!(
+                            "replay expected source {:?} content {expected} but observed {observed}",
+                            source.locator
+                        ),
+                        span,
+                    ));
+                }
+            }
+            (_, LineageNode::Invocation(parent)) => {
+                validate_replay_dependencies(parent, resolver, span)?;
+            }
+            (_, LineageNode::Source(_)) => {}
+            (_, LineageNode::ExternalObservation(_)) => {
+                return Err(Diagnostic::error(
+                    "replay argument carries invalid observation lineage",
+                    span,
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1040,7 +1198,9 @@ impl Interpreter<'_, '_, '_> {
                     ExprKind::Call { callee, arguments } => {
                         self.call(*callee, arguments, Some(input), expression.span)?
                     }
-                    ExprKind::Name(_) => self.call(*stage, &[], Some(input), expression.span)?,
+                    ExprKind::Name(_) | ExprKind::Member { .. } => {
+                        self.call(*stage, &[], Some(input), expression.span)?
+                    }
                     _ => {
                         return Err(Diagnostic::error(
                             "pipeline stage must be a transform name or call",
@@ -1074,12 +1234,7 @@ impl Interpreter<'_, '_, '_> {
         span: Span,
     ) -> Result<OuterValue, Diagnostic> {
         let callee_expression = self.program.syntax.expr(callee);
-        let ExprKind::Name(name) = &callee_expression.kind else {
-            return Err(Diagnostic::error(
-                "outer calls require a directly named builtin or transform",
-                callee_expression.span,
-            ));
-        };
+        let name = self.callable_name(callee)?;
         let mut evaluated = Vec::new();
         if let Some(input) = pipeline_input {
             evaluated.push((None, input, callee_expression.span));
@@ -1100,7 +1255,74 @@ impl Interpreter<'_, '_, '_> {
         if name == "replay" {
             return self.replay_call(evaluated, span);
         }
-        let Some((id, transform)) = self.program.transforms.find(name) else {
+        if let Some(host_transform) = HostTransform::find(&name) {
+            let parameters = host_transform.parameters();
+            let mut ordered: Vec<Option<(OuterValue, Span)>> = vec![None; parameters.len()];
+            let mut next_positional = 0;
+            for (argument_name, value, argument_span) in evaluated {
+                let index = if let Some(argument_name) = argument_name {
+                    parameters
+                        .iter()
+                        .position(|parameter| *parameter == argument_name)
+                        .ok_or_else(|| {
+                            Diagnostic::error(
+                                format!(
+                                    "{} has no parameter `{argument_name}`",
+                                    host_transform.name()
+                                ),
+                                argument_span,
+                            )
+                        })?
+                } else {
+                    while next_positional < ordered.len() && ordered[next_positional].is_some() {
+                        next_positional += 1;
+                    }
+                    if next_positional == ordered.len() {
+                        return Err(Diagnostic::error(
+                            format!("too many arguments for {}", host_transform.name()),
+                            argument_span,
+                        ));
+                    }
+                    let index = next_positional;
+                    next_positional += 1;
+                    index
+                };
+                if ordered[index].is_some() {
+                    return Err(Diagnostic::error(
+                        format!(
+                            "parameter `{}` is supplied more than once",
+                            parameters[index]
+                        ),
+                        argument_span,
+                    ));
+                }
+                ordered[index] = Some((value, argument_span));
+            }
+            let arguments = ordered
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    value.ok_or_else(|| {
+                        Diagnostic::error(
+                            format!(
+                                "missing argument `{}` for {}",
+                                parameters[index],
+                                host_transform.name()
+                            ),
+                            span,
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return invoke_host_transform_with_lineage(
+                host_transform,
+                self.engine,
+                arguments,
+                self.cache.as_deref_mut(),
+                span,
+            );
+        }
+        let Some((id, transform)) = self.program.transforms.find(&name) else {
             return Err(Diagnostic::error(
                 format!("unknown outer callable `{name}`"),
                 callee_expression.span,
@@ -1165,6 +1387,26 @@ impl Interpreter<'_, '_, '_> {
             values,
             self.cache.as_deref_mut(),
         )
+    }
+
+    fn callable_name(&self, callee: ExprId) -> Result<String, Diagnostic> {
+        let expression = self.program.syntax.expr(callee);
+        match &expression.kind {
+            ExprKind::Name(name) => Ok(name.clone()),
+            ExprKind::Member { receiver, name, .. } => {
+                let ExprKind::Name(namespace) = &self.program.syntax.expr(*receiver).kind else {
+                    return Err(Diagnostic::error(
+                        "outer callable namespaces must be directly named",
+                        expression.span,
+                    ));
+                };
+                Ok(format!("{namespace}.{name}"))
+            }
+            _ => Err(Diagnostic::error(
+                "outer calls require a named builtin or transform",
+                expression.span,
+            )),
+        }
     }
 
     fn asset(
@@ -1236,13 +1478,18 @@ impl Interpreter<'_, '_, '_> {
                 span,
             ));
         }
+        let capabilities = self.engine.capabilities();
+        let resolver = capabilities.map(CapabilityReplayResolver);
+        let dependencies = resolver
+            .as_ref()
+            .map(|resolver| resolver as &dyn ReplayDependencyResolver);
         if let Some(cache) = self.cache.as_deref_mut() {
             replay_with(
                 self.program,
                 self.engine,
                 &arguments[0].1,
                 cache,
-                None,
+                dependencies,
                 span,
             )
         } else {
@@ -1252,7 +1499,7 @@ impl Interpreter<'_, '_, '_> {
                 self.engine,
                 &arguments[0].1,
                 &mut cache,
-                None,
+                dependencies,
                 span,
             )
         }
@@ -1613,6 +1860,10 @@ impl TransformEngine for IrInterpreter<'_> {
     fn may_observe_dependencies(&self, id: TransformId) -> bool {
         transform_may_observe_dependencies(self.module, id)
     }
+
+    fn capabilities(&self) -> Option<&dyn RuntimeCapabilities> {
+        self.capabilities
+    }
 }
 
 struct NativeEngine<'a> {
@@ -1687,6 +1938,10 @@ impl TransformEngine for NativeEngine<'_> {
 
     fn may_observe_dependencies(&self, id: TransformId) -> bool {
         transform_may_observe_dependencies(self.module, id)
+    }
+
+    fn capabilities(&self) -> Option<&dyn RuntimeCapabilities> {
+        self.capabilities
     }
 }
 
@@ -2202,8 +2457,9 @@ mod tests {
         TransformEngine, ValueData, execute, execute_cached, execute_cached_with_capabilities,
         execute_native, execute_native_cached_with_capabilities,
         execute_native_with_bindings_cached, execute_with, invoke_native_transform,
-        lower_native_argument, replay, replay_native, replay_with_capabilities,
-        replay_with_dependencies, scale_rgba8_channel, validate_returned_layout,
+        lower_native_argument, replay, replay_native, replay_native_with_capabilities,
+        replay_with_capabilities, replay_with_dependencies, scale_rgba8_channel,
+        validate_returned_layout,
     };
     use crate::source::Span;
 
@@ -2221,6 +2477,27 @@ mod tests {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| format!("environment value `{name}` is unavailable"))
+        }
+    }
+
+    struct FixedAssets(BTreeMap<String, Vec<u8>>);
+
+    impl FixedAssets {
+        fn one(locator: &str, bytes: &[u8]) -> Self {
+            Self(BTreeMap::from([(locator.to_owned(), bytes.to_vec())]))
+        }
+    }
+
+    impl RuntimeCapabilities for FixedAssets {
+        fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
+            Err(format!("environment value `{name}` is unavailable"))
+        }
+
+        fn read_asset(&self, locator: &str) -> Result<Vec<u8>, String> {
+            self.0
+                .get(locator)
+                .cloned()
+                .ok_or_else(|| format!("asset `{locator}` is unavailable"))
         }
     }
 
@@ -2566,6 +2843,79 @@ mod tests {
         };
         assert_eq!(source.locator.as_ref(), "cat.png");
         assert_eq!(source.observed_content, None);
+    }
+
+    #[test]
+    fn host_ppm_pipeline_runs_native_transform_with_lineage_cache_and_replay() {
+        let compiled = crate::compile(
+            "pipeline.tima",
+            "source = asset(\"cat.ppm\")\n\
+             transform darken(img: Image, factor: f32) -> Image {\n\
+                 for p in img.pixels {\n\
+                     p.r *= factor\n\
+                     p.g *= factor\n\
+                     p.b *= factor\n\
+                 }\n\
+                 return img\n\
+             }\n\
+             decoded = source | decode.ppm\n\
+             darkened = decoded | darken(0.5)\n\
+             out = darkened | encode.ppm\n\
+             replayed = replay(out)\n\
+             derivation = trace(out)\n",
+        )
+        .unwrap();
+        let generated = CBackend.emit(&compiled.transforms).unwrap();
+        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build");
+        let artifact = ClangCompiler::default()
+            .compile(&generated, build_root)
+            .unwrap();
+        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let assets = FixedAssets::one("cat.ppm", b"P3\n2 1\n255\n100 50 20 200 100 50\n");
+        let mut cache = TransformResultCache::default();
+        let execution =
+            execute_native_cached_with_capabilities(&compiled, &native, &mut cache, &assets)
+                .unwrap();
+
+        let ValueData::Bytes(encoded) = &execution.bindings["out"].data else {
+            panic!("expected encoded bytes")
+        };
+        assert_eq!(encoded.as_ref(), b"P3\n2 1\n255\n50 25 10 100 50 25\n");
+        assert_eq!(
+            execution.bindings["replayed"].data,
+            execution.bindings["out"].data
+        );
+        let ValueData::Lineage(lineage) = &execution.bindings["derivation"].data else {
+            panic!("expected lineage")
+        };
+        let rendered = lineage.render();
+        assert!(rendered.contains("source \"cat.ppm\" content="));
+        assert!(rendered.contains("invoke decode.ppm"));
+        assert!(rendered.contains("invoke darken"));
+        assert!(rendered.contains("invoke encode.ppm"));
+
+        let replayed = replay_native_with_capabilities(
+            &compiled,
+            &native,
+            &execution.bindings["out"],
+            &mut TransformResultCache::default(),
+            &assets,
+        )
+        .unwrap();
+        assert_eq!(replayed.data, execution.bindings["out"].data);
+
+        let changed_assets = FixedAssets::one("cat.ppm", b"P3\n2 1\n255\n101 50 20 200 100 50\n");
+        let diagnostic = replay_native_with_capabilities(
+            &compiled,
+            &native,
+            &execution.bindings["out"],
+            &mut cache,
+            &changed_assets,
+        )
+        .unwrap_err();
+        assert!(diagnostic.message.contains("expected source"));
     }
 
     #[test]

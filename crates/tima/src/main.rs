@@ -6,6 +6,7 @@ use tima::backend::NativeBackend;
 use tima::backend::c::CBackend;
 use tima::backend::native::{ClangCompiler, NativeModule};
 use tima::cache::TransformResultCache;
+use tima::capability::RuntimeCapabilities;
 use tima::runtime::{OuterValue, ValueData};
 use tima::source::SourceFile;
 
@@ -69,13 +70,18 @@ fn run() -> Result<(), ()> {
                     eprintln!("error: could not load native transform artifact: {error}");
                 })?;
             let mut result_cache = TransformResultCache::default();
-            let execution =
-                tima::runtime::execute_native_cached(&compiled, &native, &mut result_cache)
-                    .map_err(|diagnostics| {
-                        for diagnostic in diagnostics {
-                            eprint!("{}", diagnostic.render(&compiled.source));
-                        }
-                    })?;
+            let capabilities = CliCapabilities;
+            let execution = tima::runtime::execute_native_cached_with_capabilities(
+                &compiled,
+                &native,
+                &mut result_cache,
+                &capabilities,
+            )
+            .map_err(|diagnostics| {
+                for diagnostic in diagnostics {
+                    eprint!("{}", diagnostic.render(&compiled.source));
+                }
+            })?;
             let unbound_trace = execution.last_value.as_ref().and_then(|last| {
                 let ValueData::Lineage(lineage) = &last.data else {
                     return None;
@@ -106,6 +112,20 @@ fn run() -> Result<(), ()> {
     Ok(())
 }
 
+struct CliCapabilities;
+
+impl RuntimeCapabilities for CliCapabilities {
+    fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
+        Err(format!(
+            "environment value `{name}` was not provided by the CLI"
+        ))
+    }
+
+    fn read_asset(&self, locator: &str) -> Result<Vec<u8>, String> {
+        fs::read(locator).map_err(|error| error.to_string())
+    }
+}
+
 fn display(value: &OuterValue) -> String {
     match &value.data {
         ValueData::Null => "null".to_owned(),
@@ -113,6 +133,7 @@ fn display(value: &OuterValue) -> String {
         ValueData::Integer(value) => value.to_string(),
         ValueData::Float(value) => value.to_string(),
         ValueData::String(value) => format!("{value:?}"),
+        ValueData::Bytes(value) => format!("bytes({})", value.len()),
         ValueData::List(values) => format!(
             "[{}]",
             values.iter().map(display).collect::<Vec<_>>().join(", ")

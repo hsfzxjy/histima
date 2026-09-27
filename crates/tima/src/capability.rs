@@ -4,14 +4,19 @@ use crate::lineage::Lineage;
 use crate::source::Span;
 
 pub const ENVIRONMENT_CAPABILITY: &str = "environment";
+pub const ASSET_CAPABILITY: &str = "asset";
 
-/// Host-mediated external state available to an inner transform.
+/// Host-mediated external state available to Tima execution.
 ///
 /// Tima never falls back to the process environment. Histima must provide an
 /// implementation explicitly, which keeps permission and dependency capture
 /// at the runtime boundary.
 pub trait RuntimeCapabilities {
     fn environment(&self, name: &str) -> Result<Vec<u8>, String>;
+
+    fn read_asset(&self, locator: &str) -> Result<Vec<u8>, String> {
+        Err(format!("asset `{locator}` is unavailable"))
+    }
 }
 
 pub(crate) struct CapabilitySession<'a> {
@@ -79,6 +84,13 @@ pub(crate) fn observe_dependency(
                 .map_err(|_| "recorded environment key is not valid UTF-8".to_owned())?;
             capabilities
                 .environment(name)
+                .map(|value| byte_content_identity(&value))
+        }
+        ASSET_CAPABILITY => {
+            let locator = std::str::from_utf8(key)
+                .map_err(|_| "recorded asset locator is not valid UTF-8".to_owned())?;
+            capabilities
+                .read_asset(locator)
                 .map(|value| byte_content_identity(&value))
         }
         other => Err(format!(

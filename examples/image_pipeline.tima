@@ -1,0 +1,18 @@
+source = asset("examples/tiny.ppm")
+
+transform darken(img: Image, factor: f32) -> Image {
+    for p in img.pixels {
+        p.r *= factor
+        p.g *= factor
+        p.b *= factor
+    }
+
+    return img
+}
+
+decoded = source | decode.ppm
+darkened = decoded | darken(0.5)
+out = darkened | encode.ppm
+replayed = replay(out)
+
+trace(out)

@@ -145,6 +145,16 @@ pub fn transform_identities(module: &TypedModule) -> Result<TransformIdentities,
     })
 }
 
+/// Semantic identity for a runtime-provided transform whose implementation is
+/// versioned independently from user-authored typed IR.
+pub fn host_transform_identity(name: &str, semantic_version: u32) -> TransformIdentity {
+    let mut hasher = CanonicalHasher::new(b"tima.host-transform");
+    hasher.u32(SEMANTIC_ID_VERSION);
+    hasher.bytes(name.as_bytes());
+    hasher.u32(semantic_version);
+    TransformIdentity(Digest::from_hasher(hasher))
+}
+
 struct TransformIdentityResolver<'a> {
     module: &'a TypedModule,
     values: Vec<Option<TransformIdentity>>,
@@ -318,6 +328,10 @@ fn encode_outer_value(
         ValueData::String(value) => {
             hasher.u8(4);
             hasher.bytes(value.as_bytes());
+        }
+        ValueData::Bytes(value) => {
+            hasher.u8(8);
+            hasher.bytes(value);
         }
         ValueData::List(values) => {
             hasher.u8(5);
@@ -721,6 +735,22 @@ mod tests {
         assert_eq!(
             hex(abc.finish()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn host_transform_identity_is_stable_and_versioned() {
+        assert_eq!(
+            host_transform_identity("decode.ppm", 1),
+            host_transform_identity("decode.ppm", 1)
+        );
+        assert_ne!(
+            host_transform_identity("decode.ppm", 1),
+            host_transform_identity("decode.ppm", 2)
+        );
+        assert_ne!(
+            host_transform_identity("decode.ppm", 1),
+            host_transform_identity("encode.ppm", 1)
         );
     }
 

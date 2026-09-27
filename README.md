@@ -7,7 +7,8 @@ The Rust workspace has one `tima` crate with:
 
 - one lexer, parser, expression arena, source-span model, and diagnostic model
   shared by outer code and inner `transform` declarations;
-- an immutable outer value model and small interpreter;
+- an immutable outer value model, including encoded byte values, and a small
+  interpreter;
 - static checking and backend-neutral typed control-flow IR for transforms;
 - an inspectable generated-C backend, LLVM/Clang artifact compilation, and
   dynamic loading behind IR/backend boundaries;
@@ -17,8 +18,8 @@ The Rust workspace has one `tima` crate with:
   RGBA8 pixels;
 - immutable semantic lineage DAGs kept entirely outside native payloads;
 - separate native-artifact and transform-result caches keyed by semantic IDs;
-- host-mediated environment observations shared by the reference interpreter
-  and generated-C runtime ABI.
+- host-mediated asset and environment observations shared by the outer runtime,
+  reference interpreter, and generated-C runtime ABI.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
@@ -83,6 +84,15 @@ reject opaque-byte images with a source-spanned format diagnostic. General
 channel expressions, replacement assignment, and a general pixel value type
 remain intentionally deferred.
 
+The first Histima-facing codec path is deliberately small but complete:
+`asset(...) | decode.ppm | darken(0.5) | encode.ppm`. `decode.ppm` accepts
+ASCII P3 data supplied through an explicit host asset capability and produces
+an RGBA8 image; `encode.ppm` produces deterministic immutable P3 bytes. These
+versioned host transforms participate in semantic lineage, result caching, and
+replay, but remain outside typed inner IR and the generated-C artifact cache.
+The CLI explicitly supplies local-file access; the library has no ambient
+filesystem fallback.
+
 Every checked transform also receives a stable semantic identity derived from
 canonical typed IR and referenced transform identities. Source formatting,
 comments, local names, declaration order, backend, and target do not affect it.
@@ -111,11 +121,13 @@ lineage from the current semantic invocation rather than recording cache
 execution history; conflicting content for one recipe is rejected as a
 reproducibility failure.
 
-`replay(value)` now resolves the recorded transform by semantic identity,
-validates recorded external observations, restores exact scalar arguments and
-CAS-backed materialized arguments, and either reuses the recorded Recipe ID or
-re-executes it. Re-execution must reproduce both the Recipe ID and expected
-Content ID; arbitrary ancestor substitution remains intentionally unsupported.
+`replay(value)` now resolves recorded inner and host transforms by semantic
+identity, recursively validates source assets and recorded external
+observations before consulting descendant result caches, restores exact scalar
+arguments and CAS-backed materialized arguments, and either reuses the recorded
+Recipe ID or re-executes it. Re-execution must reproduce both the Recipe ID and
+expected Content ID; arbitrary ancestor substitution remains intentionally
+unsupported.
 
 Try the vertical slice:
 
@@ -123,6 +135,7 @@ Try the vertical slice:
 cargo run -p tima -- check examples/first.tima
 cargo run -p tima -- check examples/darken.tima
 cargo run -p tima -- run examples/first.tima
+cargo run -p tima -- run examples/image_pipeline.tima
 cargo run -p tima -- emit-c examples/first.tima
 ```
 

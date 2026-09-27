@@ -10,6 +10,7 @@ pub mod backend;
 pub mod cache;
 pub mod capability;
 pub mod diagnostic;
+mod host;
 pub mod identity;
 pub mod ir;
 pub mod lexer;

@@ -209,6 +209,10 @@ impl LineageArgument {
             ValueData::Integer(value) => RecordedValue::Integer(*value),
             ValueData::Float(value) => RecordedValue::Float(*value),
             ValueData::String(value) => RecordedValue::String(value.clone()),
+            ValueData::Bytes(_) => RecordedValue::Materialized {
+                kind: "bytes",
+                content_id: content_identity(value)?,
+            },
             ValueData::List(_) => RecordedValue::Materialized {
                 kind: "list",
                 content_id: content_identity(value)?,
