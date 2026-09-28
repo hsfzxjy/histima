@@ -239,5 +239,6 @@ cargo run -p tima -- run examples/image_pipeline.tima
 cargo run -p tima -- emit-c examples/first.tima
 ```
 
-The language and runtime contract is maintained in the local design documents
-described by `AGENTS.md`.
+The implemented language and runtime contract is specified in
+[`spec/TIMA.md`](spec/TIMA.md). Local design rationale and future planning are
+kept separately as described by `AGENTS.md`.
