@@ -1374,7 +1374,7 @@ mod tests {
             fs::remove_dir_all(&directory).unwrap();
         }
         fs::create_dir_all(&directory).unwrap();
-        let database = directory.join("catalog.sqlite3");
+        let database = directory.join(".histima.sql3");
         let connection = Connection::open(&database).unwrap();
         connection
             .execute_batch(

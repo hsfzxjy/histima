@@ -26,7 +26,8 @@ use tima::runtime::{OuterValue, ValueData};
 use cas::{ContentKind, ContentStore};
 use catalog::{Catalog, validate_artifact_identities};
 
-const CATALOG_FILE_NAME: &str = "catalog.sqlite3";
+const CATALOG_FILE_NAME: &str = ".histima.sql3";
+const LEGACY_CATALOG_FILE_NAME: &str = "catalog.sqlite3";
 
 pub use catalog::{
     ArtifactBundleMember, ArtifactSummary, AssetSummary, CATALOG_LIST_LIMIT, CatalogInfo,
@@ -120,7 +121,10 @@ impl Workspace {
         start
             .as_ref()
             .ancestors()
-            .find(|directory| directory.join(CATALOG_FILE_NAME).is_file())
+            .find(|directory| {
+                directory.join(CATALOG_FILE_NAME).is_file()
+                    || directory.join(LEGACY_CATALOG_FILE_NAME).is_file()
+            })
             .map(Path::to_owned)
     }
 
@@ -128,6 +132,7 @@ impl Workspace {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root)
             .map_err(|error| Error::io("create Histima workspace", &root, error))?;
+        migrate_legacy_catalog(&root)?;
         let content = ContentStore::open(&root)?;
         let catalog = Catalog::open(&root.join(CATALOG_FILE_NAME))?;
         Ok(Self {
@@ -463,6 +468,22 @@ impl Workspace {
     }
 }
 
+fn migrate_legacy_catalog(root: &Path) -> Result<()> {
+    let catalog = root.join(CATALOG_FILE_NAME);
+    let legacy = root.join(LEGACY_CATALOG_FILE_NAME);
+    if catalog.exists() || !legacy.is_file() {
+        return Ok(());
+    }
+
+    // Fold any committed WAL pages into the main file before renaming it. A
+    // successful close also releases/removes SQLite's transient sidecars.
+    let connection = rusqlite::Connection::open(&legacy)?;
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    drop(connection);
+    fs::rename(&legacy, &catalog)
+        .map_err(|error| Error::io("rename legacy Histima catalog", &legacy, error))
+}
+
 impl RuntimeCapabilities for Workspace {
     fn environment(&self, name: &str) -> std::result::Result<Vec<u8>, String> {
         Err(format!(
@@ -514,9 +535,34 @@ mod tests {
 
         assert_eq!(Workspace::find_nearest(&nested), None);
         drop(Workspace::open(&outer).unwrap());
+        assert!(outer.join(CATALOG_FILE_NAME).is_file());
+        assert!(!outer.join(LEGACY_CATALOG_FILE_NAME).exists());
         assert_eq!(Workspace::find_nearest(&nested), Some(outer.clone()));
         drop(Workspace::open(&inner).unwrap());
         assert_eq!(Workspace::find_nearest(&nested), Some(inner));
+    }
+
+    #[test]
+    fn opening_a_legacy_workspace_renames_its_catalog_without_losing_data() {
+        let test = TestDirectory::new("legacy-catalog-name");
+        let root = test.path().join("workspace");
+        let nested = root.join("assets");
+        let mut workspace = Workspace::open(&root).unwrap();
+        workspace.import_bytes("old.bin", b"preserved").unwrap();
+        drop(workspace);
+
+        fs::rename(
+            root.join(CATALOG_FILE_NAME),
+            root.join(LEGACY_CATALOG_FILE_NAME),
+        )
+        .unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(Workspace::find_nearest(&nested), Some(root.clone()));
+
+        let reopened = Workspace::open(&root).unwrap();
+        assert_eq!(reopened.catalog_stats().unwrap().contents, 1);
+        assert!(root.join(CATALOG_FILE_NAME).is_file());
+        assert!(!root.join(LEGACY_CATALOG_FILE_NAME).exists());
     }
 
     #[test]

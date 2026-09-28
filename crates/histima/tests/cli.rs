@@ -160,7 +160,7 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert_eq!(native_artifact_id.len(), 64);
     assert_eq!(native_library_content_id.len(), 64);
 
-    let database = Connection::open(workspace.join("catalog.sqlite3")).unwrap();
+    let database = Connection::open(workspace.join(".histima.sql3")).unwrap();
     let metadata = database
         .query_row(
             "SELECT backend, backend_version, compiler_version, target,
@@ -361,7 +361,7 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert_ne!(field(&changed, "content_id"), content_id);
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n50 40 30\n");
 
-    let database = Connection::open(workspace.join("catalog.sqlite3")).unwrap();
+    let database = Connection::open(workspace.join(".histima.sql3")).unwrap();
     let library_relative_path = database
         .query_row(
             "SELECT library_relative_path FROM native_artifact_bundles WHERE bundle_id = ?1",
@@ -398,7 +398,7 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     assert_eq!(field(&corrupt_inspection, "bundle[0].valid"), "false");
     assert!(stdout(&corrupt_inspection).contains("library Content ID is"));
 
-    let database = Connection::open(workspace.join("catalog.sqlite3")).unwrap();
+    let database = Connection::open(workspace.join(".histima.sql3")).unwrap();
     database
         .execute(
             "UPDATE native_artifact_bundles SET optimization = 'O0' WHERE bundle_id = ?1",

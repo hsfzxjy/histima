@@ -53,6 +53,8 @@ path always takes precedence. `histima init` still accepts an explicit path;
 when omitted inside an existing workspace, it resolves that workspace by the
 same rule. For example, after building the CLI, running
 `target/debug/histima stats` anywhere below `build/my-workspace` needs no path.
+The catalog and workspace-discovery marker is `.histima.sql3`; opening an early
+workspace that still has `catalog.sqlite3` migrates that filename in place.
 
 Materialization verifies the stored Content ID, publishes through a temporary
 file, and refuses to replace an existing destination. Tima identities use one
