@@ -1,270 +1,166 @@
 # Histima / Tima
 
-This repository contains the first vertical slice of **Tima**, the embedded
-language for Histima asset pipelines, and the initial durable **Histima** host
-foundation.
+Histima is a local asset manager and transformation runner. Tima is its
+embedded language: a convenient immutable outer scripting layer surrounds a
+small statically checked inner language introduced by `transform`.
 
-The `tima` crate provides:
+The repository currently provides:
 
-- one lexer, parser, expression arena, source-span model, and diagnostic model
-  shared by outer code and inner `transform` declarations;
-- an immutable outer value model, including encoded byte values, and a small
-  interpreter;
-- static checking and backend-neutral typed control-flow IR for transforms;
-- a deterministic WebAssembly memory64 backend and Wasmtime execution behind
-  the typed-IR/backend boundary;
-- an explicit Wasm ABI distinction between owned `Image` and read-only,
-  aliasable `ImageView`;
-- explicit image layout metadata for opaque byte rows and validated interleaved
-  RGBA8 pixels;
-- immutable semantic lineage DAGs kept entirely outside Wasm payloads;
-- separate Wasm-artifact and transform-result caches keyed by semantic IDs;
-- host-mediated asset and environment observations shared by the outer runtime,
-  reference interpreter, and Wasm runtime ABI.
+- one Rust lexer/parser/AST, source-span model, and diagnostic system shared by
+  both language strata;
+- immutable outer values, calls, pipelines, registered codecs, lineage, replay,
+  and Recipe-ID result caching;
+- statically checked transforms lowered to backend-neutral typed Tima IR;
+- a production typed-IR interpreter with owned mutable inner values,
+  read-only aliasable views, and freeze-on-return;
+- a capability-controlled `World` boundary for observable external state;
+- a SQLite catalog at `.histima.sql3` plus a filesystem content-addressed
+  store for durable assets, lineage, recipes, and results;
+- a CLI for import, execution, recording, query, trace, replay, and
+  materialization.
 
-The separate `histima` crate now owns the beginning of the product boundary. A
-configurable workspace combines a migration-managed SQLite catalog with a
-filesystem content-addressed store. SQLite runs with foreign keys and WAL mode,
-stores queryable content/source metadata, preserves immutable source versions,
-tracks the current observation for each locator, and catalogs compiled artifacts
-separately from semantic transform results. Imported payloads are atomically
-published outside SQLite under their Tima Content IDs; repeat imports
-deduplicate bytes, and every read revalidates stored content before returning
-it. The workspace implements Tima's explicit asset-read capability and never
-falls back to an ambient path that has not been imported.
+The typed IR is the semantic compiler boundary. The planned native backend is
+ahead-of-time Cranelift, not JIT. WebAssembly is reserved for separately
+registered plugin transforms whose ABI is still deferred. The repository
+temporarily retains the former generated-Wasm implementation for regression
+tests over the older scalar/image subset; Histima no longer uses it for product
+execution.
 
-The initial `histima` CLI exposes that storage boundary across processes:
+## Build and try it
 
 ```text
+cargo test --workspace
 cargo run -p histima -- init build/my-workspace
 cargo run -p histima -- import build/my-workspace examples/tiny.ppm
-cargo run -p histima -- stats build/my-workspace
-cargo run -p histima -- materialize build/my-workspace <content-id> output.ppm
 cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | read | ppm.decode | webp.encode(quality=85)'
 cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
 cargo run -p histima -- trace build/my-workspace <recipe-id>
 cargo run -p histima -- replay build/my-workspace examples/image_pipeline.tima <recipe-id>
 ```
 
-Every `[workspace]` argument is optional. When it is omitted, the CLI searches
-from the current directory toward the filesystem root and uses the nearest
-directory containing an initialized Histima catalog. An explicit workspace
-path always takes precedence. `histima init` still accepts an explicit path;
-when omitted inside an existing workspace, it resolves that workspace by the
-same rule. For example, after building the CLI, running
-`target/debug/histima stats` anywhere below `build/my-workspace` needs no path.
-The catalog and workspace-discovery marker is `.histima.sql3`; opening an early
-workspace that still has `catalog.sqlite3` migrates that filename in place.
+Every `[workspace]` CLI argument is optional. When omitted, Histima walks from
+the current directory to the nearest ancestor containing `.histima.sql3`.
+Opening an older workspace migrates `catalog.sqlite3` to that hidden name.
+Add `--json` anywhere for structured output.
 
-Inner execution uses one memory64 linear-memory arena per run or replay. The
-default cap is 4 GiB and can be changed with the global CLI option
-`--wasm-memory-limit 512MiB`, the `HISTIMA_WASM_MEMORY_LIMIT` environment
-variable, or `[wasm].memory_limit = "512MiB"` in `.histima.toml`, in that
-precedence order. Host payloads enter an arena once, views reuse a session
-mirror, owned aliases detach within linear memory, and returned owned images
-remain backed by the session rather than being copied out.
+`histima pipeline [workspace] <expression>` accepts exactly one outer Tima
+expression. Invocation-derived byte results are automatically recorded in
+workspace stock, so a later process can reuse them. Custom `transform`
+declarations remain file-based through `histima run`.
 
-Materialization verifies the stored Content ID, publishes through a temporary
-file, and refuses to replace an existing destination. Tima identities use one
-canonical durable text form: 64 lowercase hexadecimal characters.
+## A small Tima program
 
-`histima run` uses the workspace as Tima's host boundary: `asset(...)` can read
-only locators already imported into that catalog, portable Wasm artifacts are
-cached under the workspace, and `save(...)` atomically refuses to replace an
-existing output. `--record <binding>` persists an invocation-derived immutable
-byte value in the filesystem CAS, stores its Recipe-to-Content mapping and
-normalized semantic lineage in SQLite, and prints the durable identities.
-`histima trace` inspects the derivation after reopening the workspace.
+```tima
+source = asset("cat.png")
 
-For one-off outer pipelines, `histima pipeline <workspace> <expression>` runs
-exactly one quoted Tima expression without requiring a source file or compiling
-an empty Wasm module. It still uses catalog-only assets, registered-transform
-lineage, and the durable Recipe cache. Invocation-derived byte results are
-automatically added to workspace stock, so a later process can reuse the same
-Recipe-to-Content result; scalar and image results remain ephemeral. Bindings,
-transform declarations, and multiple statements remain file-based through
-`histima run`. Add `--json` anywhere in either command for structured output.
+transform darken(img: Image, factor: f32) -> Image {
+    for p in img.pixels {
+        p.r *= factor
+        p.g *= factor
+        p.b *= factor
+    }
+    return img
+}
 
-Raw imported blobs and typed Tima byte values intentionally use distinct
-Content ID domains even when their payload bytes match. The catalog records the
-content kind so every CAS read can revalidate the correct semantic identity.
-Recorded byte results now participate in later `histima run` processes through
-a host-provided result-cache layer. Tima computes the current Recipe ID before
-lookup, validates source observations first, and attaches current invocation
-lineage to a hit; cache execution history never enters derivation lineage. The
-CLI reports artifact and result-cache statistics separately. Transforms whose
-external observations cannot be known before execution are not early-hit by
-this initial adapter.
+out =
+    source
+    | read
+    | png.decode
+    | darken(0.8)
+    | webp.encode(quality=85)
 
-`histima replay` rebuilds normalized lineage records from SQLite, verifies their
-Source, Dependency, Recipe, and argument identities, resolves every recorded
-transform against the supplied current Tima program, and validates all source
-and external observations before accepting a cached result. It then reuses
-valid durable intermediates or executes the Wasm path and verifies the
-expected Content ID. Replay reconstructs the recorded derivation without
-repeating outer `save(...)` effects; ancestor substitution and non-byte result
-serialization remain deferred.
-
-The intentionally small executable subset supports outer bindings, scalar and
-string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
-comparisons, transform calls, and pipelines. `tima run` emits checked
-transforms as a portable memory64 `.wasm` module and invokes them through
-Wasmtime; the IR interpreter remains a test oracle.
-Transform bodies may contain inferred immutable local bindings, typed returns,
-and `if` statements with required `else` arms. Either branch may return early
-or fall through to a continuation; branch-local bindings do not escape that
-join. The typed IR represents control flow as explicit basic-block branches and
-jumps consumed by both the reference interpreter and Wasm backend. Merged branch
-values, rebinding, and general loop bodies remain intentionally unsupported.
-Host-provided immutable images can cross the Wasm boundary: `Image` acquires
-unique mutable storage by transfer or detach, multiple owned arguments cannot
-alias, `ImageView` shares storage zero-copy, and returned descriptors are frozen
-only when they reference storage retained by the invocation. Inner-to-inner
-calls transfer owned `Image` arguments without returning through the outer
-representation; passing the same owned value twice or using it after the call
-is rejected. Inner `i64` arithmetic is still held back until its overflow and
-division-error semantics are specified.
-
-The first concrete owned-image operation is the inner-only
-`image_zero(image)`. It consumes an owned `Image`, zeros its byte storage in
-place, and returns the same ownership under a new value; aliases to the consumed
-value are rejected, including unsafe uses after branch joins. Both the reference
-interpreter and Wasm backend implement the same typed IR operation, while
-the outer input remains immutable because shared storage is detached at the
-boundary. This is intentionally narrower than general field or buffer mutation.
-
-The same ownership path now supports `image_fill(image, value)`, where `value`
-is a Wasm-safe `u8`. Outer integers cross a `u8` parameter only after a
-`0..=255` range check; inner integer literals remain `i64`, and implicit numeric
-conversions or `u8` arithmetic are intentionally deferred. `u8` equality and
-ordering are statically checked and execute consistently in the reference and Wasm
-paths.
-
-The first constrained loop surface is
-`for byte in img.bytes { byte = value }` over an owned `Image`. The body must be
-exactly one assignment producing `u8`. A loop-invariant assignment canonicalizes
-to the same backend-neutral `ImageFill` operation as `image_fill`, so equivalent
-source forms share Transform identity. A byte-dependent assignment lowers to a
-structured `ImageByteMap` IR operation containing its typed scalar instruction
-sequence; both the reference interpreter and Wasm execute it once per
-byte. General/nested loop statements, arbitrary indexing, and consuming other
-owned values inside the loop remain deferred.
-
-Images now carry a semantic format through the outer value, ownership boundary,
-reference interpreter, and Wasm ABI. Existing `ImageValue::new` values
-remain opaque byte rows; `ImageValue::new_rgba8` validates four interleaved
-8-bit channels per pixel and row stride. Format participates in content identity
-and is revalidated when a Wasm result is frozen. Byte loops work with either
-layout.
-
-The first RGBA8 pixel surface supports the target-shaped loop
-`for p in img.pixels { p.r *= factor }` over an owned `Image`. A loop may scale
-each of `r`, `g`, `b`, and `a` at most once by an `f32` expression evaluated
-before iteration. Scaling operates on stored channel bytes, truncates fractional
-results, saturates above 255, and maps non-positive or NaN results to zero.
-Unmentioned channels and row padding remain unchanged. Both execution engines
-reject opaque-byte images with a source-spanned format diagnostic. General
-channel expressions, replacement assignment, and a general pixel value type
-remain intentionally deferred.
-
-The first Histima-facing codec path is deliberately small but complete:
-`asset(...) | read | ppm.decode | darken(0.5) | ppm.encode`. `ppm.decode` accepts
-immutable P3 bytes and produces an RGBA8 image; `ppm.encode` produces
-deterministic immutable P3 bytes. `asset(...)` remains a lazy locator and the
-explicit `read` builtin is the capability-mediated source observation that
-produces those bytes and fixes source lineage. The versioned registered
-transforms participate in semantic lineage, result caching, and replay, but
-remain outside typed inner IR and the Wasm artifact cache. Decoders allocate
-their image result in the active Wasm arena so following inner transforms avoid
-a host round trip. The CLI explicitly supplies catalog-backed asset access; the library has no ambient
-filesystem fallback.
-
-The same boundary now provides `png.decode` and
-`png.encode(compression=6)`. PNG decoding
-accepts still images, normalizes supported grayscale, RGB, palette, and alpha
-forms to validated RGBA8, and deliberately rejects APNG. Encoding preserves
-RGBA bytes while removing row padding and ancillary metadata, with a pinned
-codec, fixed Paeth filter, and an integer compression level from 1 through 9.
-The default is 6; omitting it and spelling `compression=6` produce identical
-lineage arguments and Recipe IDs, while another level produces a distinct
-recipe that replay restores exactly. Fixed-setting or codec changes must bump
-the registered encoder's semantic version so existing Recipe IDs cannot
-silently acquire different output semantics.
-
-Lossy still-image WebP output is available as `webp.encode(quality=85)`.
-Quality is an integer from 0 through 100 with a canonical default of 85.
-Encoding preserves alpha losslessly, removes row padding, emits no inherited
-metadata, and uses an exactly pinned pure-Rust codec with fixed configuration
-defaults. Omitted and explicit default quality produce the same Recipe ID;
-other qualities are distinct recorded recipes. WebP decoding remains deferred.
-
-Encoded bytes can be persisted with the outer sink
-`bytes | save("output.ppm")`. Saving requires an explicit host asset-output
-capability and returns the same immutable value with the same derivation
-lineage. It is an execution effect rather than a transform: it is never
-result-cached, and replay reconstructs the derived bytes without unexpectedly
-repeating the write. The CLI maps this capability to a local-file write.
-
-Every checked transform also receives a stable semantic identity derived from
-canonical typed IR and referenced transform identities. Source formatting,
-comments, local names, declaration order, backend, and target do not affect it.
-Calls and pipeline stages may assert that identity with `name#hash`, where
-`hash` is the full 64-character Transform ID or any lowercase hexadecimal
-prefix. A mismatch fails compilation; the assertion does not itself change
-semantic identity. The same syntax works for namespaced registered transforms,
-for example `png.decode#4f26a3`.
-Content, invocation recipe, observed dependency, and Wasm artifact identities
-use separate hash domains; artifact identity additionally includes the actual
-backend, emitter version, target, optimization mode, and Wasm ABI version.
-Lazy `asset(...)` values now begin with source lineage, and every outer-to-inner
-transform call records a stable invocation recipe, semantic argument snapshots,
-and ancestor edges without retaining owned inner storage. `trace(value)`
-returns the derivation as an inspectable outer value.
-
-The first tracked capability is the literal-key inner call
-`environment_i64("NAME")`. A Histima host must explicitly implement
-`RuntimeCapabilities`; Tima never falls back to ambient process state. The
-reference interpreter and Wasm executor both parse the supplied bytes as an
-`i64`, record the raw bytes as an external observation, and include that
-dependency in Recipe identity. Different observed bytes therefore produce
-different recipes, while replay validates the recorded observation before
-cache reuse or re-execution.
-
-Portable Wasm bundles are cached persistently under
-`cache/artifacts/wasm/<bundle-id>/module.wasm` using the ordered Artifact IDs
-of their transforms and are validated against module Content ID before reuse.
-Wasmtime's machine-code cache is separate and non-semantic. Transform results use a separate
-Recipe-ID index over an immutable content-addressed store. Cache hits reconstruct
-lineage from the current semantic invocation rather than recording cache
-execution history; conflicting content for one recipe is rejected as a
-reproducibility failure.
-
-Histima additionally records each artifact bundle and its ordered Artifact IDs in
-SQLite. The catalog keeps backend and compiler versions, target, CPU-feature
-selection, optimization configuration, ABI version, module Content ID, and
-workspace-relative cache location. Each load compares those records with the
-Tima-computed identities and the bytes currently on disk before instantiating
-Wasm. These records have no identity relationship to Recipe IDs: changing a
-compiler or backend affects artifact reuse, never semantic lineage.
-
-`replay(value)` now resolves recorded inner and registered transforms by semantic
-identity, recursively validates source assets and recorded external
-observations before consulting descendant result caches, restores exact scalar
-arguments and CAS-backed materialized arguments, and either reuses the recorded
-Recipe ID or re-executes it. Re-execution must reproduce both the Recipe ID and
-expected Content ID; arbitrary ancestor substitution remains intentionally
-unsupported.
-
-Try the vertical slice:
-
-```text
-cargo run -p tima -- check examples/first.tima
-cargo run -p tima -- check examples/darken.tima
-cargo run -p tima -- run examples/first.tima
-cargo run -p tima -- run examples/image_pipeline.tima
-cargo run -p tima -- emit-wasm examples/first.tima
+derivation = trace(out)
+replayed = replay(out)
 ```
 
-The implemented language and runtime contract is specified in
-[`spec/TIMA.md`](spec/TIMA.md). Local design rationale and future planning are
-kept separately as described by `AGENTS.md`.
+Outer composites are immutable. Inner owned values such as `Image`, `Bytes`,
+and `String` are unique and consumable; `ImageView`, `BytesView`, and
+`StringView` are read-only and may alias. Returning to outer code freezes the
+value. Dynamic outer tags, lineage, and cache metadata do not enter inner
+representations.
+
+Image support currently includes opaque byte rows and validated RGBA8 storage,
+owned byte loops, `image_zero`, `image_fill`, and constrained RGBA8 channel
+scaling. Registered deterministic codecs currently include PPM and PNG
+decode/encode and WebP encode. They use the same Transform/Recipe/Content
+identity, lineage, cache, and replay model as user transforms, but their host
+implementations are provisional pending a registered-Wasm-plugin ABI.
+
+Transform references can assert semantic identity as `name#hash`, where `hash`
+is a full Transform ID or lowercase prefix. The assertion does not itself
+change semantic identity.
+
+## The World boundary
+
+Inner transforms declare broad external authority explicitly:
+
+```tima
+transform load_config() -> Bytes uses file.read {
+    return file.read("config.bin")
+}
+
+transform mode() -> String uses env.read {
+    return env.read("MODE")
+}
+
+transform fetch() -> Bytes uses http.get {
+    return http.get("https://assets.example.test/v1/palette.bin")
+}
+```
+
+Recognized declarations and calls are:
+
+- `uses env.read` / `env.read(StringView) -> String`;
+- `uses file.read` / `file.read(StringView) -> Bytes`;
+- `uses http.get` / `http.get(StringView) -> Bytes`.
+
+`environment_i64("NAME")` remains as a compatibility helper and also requires
+`uses env.read`.
+
+Histima grants workspace files automatically. Extra authorities are explicit
+in `<workspace>/.histima.toml`:
+
+```toml
+[world]
+environment = ["MODE"]
+retain_environment = ["MODE"]
+file_roots = ["../shared-assets"]
+http_prefixes = ["https://assets.example.test/v1/"]
+```
+
+File paths are canonicalized before checking the workspace and configured
+roots. Environment names must be listed exactly. HTTP URLs must match a listed
+prefix byte-for-byte, redirects are rejected rather than escaping that grant,
+and response bodies are capped at 64 MiB. Tima itself
+never falls back to ambient filesystem, environment, network, clock, or
+randomness access.
+
+Every successful read records its precise key and observed Content ID in
+lineage and Recipe identity. File and HTTP response bytes are retained in the
+workspace CAS by default. Environment values are hash-only unless the name is
+also listed in `retain_environment`.
+
+Replay uses strict re-observation by default: it reads each external dependency
+again and rejects changed content before cached descendants are accepted.
+`histima replay ... --snapshot` instead uses retained observations without
+touching those external resources. Snapshot availability is execution/storage
+policy; it does not change Dependency or Recipe identity. Source assets still
+follow their separately recorded source-validation rules.
+
+## Storage, lineage, and identity
+
+The filesystem CAS contains immutable payloads; SQLite contains queryable
+source versions, current locator heads, normalized lineage, recipes, result
+references, and legacy/future artifact metadata. CAS publication and output
+materialization are atomic, and materialization refuses to replace an existing
+file.
+
+Tima keeps distinct hash domains for Transform ID, Recipe ID, Content ID,
+Source ID, Dependency ID, and Artifact ID. Backend choice, cache hits, and
+execution timestamps never alter semantic derivation lineage. A future
+Cranelift artifact cache will remain independent from the existing Recipe-ID
+result cache.
+
+The normative implemented contract is [`spec/TIMA.md`](spec/TIMA.md). Local
+design rationale and work plans live under `agents/` as required by
+`AGENTS.md` and are intentionally not committed.

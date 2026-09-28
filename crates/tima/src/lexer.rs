@@ -14,6 +14,7 @@ pub enum TokenKind {
     Float(f64),
     String(String),
     Transform,
+    Uses,
     Return,
     If,
     Else,
@@ -171,6 +172,7 @@ impl Lexer<'_> {
         let text = &self.text[start..self.position];
         let kind = match text {
             "transform" => TokenKind::Transform,
+            "uses" => TokenKind::Uses,
             "return" => TokenKind::Return,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,

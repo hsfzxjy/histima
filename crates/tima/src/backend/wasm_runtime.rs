@@ -763,6 +763,9 @@ fn default_results(ty: Type) -> Vec<Val> {
         Type::Bool | Type::U8 => vec![Val::I32(0)],
         Type::I64 => vec![Val::I64(0)],
         Type::F32 => vec![Val::F32(0)],
+        Type::String | Type::StringView | Type::Bytes | Type::BytesView => {
+            unreachable!("World string/byte types are not supported by the legacy Wasm runtime")
+        }
         Type::Image | Type::ImageView => vec![
             Val::I64(0),
             Val::I64(0),
@@ -781,6 +784,11 @@ fn unflatten_value(ty: Type, values: &[Val]) -> Result<WasmValue, WasmInvokeErro
         Type::U8 => WasmValue::U8(values[0].i32().ok_or_else(mismatch)? as u8),
         Type::I64 => WasmValue::I64(values[0].i64().ok_or_else(mismatch)?),
         Type::F32 => WasmValue::F32(values[0].f32().ok_or_else(mismatch)?),
+        Type::String | Type::StringView | Type::Bytes | Type::BytesView => {
+            return Err(WasmInvokeError::Runtime(WasmError::new(
+                "World string/byte types are not supported by the legacy Wasm runtime",
+            )));
+        }
         Type::Image | Type::ImageView => WasmValue::Image(WasmImage {
             offset: values[0].i64().ok_or_else(mismatch)? as u64,
             byte_len: values[1].i64().ok_or_else(mismatch)? as u64,

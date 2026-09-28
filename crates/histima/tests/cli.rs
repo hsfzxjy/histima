@@ -3,9 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rusqlite::Connection;
 use serde_json::Value;
-use tima::identity::byte_content_identity;
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -57,7 +55,7 @@ fn cli_imports_inspects_and_materializes_across_processes() {
 
     let initialized = histima(["init", text(&workspace)]);
     assert_success(&initialized);
-    assert!(stdout(&initialized).contains("schema_version = 4"));
+    assert!(stdout(&initialized).contains("schema_version = 5"));
 
     let imported = histima(["import", text(&workspace), text(&source)]);
     assert_success(&imported);
@@ -110,7 +108,55 @@ fn cli_imports_inspects_and_materializes_across_processes() {
 }
 
 #[test]
-fn cli_runs_a_wasm_tima_pipeline_against_imported_assets() {
+fn cli_executes_and_strictly_replays_workspace_world_file_reads() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let script = test.path().join("world-read.tima");
+    assert_success(&histima(["init", text(&workspace)]));
+    fs::write(workspace.join("config.bin"), b"first config").unwrap();
+    fs::write(
+        &script,
+        "transform load() -> Bytes uses file.read {\n\
+             return file.read(\"config.bin\")\n\
+         }\n\
+         out = load()\n",
+    )
+    .unwrap();
+
+    let run = histima(["run", text(&workspace), text(&script), "--record", "out"]);
+    assert_success(&run);
+    assert!(stdout(&run).contains("execution_engine = interpreter"));
+    let recipe = field(&run, "recipe_id");
+
+    let trace = histima(["trace", text(&workspace), &recipe]);
+    assert_success(&trace);
+    assert!(stdout(&trace).contains("observe file.read"));
+    assert!(stdout(&trace).contains("config.bin"));
+
+    let replay = histima(["replay", text(&workspace), text(&script), &recipe]);
+    assert_success(&replay);
+    assert_eq!(field(&replay, "recipe_id"), recipe);
+
+    fs::write(workspace.join("config.bin"), b"changed config").unwrap();
+    let changed = histima(["replay", text(&workspace), text(&script), &recipe]);
+    assert!(!changed.status.success());
+    assert!(stderr(&changed).contains("replay expected external `file.read` dependency"));
+
+    fs::remove_file(workspace.join("config.bin")).unwrap();
+    let snapshot = histima([
+        "replay",
+        text(&workspace),
+        text(&script),
+        &recipe,
+        "--snapshot",
+    ]);
+    assert_success(&snapshot);
+    assert!(stdout(&snapshot).contains("replay_policy = snapshot"));
+    assert_eq!(field(&snapshot, "recipe_id"), recipe);
+}
+
+#[test]
+fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");
     let source = test.path().join("source.ppm");
@@ -145,110 +191,15 @@ fn cli_runs_a_wasm_tima_pipeline_against_imported_assets() {
 
     let first = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&first);
-    assert!(stdout(&first).contains("artifact_cache = miss"));
+    assert!(stdout(&first).contains("execution_engine = interpreter"));
+    assert!(stdout(&first).contains("artifact_cache = none"));
     assert!(stdout(&first).contains("result_cache_hits = 0"));
     assert!(stdout(&first).contains("invoke darken"));
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
     let recipe_id = field(&first, "recipe_id");
     let content_id = field(&first, "content_id");
-    let artifact_bundle_id = field(&first, "artifact_bundle_id");
-    let artifact_id = field(&first, "artifact_ids");
-    let artifact_content_id = field(&first, "artifact_content_id");
     assert_eq!(recipe_id.len(), 64);
     assert_eq!(content_id.len(), 64);
-    assert_eq!(artifact_bundle_id.len(), 64);
-    assert_eq!(artifact_id.len(), 64);
-    assert_eq!(artifact_content_id.len(), 64);
-
-    let database = Connection::open(workspace.join(".histima.sql3")).unwrap();
-    let metadata = database
-        .query_row(
-            "SELECT backend, backend_version, compiler_version, target,
-                    cpu_features, optimization, abi_version, artifact_content_id,
-                    artifact_relative_path
-             FROM artifact_bundles WHERE bundle_id = ?1",
-            [&artifact_bundle_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(metadata.0, "wasm");
-    assert_eq!(metadata.1, "1");
-    assert_eq!(metadata.2, "wasm-encoder-0.259.0");
-    assert_eq!(metadata.3, "wasm64-unknown-unknown");
-    assert_eq!(metadata.4, "");
-    assert_eq!(metadata.5, "speed");
-    assert_eq!(metadata.6, 1);
-    assert_eq!(metadata.7, artifact_content_id);
-    assert_eq!(
-        metadata.8,
-        format!("cache/artifacts/wasm/{artifact_bundle_id}/module.wasm")
-    );
-    let recorded_member = database
-        .query_row(
-            "SELECT member.artifact_id, artifact.transform_id
-             FROM artifact_bundle_members AS member
-             JOIN artifacts AS artifact USING (artifact_id)
-             WHERE member.bundle_id = ?1 AND member.artifact_index = 0",
-            [&artifact_bundle_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .unwrap();
-    assert_eq!(recorded_member.0, artifact_id);
-    assert_eq!(recorded_member.1.len(), 64);
-    drop(database);
-
-    let inspected_bundle = histima(["inspect", "artifact", text(&workspace), &artifact_bundle_id]);
-    assert_success(&inspected_bundle);
-    assert_eq!(field(&inspected_bundle, "requested_id"), artifact_bundle_id);
-    assert_eq!(field(&inspected_bundle, "matched_artifact"), "false");
-    assert_eq!(field(&inspected_bundle, "bundle_count"), "1");
-    assert_eq!(field(&inspected_bundle, "bundles_truncated"), "false");
-    assert_eq!(field(&inspected_bundle, "bundle[0].backend"), "wasm");
-    assert_eq!(field(&inspected_bundle, "bundle[0].backend_version"), "1");
-    assert_eq!(
-        field(&inspected_bundle, "bundle[0].compiler_version"),
-        "wasm-encoder-0.259.0"
-    );
-    assert!(!field(&inspected_bundle, "bundle[0].target").is_empty());
-    assert_eq!(field(&inspected_bundle, "bundle[0].optimization"), "speed");
-    assert_eq!(field(&inspected_bundle, "bundle[0].abi_version"), "1");
-    assert_eq!(
-        field(&inspected_bundle, "bundle[0].artifact_content_id"),
-        artifact_content_id
-    );
-    assert_eq!(field(&inspected_bundle, "bundle[0].identity_valid"), "true");
-    assert_eq!(field(&inspected_bundle, "bundle[0].artifact_valid"), "true");
-    assert_eq!(field(&inspected_bundle, "bundle[0].valid"), "true");
-    assert_eq!(field(&inspected_bundle, "bundle[0].member_count"), "1");
-    assert_eq!(
-        field(&inspected_bundle, "bundle[0].member[0].artifact_id"),
-        artifact_id
-    );
-
-    let inspected_artifact = histima(["inspect", "artifact", text(&workspace), &artifact_id]);
-    assert_success(&inspected_artifact);
-    assert_eq!(field(&inspected_artifact, "matched_artifact"), "true");
-    assert_eq!(field(&inspected_artifact, "artifact_id"), artifact_id);
-    assert_eq!(
-        field(&inspected_artifact, "transform_id"),
-        recorded_member.1
-    );
-    assert_eq!(
-        field(&inspected_artifact, "bundle[0].bundle_id"),
-        artifact_bundle_id
-    );
 
     let trace = histima(["trace", text(&workspace), &recipe_id]);
     assert_success(&trace);
@@ -285,8 +236,7 @@ fn cli_runs_a_wasm_tima_pipeline_against_imported_assets() {
     assert!(stdout(&replayed).contains("result_cache_hits = 1"));
     assert_eq!(field(&replayed, "recipe_id"), recipe_id);
     assert_eq!(field(&replayed, "content_id"), content_id);
-    assert_eq!(field(&replayed, "artifact_bundle_id"), artifact_bundle_id);
-    assert_eq!(field(&replayed, "artifact_content_id"), artifact_content_id);
+    assert!(stdout(&replayed).contains("execution_engine = interpreter"));
     assert!(stdout(&replayed).contains("invoke darken"));
 
     let materialized = histima([
@@ -303,8 +253,8 @@ fn cli_runs_a_wasm_tima_pipeline_against_imported_assets() {
     assert!(stdout(&stats).contains("contents = 2"));
     assert!(stdout(&stats).contains("lineage_invocations = 3"));
     assert!(stdout(&stats).contains("recipe_results = 1"));
-    assert!(stdout(&stats).contains("artifact_bundles = 1"));
-    assert!(stdout(&stats).contains("artifacts = 1"));
+    assert!(stdout(&stats).contains("artifact_bundles = 0"));
+    assert!(stdout(&stats).contains("artifacts = 0"));
 
     let renamed = fs::read_to_string(&script)
         .unwrap()
@@ -314,7 +264,7 @@ fn cli_runs_a_wasm_tima_pipeline_against_imported_assets() {
     fs::remove_file(&output).unwrap();
     let second = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&second);
-    assert!(stdout(&second).contains("artifact_cache = hit"));
+    assert!(stdout(&second).contains("artifact_cache = none"));
     assert!(stdout(&second).contains("result_cache_hits = 1"));
     assert!(stdout(&second).contains("invoke shade"));
     assert_eq!(field(&second, "recipe_id"), recipe_id);
@@ -353,62 +303,6 @@ fn cli_runs_a_wasm_tima_pipeline_against_imported_assets() {
     assert_ne!(field(&changed, "recipe_id"), recipe_id);
     assert_ne!(field(&changed, "content_id"), content_id);
     assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n50 40 30\n");
-
-    let database = Connection::open(workspace.join(".histima.sql3")).unwrap();
-    let artifact_relative_path = database
-        .query_row(
-            "SELECT artifact_relative_path FROM artifact_bundles WHERE bundle_id = ?1",
-            [&artifact_bundle_id],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap();
-    drop(database);
-    let library = workspace.join(artifact_relative_path);
-    let corrupt = b"corrupt wasm module";
-    fs::write(&library, corrupt).unwrap();
-    fs::write(
-        library.with_file_name("module.sha256"),
-        byte_content_identity(corrupt).to_string(),
-    )
-    .unwrap();
-    let corrupt_inspection =
-        histima(["inspect", "artifact", text(&workspace), &artifact_bundle_id]);
-    assert_success(&corrupt_inspection);
-    assert_eq!(
-        field(&corrupt_inspection, "bundle[0].identity_valid"),
-        "true"
-    );
-    assert_eq!(
-        field(&corrupt_inspection, "bundle[0].artifact_valid"),
-        "false"
-    );
-    assert_eq!(field(&corrupt_inspection, "bundle[0].valid"), "false");
-    assert!(stdout(&corrupt_inspection).contains("artifact Content ID is"));
-
-    fs::remove_file(&output).unwrap();
-    let rebuilt_artifact = histima(["run", text(&workspace), text(&script)]);
-    assert_success(&rebuilt_artifact);
-    assert!(stdout(&rebuilt_artifact).contains("artifact_cache = miss"));
-    let rebuilt_inspection =
-        histima(["inspect", "artifact", text(&workspace), &artifact_bundle_id]);
-    assert_success(&rebuilt_inspection);
-    assert_eq!(field(&rebuilt_inspection, "bundle[0].valid"), "true");
-
-    let database = Connection::open(workspace.join(".histima.sql3")).unwrap();
-    database
-        .execute(
-            "UPDATE artifact_bundles SET optimization = 'O0' WHERE bundle_id = ?1",
-            [&artifact_bundle_id],
-        )
-        .unwrap();
-    drop(database);
-    let invalid_identity = histima(["inspect", "artifact", text(&workspace), &artifact_bundle_id]);
-    assert_success(&invalid_identity);
-    assert_eq!(
-        field(&invalid_identity, "bundle[0].identity_valid"),
-        "false"
-    );
-    assert!(stdout(&invalid_identity).contains("Artifact ID is"));
 }
 
 #[test]
@@ -447,7 +341,7 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
     assert_success(&histima(["import", text(&workspace), &source_locator]));
     let run = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&run);
-    assert!(stdout(&run).contains("artifact_cache = miss"));
+    assert!(stdout(&run).contains("execution_engine = interpreter"));
     let encoded = fs::read(&output).unwrap();
     assert_eq!(&encoded[..4], b"RIFF");
     assert_eq!(&encoded[8..12], b"WEBP");
@@ -506,7 +400,7 @@ fn cli_json_covers_the_workspace_lifecycle() {
     let initialized = histima(["--json", "init", text(&workspace)]);
     assert_success(&initialized);
     let initialized = json_output(&initialized);
-    assert_eq!(initialized["schema_version"], 4);
+    assert_eq!(initialized["schema_version"], 5);
     assert_eq!(initialized["journal_mode"], "wal");
 
     let imported = histima(["import", text(&workspace), &source_locator, "--json"]);
@@ -535,18 +429,15 @@ fn cli_json_covers_the_workspace_lifecycle() {
     ]);
     assert_success(&run);
     let run = json_output(&run);
-    assert_eq!(run["artifact_cache"], "miss");
+    assert_eq!(run["execution_engine"], "interpreter");
+    assert_eq!(run["artifact_cache"], Value::Null);
+    assert_eq!(run["artifact"], Value::Null);
     assert_eq!(run["result_cache"]["hits"], 0);
     assert_eq!(run["bindings"]["out"]["type"], "bytes");
     assert_eq!(run["recorded"]["binding"], "out");
     let recipe_id = json_string(&run["recorded"], "recipe_id").to_owned();
     let content_id = json_string(&run["recorded"], "content_id").to_owned();
-    let bundle_id = json_string(&run["artifact"], "bundle_id").to_owned();
-    let artifact_id = run["artifact"]["artifact_ids"][0]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    for identity in [&recipe_id, &content_id, &bundle_id, &artifact_id] {
+    for identity in [&recipe_id, &content_id] {
         assert_canonical_identity(identity);
     }
 
@@ -580,22 +471,6 @@ fn cli_json_covers_the_workspace_lifecycle() {
     );
     assert_eq!(recipe["observations"].as_array().unwrap().len(), 0);
     assert!(recipe["trace"].as_str().unwrap().contains("invoke darken"));
-
-    let artifact = histima([
-        "inspect",
-        "artifact",
-        text(&workspace),
-        &bundle_id,
-        "--json",
-    ]);
-    assert_success(&artifact);
-    let artifact = json_output(&artifact);
-    assert_eq!(artifact["matched_artifact"], Value::Null);
-    assert_eq!(artifact["bundles"][0]["valid"], true);
-    assert_eq!(
-        artifact["bundles"][0]["members"][0]["artifact_id"],
-        artifact_id
-    );
 
     let trace = histima(["trace", text(&workspace), &recipe_id, "--json"]);
     assert_success(&trace);
@@ -635,7 +510,7 @@ fn cli_json_covers_the_workspace_lifecycle() {
     assert_success(&stats);
     let stats = json_output(&stats);
     assert_eq!(stats["recipe_results"], 1);
-    assert_eq!(stats["artifact_bundles"], 1);
+    assert_eq!(stats["artifact_bundles"], 0);
 
     let invalid = histima([
         "--json",

@@ -36,7 +36,14 @@ pub struct TransformDecl {
     pub name_span: Span,
     pub parameters: Vec<Parameter>,
     pub return_type: TypeRef,
+    pub capabilities: Vec<CapabilityRef>,
     pub body: Vec<InnerStmt>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct CapabilityRef {
+    pub name: String,
     pub span: Span,
 }
 

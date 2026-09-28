@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ast::{self, ExprId, ExprKind, InnerStmt, Item};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    BasicBlock, BlockId, Constant, Parameter, Rgba8Channel, RuntimeCall, Terminator, Transform,
-    TransformId, Type, TypedModule, Value, ValueId, ValueKind,
+    BasicBlock, BlockId, Capability, Constant, Parameter, Rgba8Channel, RuntimeCall, Terminator,
+    Transform, TransformId, Type, TypedModule, Value, ValueId, ValueKind,
 };
 
 pub fn check(program: &ast::Program) -> Result<TypedModule, Vec<Diagnostic>> {
@@ -147,6 +147,10 @@ impl<'a> Checker<'a> {
             "u8" => Type::U8,
             "i64" => Type::I64,
             "f32" => Type::F32,
+            "String" => Type::String,
+            "StringView" => Type::StringView,
+            "Bytes" => Type::Bytes,
+            "BytesView" => Type::BytesView,
             "Image" => Type::Image,
             "ImageView" => Type::ImageView,
             _ => {
@@ -156,7 +160,7 @@ impl<'a> Checker<'a> {
                         reference.span,
                     )
                     .with_note(
-                        "the initial native-safe types are bool, u8, i64, f32, Image, and ImageView",
+                        "the native-safe types are bool, u8, i64, f32, String, StringView, Bytes, BytesView, Image, and ImageView",
                     ),
                 );
                 return None;
@@ -176,6 +180,7 @@ struct Lowerer<'a> {
     blocks: Vec<PendingBlock>,
     current_block: BlockId,
     diagnostics: Vec<Diagnostic>,
+    capabilities: BTreeSet<Capability>,
 }
 
 struct PendingBlock {
@@ -202,11 +207,39 @@ impl<'a> Lowerer<'a> {
             }],
             current_block: BlockId(0),
             diagnostics: Vec::new(),
+            capabilities: BTreeSet::new(),
         }
     }
 
     fn lower(mut self) -> Result<Transform, Vec<Diagnostic>> {
         let signature = self.signatures[&self.declaration.name].clone();
+        for capability in &self.declaration.capabilities {
+            let resolved = match capability.name.as_str() {
+                "env.read" => Some(Capability::EnvironmentRead),
+                "file.read" => Some(Capability::FileRead),
+                "http.get" => Some(Capability::HttpGet),
+                _ => None,
+            };
+            let Some(resolved) = resolved else {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("unknown inner capability `{}`", capability.name),
+                        capability.span,
+                    )
+                    .with_note("supported capabilities are env.read, file.read, and http.get"),
+                );
+                continue;
+            };
+            if !self.capabilities.insert(resolved) {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "capability `{}` is declared more than once",
+                        capability.name
+                    ),
+                    capability.span,
+                ));
+            }
+        }
         let mut parameters = Vec::new();
         for (index, (syntax, (_, ty))) in self
             .declaration
@@ -258,6 +291,7 @@ impl<'a> Lowerer<'a> {
             name: self.declaration.name.clone(),
             parameters,
             return_type: signature.return_type,
+            capabilities: self.capabilities.into_iter().collect(),
             values: self.values,
             blocks,
             entry: BlockId(0),
@@ -808,6 +842,12 @@ impl<'a> Lowerer<'a> {
                 expression.span,
                 true,
             )),
+            ExprKind::String(value) => Some(self.alloc(
+                Type::StringView,
+                ValueKind::Constant(Constant::String(value.clone())),
+                expression.span,
+                true,
+            )),
             ExprKind::Name(name) => match self.environment.get(name).copied() {
                 Some((value, _)) if self.moved.contains(&value) => {
                     self.diagnostics.push(
@@ -815,9 +855,7 @@ impl<'a> Lowerer<'a> {
                             format!("owned inner value `{name}` has already been moved"),
                             expression.span,
                         )
-                        .with_note(
-                            "owned image operations consume their Image input and return new ownership",
-                        ),
+                        .with_note("owned inner values are consumed when passed or transformed"),
                     );
                     None
                 }
@@ -918,6 +956,16 @@ impl<'a> Lowerer<'a> {
                     }
                     return self.environment_i64(arguments, expression.span);
                 }
+                if matches!(name.as_str(), "env.read" | "file.read" | "http.get") {
+                    if qualified {
+                        self.diagnostics.push(Diagnostic::error(
+                            "inner runtime operations cannot use semantic identity qualifiers",
+                            self.program.expr(*callee).span,
+                        ));
+                        return None;
+                    }
+                    return self.world_read(&name, arguments, expression.span);
+                }
                 if name == "image_zero" {
                     if qualified {
                         self.diagnostics.push(Diagnostic::error(
@@ -938,7 +986,7 @@ impl<'a> Lowerer<'a> {
                     }
                     return self.image_fill(arguments, expression.span);
                 }
-                let Some(signature) = self.signatures.get(name) else {
+                let Some(signature) = self.signatures.get(&name) else {
                     self.diagnostics.push(Diagnostic::error(
                         format!("unknown inner transform `{name}`"),
                         self.program.expr(*callee).span,
@@ -978,7 +1026,7 @@ impl<'a> Lowerer<'a> {
                         ));
                         return None;
                     }
-                    if *expected == Type::Image {
+                    if expected.is_owned() {
                         self.moved.insert(value);
                     }
                     lowered.push(value);
@@ -994,7 +1042,6 @@ impl<'a> Lowerer<'a> {
                 ))
             }
             ExprKind::Null
-            | ExprKind::String(_)
             | ExprKind::List(_)
             | ExprKind::Record(_)
             | ExprKind::Member { .. }
@@ -1034,6 +1081,15 @@ impl<'a> Lowerer<'a> {
         arguments: &[ast::Argument],
         span: crate::source::Span,
     ) -> Option<ValueId> {
+        if !self.capabilities.contains(&Capability::EnvironmentRead) {
+            self.diagnostics.push(
+                Diagnostic::error("environment access requires `uses env.read`", span).with_label(
+                    self.declaration.name_span,
+                    "declare the capability on this transform",
+                ),
+            );
+            return None;
+        }
         if arguments.len() != 1 || arguments[0].name.is_some() {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -1068,6 +1124,61 @@ impl<'a> Lowerer<'a> {
             span,
             true,
         ))
+    }
+
+    fn world_read(
+        &mut self,
+        name: &str,
+        arguments: &[ast::Argument],
+        span: crate::source::Span,
+    ) -> Option<ValueId> {
+        let (capability, result_type, argument_name) = match name {
+            "env.read" => (Capability::EnvironmentRead, Type::String, "name"),
+            "file.read" => (Capability::FileRead, Type::Bytes, "path"),
+            "http.get" => (Capability::HttpGet, Type::Bytes, "url"),
+            _ => unreachable!("world_read is called only for known World operations"),
+        };
+        if !self.capabilities.contains(&capability) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("{name} requires `uses {}`", capability.name()),
+                    span,
+                )
+                .with_label(
+                    self.declaration.name_span,
+                    "declare the capability on this transform",
+                ),
+            );
+            return None;
+        }
+        if arguments.len() != 1 || arguments[0].name.is_some() {
+            self.diagnostics.push(Diagnostic::error(
+                format!("{name} expects one positional StringView {argument_name}"),
+                span,
+            ));
+            return None;
+        }
+        let argument = self.expression(arguments[0].value)?;
+        let actual = self.values[argument.0 as usize].ty;
+        if actual != Type::StringView {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "{name} requires StringView {argument_name}, not {}",
+                        actual.name()
+                    ),
+                    arguments[0].span,
+                )
+                .with_note("string literals and StringView parameters are accepted"),
+            );
+            return None;
+        }
+        let call = match capability {
+            Capability::EnvironmentRead => RuntimeCall::EnvironmentRead { name: argument },
+            Capability::FileRead => RuntimeCall::FileRead { path: argument },
+            Capability::HttpGet => RuntimeCall::HttpGet { url: argument },
+        };
+        Some(self.alloc(result_type, ValueKind::RuntimeCall(call), span, true))
     }
 
     fn image_zero(
@@ -1160,15 +1271,25 @@ fn inner_statement_span(statement: &InnerStmt) -> crate::source::Span {
     }
 }
 
-fn inner_callable_name(program: &ast::Program, expression: ExprId) -> Option<(&str, bool)> {
+fn inner_callable_name(program: &ast::Program, expression: ExprId) -> Option<(String, bool)> {
     match &program.expr(expression).kind {
-        ExprKind::Name(name) => Some((name, false)),
-        ExprKind::IdentityQualified { callable, .. } => {
-            let ExprKind::Name(name) = &program.expr(*callable).kind else {
+        ExprKind::Name(name) => Some((name.clone(), false)),
+        ExprKind::Member { receiver, name, .. } => {
+            let ExprKind::Name(namespace) = &program.expr(*receiver).kind else {
                 return None;
             };
-            Some((name, true))
+            Some((format!("{namespace}.{name}"), false))
         }
+        ExprKind::IdentityQualified { callable, .. } => match &program.expr(*callable).kind {
+            ExprKind::Name(name) => Some((name.clone(), true)),
+            ExprKind::Member { receiver, name, .. } => {
+                let ExprKind::Name(namespace) = &program.expr(*receiver).kind else {
+                    return None;
+                };
+                Some((format!("{namespace}.{name}"), true))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1444,7 +1565,7 @@ mod tests {
     fn lowers_literal_environment_reads_to_typed_runtime_calls() {
         let compiled = compile(
             "test.tima",
-            "transform configured() -> i64 { return environment_i64(\"MODE\") }\n",
+            "transform configured() -> i64 uses env.read { return environment_i64(\"MODE\") }\n",
         )
         .unwrap();
         assert!(matches!(
@@ -1454,10 +1575,88 @@ mod tests {
     }
 
     #[test]
+    fn requires_declared_capabilities_and_rejects_unknown_or_duplicate_ones() {
+        let missing = compile(
+            "missing.tima",
+            "transform configured() -> i64 { return environment_i64(\"MODE\") }\n",
+        )
+        .unwrap_err();
+        assert!(
+            missing
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("requires `uses env.read`") })
+        );
+
+        let unknown = compile(
+            "unknown.tima",
+            "transform configured() -> i64 uses clock.read { return 1 }\n",
+        )
+        .unwrap_err();
+        assert!(unknown.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("unknown inner capability `clock.read`")
+        }));
+
+        let duplicate = compile(
+            "duplicate.tima",
+            "transform configured() -> i64 uses env.read, env.read { return 1 }\n",
+        )
+        .unwrap_err();
+        assert!(duplicate.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("capability `env.read` is declared more than once")
+        }));
+    }
+
+    #[test]
+    fn lowers_world_reads_with_native_safe_string_and_byte_types() {
+        let compiled = compile(
+            "world.tima",
+            "transform mode() -> String uses env.read { return env.read(\"MODE\") }\n\
+             transform local() -> Bytes uses file.read { return file.read(\"assets/a.bin\") }\n\
+             transform remote(url: StringView) -> Bytes uses http.get { return http.get(url) }\n",
+        )
+        .unwrap();
+
+        let mode = &compiled.transforms.transforms[0];
+        assert_eq!(mode.return_type, ir::Type::String);
+        assert!(matches!(
+            mode.values[0].kind,
+            ir::ValueKind::Constant(ir::Constant::String(ref value)) if value == "MODE"
+        ));
+        assert!(matches!(
+            mode.values[1].kind,
+            ir::ValueKind::RuntimeCall(ir::RuntimeCall::EnvironmentRead {
+                name: ir::ValueId(0)
+            })
+        ));
+
+        let local = &compiled.transforms.transforms[1];
+        assert_eq!(local.return_type, ir::Type::Bytes);
+        assert!(matches!(
+            local.values[1].kind,
+            ir::ValueKind::RuntimeCall(ir::RuntimeCall::FileRead {
+                path: ir::ValueId(0)
+            })
+        ));
+
+        let remote = &compiled.transforms.transforms[2];
+        assert_eq!(remote.parameters[0].ty, ir::Type::StringView);
+        assert!(matches!(
+            remote.values[1].kind,
+            ir::ValueKind::RuntimeCall(ir::RuntimeCall::HttpGet {
+                url: ir::ValueId(0)
+            })
+        ));
+    }
+
+    #[test]
     fn rejects_dynamic_environment_keys() {
         let diagnostics = compile(
             "test.tima",
-            "transform configured(key: i64) -> i64 { return environment_i64(key) }\n",
+            "transform configured(key: i64) -> i64 uses env.read { return environment_i64(key) }\n",
         )
         .unwrap_err();
         assert!(diagnostics[0].message.contains("string-literal name"));

@@ -98,6 +98,15 @@ impl Parser {
         self.expect(|kind| matches!(kind, TokenKind::RightParen), "`)`")?;
         self.expect(|kind| matches!(kind, TokenKind::Arrow), "`->`")?;
         let return_type = self.type_ref()?;
+        let mut capabilities = Vec::new();
+        if self.eat(|kind| matches!(kind, TokenKind::Uses)) {
+            loop {
+                capabilities.push(self.capability_ref()?);
+                if !self.eat(|kind| matches!(kind, TokenKind::Comma)) {
+                    break;
+                }
+            }
+        }
         self.expect(|kind| matches!(kind, TokenKind::LeftBrace), "`{`")?;
         let (body, end) = self.inner_block()?;
         Ok(TransformDecl {
@@ -105,7 +114,21 @@ impl Parser {
             name_span,
             parameters,
             return_type,
+            capabilities,
             body,
+            span: start.join(end),
+        })
+    }
+
+    fn capability_ref(&mut self) -> Result<CapabilityRef, Diagnostic> {
+        let (namespace, start) = self.identifier("a capability namespace after `uses`")?;
+        self.expect(
+            |kind| matches!(kind, TokenKind::Dot),
+            "`.` in a capability name",
+        )?;
+        let (operation, end) = self.identifier("a capability operation after `.`")?;
+        Ok(CapabilityRef {
+            name: format!("{namespace}.{operation}"),
             span: start.join(end),
         })
     }
@@ -558,6 +581,28 @@ mod tests {
         };
         assert!(matches!(transform.body[0], InnerStmt::Binding(_)));
         assert!(matches!(transform.body[1], InnerStmt::Return { .. }));
+    }
+
+    #[test]
+    fn parses_explicit_transform_capabilities() {
+        let source = SourceFile::new(
+            "test.tima",
+            "transform configured() -> i64 uses env.read, file.read, http.get {\n\
+                 return environment_i64(\"MODE\")\n\
+             }\n",
+        );
+        let program = parse(&source).unwrap();
+        let Item::Transform(transform) = &program.items[0] else {
+            panic!("expected transform")
+        };
+        assert_eq!(
+            transform
+                .capabilities
+                .iter()
+                .map(|capability| capability.name.as_str())
+                .collect::<Vec<_>>(),
+            ["env.read", "file.read", "http.get"]
+        );
     }
 
     #[test]

@@ -12,9 +12,7 @@ use crate::backend::wasm_runtime::{
     InvocationBridge, WasmBuffer, WasmImage, WasmInvokeError, WasmSession, WasmValue,
 };
 use crate::cache::{ResultCache, TransformResultCache};
-use crate::capability::{
-    ASSET_CAPABILITY, CapabilitySession, RuntimeCapabilities, observe_dependency,
-};
+use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
 use crate::diagnostic::Diagnostic;
 use crate::identity::{ContentIdentity, content_identity};
 use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueId, ValueKind};
@@ -345,7 +343,7 @@ pub fn execute_cached(
 
 pub fn execute_with_capabilities(
     program: &CompiledProgram,
-    capabilities: &dyn RuntimeCapabilities,
+    capabilities: &dyn World,
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = IrInterpreter {
         module: &program.transforms,
@@ -357,7 +355,7 @@ pub fn execute_with_capabilities(
 pub fn execute_cached_with_capabilities(
     program: &CompiledProgram,
     cache: &mut dyn ResultCache,
-    capabilities: &dyn RuntimeCapabilities,
+    capabilities: &dyn World,
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = IrInterpreter {
         module: &program.transforms,
@@ -396,7 +394,7 @@ pub fn execute_wasm_cached(
 pub fn execute_wasm_with_capabilities(
     program: &CompiledProgram,
     wasm: &WasmSession,
-    capabilities: &dyn RuntimeCapabilities,
+    capabilities: &dyn World,
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = WasmEngine {
         module: &program.transforms,
@@ -410,7 +408,7 @@ pub fn execute_wasm_cached_with_capabilities(
     program: &CompiledProgram,
     wasm: &WasmSession,
     cache: &mut dyn ResultCache,
-    capabilities: &dyn RuntimeCapabilities,
+    capabilities: &dyn World,
 ) -> Result<Execution, Vec<Diagnostic>> {
     let engine = WasmEngine {
         module: &program.transforms,
@@ -520,7 +518,7 @@ pub trait ReplayDependencyResolver {
     fn observe(&self, capability: &str, key: &[u8]) -> Result<ContentIdentity, String>;
 }
 
-struct CapabilityReplayResolver<'a>(&'a dyn RuntimeCapabilities);
+struct CapabilityReplayResolver<'a>(&'a dyn World);
 
 impl ReplayDependencyResolver for CapabilityReplayResolver<'_> {
     fn observe(&self, capability: &str, key: &[u8]) -> Result<ContentIdentity, String> {
@@ -560,7 +558,7 @@ pub fn replay_with_capabilities(
     program: &CompiledProgram,
     target: &OuterValue,
     cache: &mut dyn ResultCache,
-    capabilities: &dyn RuntimeCapabilities,
+    capabilities: &dyn World,
 ) -> Result<OuterValue, Diagnostic> {
     let engine = IrInterpreter {
         module: &program.transforms,
@@ -613,7 +611,7 @@ pub fn replay_wasm_with_capabilities(
     wasm: &WasmSession,
     target: &OuterValue,
     cache: &mut dyn ResultCache,
-    capabilities: &dyn RuntimeCapabilities,
+    capabilities: &dyn World,
 ) -> Result<OuterValue, Diagnostic> {
     let engine = WasmEngine {
         module: &program.transforms,
@@ -661,7 +659,7 @@ trait TransformEngine {
         false
     }
 
-    fn capabilities(&self) -> Option<&dyn RuntimeCapabilities> {
+    fn capabilities(&self) -> Option<&dyn World> {
         None
     }
 
@@ -1865,6 +1863,10 @@ enum NativeScalar {
 
 enum InterpretedValue {
     Scalar(NativeScalar),
+    String(String),
+    StringView(Arc<str>),
+    Bytes(Vec<u8>),
+    BytesView(Arc<[u8]>),
     Image(InterpretedImage),
     ImageView(Arc<ImageValue>),
 }
@@ -1873,9 +1875,22 @@ impl InterpretedValue {
     fn scalar(&self) -> NativeScalar {
         match self {
             Self::Scalar(value) => *value,
-            Self::Image(_) | Self::ImageView(_) => {
-                unreachable!("typed scalar operation received an image")
+            Self::String(_)
+            | Self::StringView(_)
+            | Self::Bytes(_)
+            | Self::BytesView(_)
+            | Self::Image(_)
+            | Self::ImageView(_) => {
+                unreachable!("typed scalar operation received a composite value")
             }
+        }
+    }
+
+    fn string(&self) -> &str {
+        match self {
+            Self::String(value) => value,
+            Self::StringView(value) => value,
+            _ => unreachable!("typed World operation received a non-string value"),
         }
     }
 }
@@ -1890,7 +1905,7 @@ struct InterpretedImage {
 
 struct IrInterpreter<'a> {
     module: &'a crate::ir::TypedModule,
-    capabilities: Option<&'a dyn RuntimeCapabilities>,
+    capabilities: Option<&'a dyn World>,
 }
 
 impl IrInterpreter<'_> {
@@ -1973,11 +1988,12 @@ impl IrInterpreter<'_> {
         let value = transform.value(id);
         Ok(match &value.kind {
             ValueKind::Parameter { .. } | ValueKind::ImageByteElement => unreachable!(),
-            ValueKind::Constant(constant) => InterpretedValue::Scalar(match constant {
-                Constant::Bool(value) => NativeScalar::Bool(*value),
-                Constant::I64(value) => NativeScalar::I64(*value),
-                Constant::F32(value) => NativeScalar::F32(*value),
-            }),
+            ValueKind::Constant(constant) => match constant {
+                Constant::Bool(value) => InterpretedValue::Scalar(NativeScalar::Bool(*value)),
+                Constant::I64(value) => InterpretedValue::Scalar(NativeScalar::I64(*value)),
+                Constant::F32(value) => InterpretedValue::Scalar(NativeScalar::F32(*value)),
+                Constant::String(value) => InterpretedValue::StringView(Arc::from(value.as_str())),
+            },
             ValueKind::Binary { op, left, right } => InterpretedValue::Scalar(native_binary(
                 *op,
                 values[left.0 as usize].as_ref().unwrap().scalar(),
@@ -2088,6 +2104,26 @@ impl IrInterpreter<'_> {
                     capabilities.environment_i64(name, value.span)?,
                 ))
             }
+            ValueKind::RuntimeCall(RuntimeCall::EnvironmentRead { name }) => {
+                let name = values[name.0 as usize]
+                    .as_ref()
+                    .unwrap()
+                    .string()
+                    .to_owned();
+                InterpretedValue::String(capabilities.environment(&name, value.span)?)
+            }
+            ValueKind::RuntimeCall(RuntimeCall::FileRead { path }) => {
+                let path = values[path.0 as usize]
+                    .as_ref()
+                    .unwrap()
+                    .string()
+                    .to_owned();
+                InterpretedValue::Bytes(capabilities.read_file(&path, value.span)?)
+            }
+            ValueKind::RuntimeCall(RuntimeCall::HttpGet { url }) => {
+                let url = values[url.0 as usize].as_ref().unwrap().string().to_owned();
+                InterpretedValue::Bytes(capabilities.http_get(&url, value.span)?)
+            }
         })
     }
 }
@@ -2110,7 +2146,7 @@ impl TransformEngine for IrInterpreter<'_> {
         transform_may_observe_dependencies(self.module, id)
     }
 
-    fn capabilities(&self) -> Option<&dyn RuntimeCapabilities> {
+    fn capabilities(&self) -> Option<&dyn World> {
         self.capabilities
     }
 }
@@ -2118,7 +2154,7 @@ impl TransformEngine for IrInterpreter<'_> {
 struct WasmEngine<'a> {
     module: &'a crate::ir::TypedModule,
     wasm: &'a WasmSession,
-    capabilities: Option<&'a dyn RuntimeCapabilities>,
+    capabilities: Option<&'a dyn World>,
 }
 
 impl TransformEngine for WasmEngine<'_> {
@@ -2189,7 +2225,7 @@ impl TransformEngine for WasmEngine<'_> {
         transform_may_observe_dependencies(self.module, id)
     }
 
-    fn capabilities(&self) -> Option<&dyn RuntimeCapabilities> {
+    fn capabilities(&self) -> Option<&dyn World> {
         self.capabilities
     }
 
@@ -2574,6 +2610,14 @@ fn lower_interpreted_value(
         (Type::F32, ValueData::Float(value)) => {
             Ok(InterpretedValue::Scalar(NativeScalar::F32(value)))
         }
+        (Type::String, ValueData::String(value)) => {
+            Ok(InterpretedValue::String(value.as_ref().to_owned()))
+        }
+        (Type::StringView, ValueData::String(value)) => Ok(InterpretedValue::StringView(value)),
+        (Type::Bytes, ValueData::Bytes(value)) => {
+            Ok(InterpretedValue::Bytes(value.as_ref().to_vec()))
+        }
+        (Type::BytesView, ValueData::Bytes(value)) => Ok(InterpretedValue::BytesView(value)),
         (Type::Image, ValueData::Image(image)) => {
             let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
             let ImageValue {
@@ -2623,6 +2667,17 @@ fn transfer_interpreted_argument(
         (Type::F32, InterpretedValue::Scalar(NativeScalar::F32(value))) => {
             InterpretedValue::Scalar(NativeScalar::F32(*value))
         }
+        (Type::StringView, InterpretedValue::StringView(value)) => {
+            InterpretedValue::StringView(value.clone())
+        }
+        (Type::BytesView, InterpretedValue::BytesView(value)) => {
+            InterpretedValue::BytesView(value.clone())
+        }
+        (Type::String, InterpretedValue::String(_)) | (Type::Bytes, InterpretedValue::Bytes(_)) => {
+            value
+                .take()
+                .expect("owned inner argument remains available until transferred")
+        }
         (Type::ImageView, InterpretedValue::ImageView(image)) => {
             InterpretedValue::ImageView(image.clone())
         }
@@ -2636,6 +2691,10 @@ fn transfer_interpreted_argument(
 fn freeze_interpreted_value(value: InterpretedValue) -> OuterValue {
     match value {
         InterpretedValue::Scalar(value) => freeze_scalar(value),
+        InterpretedValue::String(value) => OuterValue::plain(ValueData::String(Arc::from(value))),
+        InterpretedValue::StringView(value) => OuterValue::plain(ValueData::String(value)),
+        InterpretedValue::Bytes(value) => OuterValue::plain(ValueData::Bytes(Arc::from(value))),
+        InterpretedValue::BytesView(value) => OuterValue::plain(ValueData::Bytes(value)),
         InterpretedValue::Image(image) => OuterValue::image(ImageValue {
             storage: Arc::new(ImageStorage::new(image.storage)),
             format: image.format,
@@ -2725,7 +2784,7 @@ fn checked_u8(value: i64, span: Span) -> Result<u8, Diagnostic> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2741,10 +2800,10 @@ mod tests {
         ImageFormat, ImageStorage, ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver,
         TransformEngine, ValueData, WasmValue, execute, execute_cached,
         execute_cached_with_capabilities, execute_wasm, execute_wasm_cached_with_capabilities,
-        execute_wasm_with_bindings_cached, execute_with, invoke_wasm_transform,
-        lower_wasm_argument, replay, replay_wasm, replay_wasm_with_capabilities,
-        replay_with_capabilities, replay_with_dependencies, scale_rgba8_channel,
-        validate_returned_layout,
+        execute_wasm_with_bindings_cached, execute_with, execute_with_capabilities,
+        invoke_wasm_transform, lower_wasm_argument, replay, replay_wasm,
+        replay_wasm_with_capabilities, replay_with_capabilities, replay_with_dependencies,
+        scale_rgba8_channel, validate_returned_layout,
     };
     use crate::source::Span;
 
@@ -2782,6 +2841,50 @@ mod tests {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| format!("environment value `{name}` is unavailable"))
+        }
+    }
+
+    struct FixedWorld {
+        environment: BTreeMap<String, Vec<u8>>,
+        files: BTreeMap<String, Vec<u8>>,
+        urls: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl RuntimeCapabilities for FixedWorld {
+        fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
+            self.environment
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("environment value `{name}` is unavailable"))
+        }
+
+        fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("file `{path}` is unavailable"))
+        }
+
+        fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
+            self.urls
+                .get(url)
+                .cloned()
+                .ok_or_else(|| format!("HTTP URL `{url}` is unavailable"))
+        }
+    }
+
+    struct ChangingFile(RefCell<VecDeque<Vec<u8>>>);
+
+    impl RuntimeCapabilities for ChangingFile {
+        fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
+            Err(format!("environment value `{name}` is unavailable"))
+        }
+
+        fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
+            self.0
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| "no value remains".to_owned())
         }
     }
 
@@ -2852,7 +2955,7 @@ mod tests {
     fn environment_capability_is_explicit_and_part_of_the_recipe() {
         let compiled = crate::compile(
             "test.tima",
-            "transform read_mode() -> i64 { return environment_i64(\"MODE\") }\n\
+            "transform read_mode() -> i64 uses env.read { return environment_i64(\"MODE\") }\n\
              transform configured() -> i64 { return read_mode() }\n\
              result = configured()\n",
         )
@@ -2907,10 +3010,101 @@ mod tests {
     }
 
     #[test]
+    fn world_reads_return_frozen_values_and_record_precise_observations() {
+        let compiled = crate::compile(
+            "world.tima",
+            "transform mode() -> String uses env.read { return env.read(\"MODE\") }\n\
+             transform local() -> Bytes uses file.read { return file.read(\"assets/a.bin\") }\n\
+             transform remote(url: StringView) -> Bytes uses http.get { return http.get(url) }\n\
+             mode_value = mode()\n\
+             file_value = local()\n\
+             http_value = remote(\"https://example.test/data\")\n",
+        )
+        .unwrap();
+        let world = FixedWorld {
+            environment: BTreeMap::from([("MODE".to_owned(), b"dark".to_vec())]),
+            files: BTreeMap::from([("assets/a.bin".to_owned(), b"local".to_vec())]),
+            urls: BTreeMap::from([("https://example.test/data".to_owned(), b"remote".to_vec())]),
+        };
+        let mut cache = TransformResultCache::default();
+        let execution = execute_cached_with_capabilities(&compiled, &mut cache, &world).unwrap();
+
+        assert_eq!(
+            execution.bindings["mode_value"].data,
+            ValueData::String(Arc::from("dark"))
+        );
+        assert_eq!(
+            execution.bindings["file_value"].data,
+            ValueData::Bytes(Arc::from(&b"local"[..]))
+        );
+        assert_eq!(
+            execution.bindings["http_value"].data,
+            ValueData::Bytes(Arc::from(&b"remote"[..]))
+        );
+
+        for (binding, capability, key, content) in [
+            (
+                "mode_value",
+                "environment",
+                b"MODE".as_slice(),
+                b"dark".as_slice(),
+            ),
+            (
+                "file_value",
+                "file.read",
+                b"assets/a.bin".as_slice(),
+                b"local".as_slice(),
+            ),
+            (
+                "http_value",
+                "http.get",
+                b"https://example.test/data".as_slice(),
+                b"remote".as_slice(),
+            ),
+        ] {
+            let LineageNode::Invocation(invocation) =
+                execution.bindings[binding].lineage.as_ref().unwrap().node()
+            else {
+                panic!("expected invocation lineage")
+            };
+            let LineageNode::ExternalObservation(observation) = invocation.observations[0].node()
+            else {
+                panic!("expected external observation")
+            };
+            assert_eq!(observation.capability.as_ref(), capability);
+            assert_eq!(observation.key.as_ref(), key);
+            assert_eq!(observation.observed_content, byte_content_identity(content));
+        }
+    }
+
+    #[test]
+    fn world_dependency_must_remain_stable_during_one_invocation() {
+        let compiled = crate::compile(
+            "changing.tima",
+            "transform load() -> Bytes uses file.read {\n\
+                 first = file.read(\"config.bin\")\n\
+                 return file.read(\"config.bin\")\n\
+             }\n\
+             result = load()\n",
+        )
+        .unwrap();
+        let world = ChangingFile(RefCell::new(VecDeque::from([
+            b"first".to_vec(),
+            b"second".to_vec(),
+        ])));
+        let diagnostic = execute_with_capabilities(&compiled, &world).unwrap_err();
+        assert!(
+            diagnostic[0]
+                .message
+                .contains("changed during one transform invocation")
+        );
+    }
+
+    #[test]
     fn replay_revalidates_and_reexecutes_environment_dependencies() {
         let compiled = crate::compile(
             "test.tima",
-            "transform configured() -> i64 { return environment_i64(\"MODE\") }\n\
+            "transform configured() -> i64 uses env.read { return environment_i64(\"MODE\") }\n\
              result = configured()\n",
         )
         .unwrap();
@@ -3503,7 +3697,7 @@ mod tests {
     fn wasm_reads_environment_through_the_host_capability() {
         let compiled = crate::compile(
             "test.tima",
-            "transform read_mode() -> i64 { return environment_i64(\"MODE\") }\n\
+            "transform read_mode() -> i64 uses env.read { return environment_i64(\"MODE\") }\n\
              transform configured() -> i64 { return read_mode() }\n\
              result = configured()\n",
         )
@@ -3549,7 +3743,7 @@ mod tests {
     fn untaken_branches_do_not_observe_runtime_capabilities() {
         let compiled = crate::compile(
             "test.tima",
-            "transform guarded(flag: bool) -> i64 {\n\
+            "transform guarded(flag: bool) -> i64 uses env.read {\n\
                  if flag {\n\
                      observed = environment_i64(\"MODE\")\n\
                  } else {}\n\

@@ -12,14 +12,14 @@ mod error;
 mod runner;
 mod stored_lineage;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tima::backend::wasm_runtime::{DEFAULT_MEMORY_LIMIT, parse_memory_limit};
-use tima::capability::RuntimeCapabilities;
+use tima::capability::{ENVIRONMENT_CAPABILITY, FILE_READ_CAPABILITY, HTTP_GET_CAPABILITY, World};
 use tima::identity::{
-    ArtifactIdentity, ContentIdentity, RecipeIdentity, SourceIdentity, byte_content_identity,
-    source_identity,
+    ArtifactIdentity, ContentIdentity, DependencyIdentity, RecipeIdentity, SourceIdentity,
+    byte_content_identity, source_identity,
 };
 use tima::lineage::{Lineage, LineageNode};
 use tima::runtime::{OuterValue, ValueData};
@@ -29,13 +29,14 @@ use catalog::{Catalog, validate_artifact_identities};
 
 const CATALOG_FILE_NAME: &str = ".histima.sql3";
 const LEGACY_CATALOG_FILE_NAME: &str = "catalog.sqlite3";
+const WORLD_HTTP_READ_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub use catalog::{
     ArtifactBundleMember, ArtifactInfo, ArtifactSummary, AssetSummary, CATALOG_LIST_LIMIT,
     CatalogInfo, CatalogPage, CatalogStats, RecipeSummary,
 };
 pub use error::{Error, Result};
-pub use runner::{PipelineExecution, ProgramExecution, RecipeReplay, RunError};
+pub use runner::{PipelineExecution, ProgramExecution, RecipeReplay, ReplayPolicy, RunError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedAsset {
@@ -111,7 +112,138 @@ pub struct Workspace {
     root: PathBuf,
     content: ContentStore,
     catalog: Catalog,
-    wasm_memory_limit: u64,
+    world: WorldPolicy,
+}
+
+#[derive(Debug)]
+struct WorldPolicy {
+    environment: BTreeSet<String>,
+    retain_environment: BTreeSet<String>,
+    file_roots: Vec<PathBuf>,
+    http_prefixes: Vec<String>,
+}
+
+impl WorldPolicy {
+    fn load(root: &Path) -> Result<Self> {
+        let workspace_root = fs::canonicalize(root)
+            .map_err(|error| Error::io("resolve Histima workspace", root, error))?;
+        let mut policy = Self {
+            environment: BTreeSet::new(),
+            retain_environment: BTreeSet::new(),
+            file_roots: vec![workspace_root],
+            http_prefixes: Vec::new(),
+        };
+        let config_path = root.join(".histima.toml");
+        if !config_path.is_file() {
+            return Ok(policy);
+        }
+        let text = fs::read_to_string(&config_path)
+            .map_err(|error| Error::io("read workspace configuration", &config_path, error))?;
+        let config = toml::from_str::<toml::Value>(&text).map_err(|error| {
+            Error::catalog(format!("invalid {}: {error}", config_path.display()))
+        })?;
+        let Some(world) = config.get("world") else {
+            return Ok(policy);
+        };
+        let world = world.as_table().ok_or_else(|| {
+            Error::catalog(format!(
+                "[world] in {} must be a table",
+                config_path.display()
+            ))
+        })?;
+
+        policy.environment.extend(config_strings(
+            world.get("environment"),
+            "[world].environment",
+        )?);
+        policy.retain_environment.extend(config_strings(
+            world.get("retain_environment"),
+            "[world].retain_environment",
+        )?);
+        if let Some(name) = policy
+            .retain_environment
+            .iter()
+            .find(|name| !policy.environment.contains(*name))
+        {
+            return Err(Error::catalog(format!(
+                "[world].retain_environment entry {name:?} must also appear in [world].environment"
+            )));
+        }
+        policy.http_prefixes = config_strings(world.get("http_prefixes"), "[world].http_prefixes")?;
+        for prefix in &policy.http_prefixes {
+            if !(prefix.starts_with("http://") || prefix.starts_with("https://")) {
+                return Err(Error::catalog(format!(
+                    "[world].http_prefixes entry {prefix:?} must begin with http:// or https://"
+                )));
+            }
+        }
+        for configured in config_strings(world.get("file_roots"), "[world].file_roots")? {
+            let configured = PathBuf::from(configured);
+            let configured = if configured.is_absolute() {
+                configured
+            } else {
+                root.join(configured)
+            };
+            let resolved = fs::canonicalize(&configured).map_err(|error| {
+                Error::io("resolve configured World file root", &configured, error)
+            })?;
+            if !resolved.is_dir() {
+                return Err(Error::catalog(format!(
+                    "configured World file root {} is not a directory",
+                    resolved.display()
+                )));
+            }
+            if !policy.file_roots.contains(&resolved) {
+                policy.file_roots.push(resolved);
+            }
+        }
+        Ok(policy)
+    }
+
+    fn resolve_file(
+        &self,
+        workspace: &Path,
+        requested: &str,
+    ) -> std::result::Result<PathBuf, String> {
+        let requested_path = Path::new(requested);
+        let candidate = if requested_path.is_absolute() {
+            requested_path.to_owned()
+        } else {
+            workspace.join(requested_path)
+        };
+        let resolved = fs::canonicalize(&candidate)
+            .map_err(|error| format!("could not resolve {}: {error}", candidate.display()))?;
+        if self
+            .file_roots
+            .iter()
+            .any(|root| resolved.starts_with(root))
+        {
+            Ok(resolved)
+        } else {
+            Err(format!(
+                "{} is outside the workspace and configured file roots",
+                resolved.display()
+            ))
+        }
+    }
+}
+
+fn config_strings(value: Option<&toml::Value>, key: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| Error::catalog(format!("{key} must be an array of strings")))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::catalog(format!("{key} must contain only strings")))
+        })
+        .collect()
 }
 
 impl Workspace {
@@ -131,25 +263,18 @@ impl Workspace {
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_wasm_memory_limit(root, None)
-    }
-
-    pub fn open_with_wasm_memory_limit(
-        root: impl AsRef<Path>,
-        cli_memory_limit: Option<u64>,
-    ) -> Result<Self> {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root)
             .map_err(|error| Error::io("create Histima workspace", &root, error))?;
         migrate_legacy_catalog(&root)?;
         let content = ContentStore::open(&root)?;
         let catalog = Catalog::open(&root.join(CATALOG_FILE_NAME))?;
-        let wasm_memory_limit = resolve_wasm_memory_limit(&root, cli_memory_limit)?;
+        let world = WorldPolicy::load(&root)?;
         Ok(Self {
             root,
             content,
             catalog,
-            wasm_memory_limit,
+            world,
         })
     }
 
@@ -157,13 +282,48 @@ impl Workspace {
         &self.root
     }
 
+    fn retain_world_snapshot(
+        &self,
+        capability: &str,
+        key: &[u8],
+        bytes: &[u8],
+    ) -> std::result::Result<(), String> {
+        let content = self.content.put(bytes).map_err(|error| error.to_string())?;
+        self.catalog
+            .record_world_snapshot(capability, key, &content)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn world_snapshot(
+        &self,
+        dependency: DependencyIdentity,
+    ) -> std::result::Result<Option<Vec<u8>>, String> {
+        let Some(object) = self
+            .catalog
+            .world_snapshot(dependency)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let bytes = self
+            .content
+            .read_recorded(&object.content_id, &object.relative_path, object.kind)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 != object.byte_len {
+            return Err(format!(
+                "snapshot content {} has catalog length {} but stored length {}",
+                object.content_id,
+                object.byte_len,
+                bytes.len()
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
     /// Root for compiled artifacts and future non-semantic execution caches.
     pub fn artifact_cache_root(&self) -> PathBuf {
         self.root.join("cache")
-    }
-
-    pub fn wasm_memory_limit(&self) -> u64 {
-        self.wasm_memory_limit
     }
 
     pub fn import_file(&mut self, path: impl AsRef<Path>) -> Result<ImportedAsset> {
@@ -502,49 +662,64 @@ fn migrate_legacy_catalog(root: &Path) -> Result<()> {
         .map_err(|error| Error::io("rename legacy Histima catalog", &legacy, error))
 }
 
-fn resolve_wasm_memory_limit(root: &Path, cli: Option<u64>) -> Result<u64> {
-    let environment = std::env::var_os("HISTIMA_WASM_MEMORY_LIMIT");
-    resolve_wasm_memory_limit_with(root, cli, environment.as_deref())
-}
-
-fn resolve_wasm_memory_limit_with(
-    root: &Path,
-    cli: Option<u64>,
-    environment: Option<&std::ffi::OsStr>,
-) -> Result<u64> {
-    if let Some(limit) = cli {
-        tima::backend::wasm_runtime::validate_memory_limit(limit)
-            .map_err(|error| Error::catalog(error.to_string()))?;
-        return Ok(limit);
-    }
-    if let Some(value) = environment {
-        let value = value
-            .to_str()
-            .ok_or_else(|| Error::catalog("HISTIMA_WASM_MEMORY_LIMIT is not valid UTF-8"))?;
-        return parse_memory_limit(value).map_err(|error| Error::catalog(error.to_string()));
-    }
-    let config_path = root.join(".histima.toml");
-    if config_path.is_file() {
-        let text = fs::read_to_string(&config_path)
-            .map_err(|error| Error::io("read workspace configuration", &config_path, error))?;
-        let config = toml::from_str::<toml::Value>(&text).map_err(|error| {
-            Error::catalog(format!("invalid {}: {error}", config_path.display()))
-        })?;
-        if let Some(value) = config.get("wasm").and_then(|wasm| wasm.get("memory_limit")) {
-            let value = value.as_str().ok_or_else(|| {
-                Error::catalog("[wasm].memory_limit must be a quoted size string")
-            })?;
-            return parse_memory_limit(value).map_err(|error| Error::catalog(error.to_string()));
-        }
-    }
-    Ok(DEFAULT_MEMORY_LIMIT)
-}
-
-impl RuntimeCapabilities for Workspace {
+impl World for Workspace {
     fn environment(&self, name: &str) -> std::result::Result<Vec<u8>, String> {
-        Err(format!(
-            "environment value `{name}` is unavailable in this Histima workspace"
-        ))
+        if !self.world.environment.contains(name) {
+            return Err(format!(
+                "environment value `{name}` is not granted by [world].environment"
+            ));
+        }
+        let bytes = std::env::var(name)
+            .map(String::into_bytes)
+            .map_err(|error| format!("environment value `{name}` is unavailable: {error}"))?;
+        if self.world.retain_environment.contains(name) {
+            self.retain_world_snapshot(ENVIRONMENT_CAPABILITY, name.as_bytes(), &bytes)?;
+        }
+        Ok(bytes)
+    }
+
+    fn read_file(&self, path: &str) -> std::result::Result<Vec<u8>, String> {
+        let resolved = self.world.resolve_file(&self.root, path)?;
+        let bytes = fs::read(&resolved)
+            .map_err(|error| format!("could not read {}: {error}", resolved.display()))?;
+        self.retain_world_snapshot(FILE_READ_CAPABILITY, path.as_bytes(), &bytes)?;
+        Ok(bytes)
+    }
+
+    fn http_get(&self, url: &str) -> std::result::Result<Vec<u8>, String> {
+        if !self
+            .world
+            .http_prefixes
+            .iter()
+            .any(|prefix| url.starts_with(prefix))
+        {
+            return Err(format!(
+                "URL `{url}` is not granted by [world].http_prefixes"
+            ));
+        }
+        let config = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build();
+        let agent = ureq::Agent::new_with_config(config);
+        let mut response = agent
+            .get(url)
+            .call()
+            .map_err(|error| format!("HTTP GET failed: {error}"))?;
+        if response.status().is_redirection() {
+            return Err(format!(
+                "HTTP redirects are disabled because the redirected URL has not been granted: {}",
+                response.status()
+            ));
+        }
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(WORLD_HTTP_READ_LIMIT)
+            .read_to_vec()
+            .map_err(|error| format!("could not read HTTP response body: {error}"))?;
+        self.retain_world_snapshot(HTTP_GET_CAPABILITY, url.as_bytes(), &bytes)?;
+        Ok(bytes)
     }
 
     fn read_asset(&self, locator: &str) -> std::result::Result<Vec<u8>, String> {
@@ -573,7 +748,7 @@ mod tests {
         assert_eq!(
             workspace.catalog_info().unwrap(),
             CatalogInfo {
-                schema_version: 4,
+                schema_version: 5,
                 foreign_keys_enabled: true,
                 journal_mode: "wal".to_owned(),
             }
@@ -582,39 +757,56 @@ mod tests {
     }
 
     #[test]
-    fn wasm_memory_limit_uses_cli_environment_config_then_default_precedence() {
-        let test = TestDirectory::new("wasm-memory-limit");
+    fn workspace_world_confines_files_and_loads_explicit_grants() {
+        let test = TestDirectory::new("world-policy");
         let root = test.path().join("workspace");
+        let external = test.path().join("shared");
+        let denied = test.path().join("denied");
         fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::create_dir_all(&denied).unwrap();
+        fs::write(root.join("local.bin"), b"local").unwrap();
+        fs::write(external.join("shared.bin"), b"shared").unwrap();
+        fs::write(denied.join("secret.bin"), b"secret").unwrap();
         fs::write(
             root.join(".histima.toml"),
-            "[wasm]\nmemory_limit = \"128MiB\"\n",
+            "[world]\n\
+             environment = [\"HISTIMA_TEST_MODE\"]\n\
+             retain_environment = [\"HISTIMA_TEST_MODE\"]\n\
+             file_roots = [\"../shared\"]\n\
+             http_prefixes = [\"https://example.test/assets/\"]\n",
         )
         .unwrap();
 
-        assert_eq!(
-            resolve_wasm_memory_limit_with(&root, None, None).unwrap(),
-            128 * 1024 * 1024
+        let workspace = Workspace::open(&root).unwrap();
+        assert!(workspace.world.environment.contains("HISTIMA_TEST_MODE"));
+        assert!(
+            workspace
+                .world
+                .retain_environment
+                .contains("HISTIMA_TEST_MODE")
         );
         assert_eq!(
-            resolve_wasm_memory_limit_with(&root, None, Some(std::ffi::OsStr::new("256MiB")),)
-                .unwrap(),
-            256 * 1024 * 1024
+            workspace.world.http_prefixes,
+            ["https://example.test/assets/"]
         );
+        assert_eq!(World::read_file(&workspace, "local.bin").unwrap(), b"local");
         assert_eq!(
-            resolve_wasm_memory_limit_with(
-                &root,
-                Some(64 * 1024 * 1024),
-                Some(std::ffi::OsStr::new("invalid")),
-            )
-            .unwrap(),
-            64 * 1024 * 1024
+            World::read_file(&workspace, external.join("shared.bin").to_str().unwrap()).unwrap(),
+            b"shared"
         );
-
-        fs::remove_file(root.join(".histima.toml")).unwrap();
-        assert_eq!(
-            resolve_wasm_memory_limit_with(&root, None, None).unwrap(),
-            DEFAULT_MEMORY_LIMIT
+        let error =
+            World::read_file(&workspace, denied.join("secret.bin").to_str().unwrap()).unwrap_err();
+        assert!(error.contains("outside the workspace and configured file roots"));
+        assert!(
+            World::environment(&workspace, "UNDECLARED")
+                .unwrap_err()
+                .contains("not granted")
+        );
+        assert!(
+            World::http_get(&workspace, "https://other.test/assets/a")
+                .unwrap_err()
+                .contains("not granted")
         );
     }
 
@@ -825,10 +1017,9 @@ mod tests {
         let workspace = Workspace::open(test.path().join("workspace")).unwrap();
         let output = test.path().join("output.bin");
 
-        RuntimeCapabilities::write_asset(&workspace, output.to_str().unwrap(), b"first").unwrap();
+        World::write_asset(&workspace, output.to_str().unwrap(), b"first").unwrap();
         let error =
-            RuntimeCapabilities::write_asset(&workspace, output.to_str().unwrap(), b"replacement")
-                .unwrap_err();
+            World::write_asset(&workspace, output.to_str().unwrap(), b"replacement").unwrap_err();
 
         assert!(error.contains("refusing to replace"));
         assert_eq!(fs::read(output).unwrap(), b"first");

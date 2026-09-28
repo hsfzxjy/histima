@@ -17,6 +17,14 @@ pub enum Type {
     U8,
     I64,
     F32,
+    /// Uniquely owned UTF-8 storage.
+    String,
+    /// Read-only UTF-8 storage that may alias.
+    StringView,
+    /// Uniquely owned byte storage.
+    Bytes,
+    /// Read-only byte storage that may alias.
+    BytesView,
     /// Uniquely owned and mutable while an inner transform runs.
     Image,
     /// Read-only and permitted to alias other views.
@@ -30,6 +38,10 @@ impl Type {
             Self::U8 => "u8",
             Self::I64 => "i64",
             Self::F32 => "f32",
+            Self::String => "String",
+            Self::StringView => "StringView",
+            Self::Bytes => "Bytes",
+            Self::BytesView => "BytesView",
             Self::Image => "Image",
             Self::ImageView => "ImageView",
         }
@@ -37,6 +49,10 @@ impl Type {
 
     pub fn is_numeric(self) -> bool {
         matches!(self, Self::I64 | Self::F32)
+    }
+
+    pub fn is_owned(self) -> bool {
+        matches!(self, Self::String | Self::Bytes | Self::Image)
     }
 }
 
@@ -64,10 +80,30 @@ pub struct Transform {
     pub name: String,
     pub parameters: Vec<Parameter>,
     pub return_type: Type,
+    pub capabilities: Vec<Capability>,
     pub values: Vec<Value>,
     pub blocks: Vec<BasicBlock>,
     pub entry: BlockId,
     pub span: Span,
+}
+
+/// Broad external read authorities declared by an inner transform. Precise
+/// resource keys and observed content identities are recorded at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Capability {
+    EnvironmentRead,
+    FileRead,
+    HttpGet,
+}
+
+impl Capability {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::EnvironmentRead => "env.read",
+            Self::FileRead => "file.read",
+            Self::HttpGet => "http.get",
+        }
+    }
 }
 
 impl Transform {
@@ -162,13 +198,17 @@ pub enum ValueKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RuntimeCall {
     EnvironmentI64 { name: String },
+    EnvironmentRead { name: ValueId },
+    FileRead { path: ValueId },
+    HttpGet { url: ValueId },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Constant {
     Bool(bool),
     I64(i64),
     F32(f32),
+    String(String),
 }
 
 #[derive(Clone, Debug)]

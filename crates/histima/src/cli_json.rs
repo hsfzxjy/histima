@@ -191,9 +191,10 @@ pub fn run(result: &ProgramExecution, recorded: Option<(&str, &RecordedResult)>)
         .then(|| lineage.render())
     });
     json!({
-        "artifact_cache": artifact_cache(result.artifact_cache),
+        "execution_engine": "interpreter",
+        "artifact_cache": Value::Null,
         "result_cache": cache_stats(result.result_cache),
-        "artifact": artifact_info(&result.artifact),
+        "artifact": result.artifact.as_ref().map(artifact_info),
         "bindings": bindings,
         "trace": trace,
         "recorded": recorded.map(|(binding, recorded)| json!({
@@ -220,9 +221,11 @@ pub fn pipeline(result: &PipelineExecution, stocked: Option<&RecordedResult>) ->
 
 pub fn replay(recipe_id: impl ToString, content_id: impl ToString, result: &RecipeReplay) -> Value {
     json!({
-        "artifact_cache": artifact_cache(result.artifact_cache),
+        "execution_engine": "interpreter",
+        "replay_policy": result.policy.name(),
+        "artifact_cache": Value::Null,
         "result_cache": cache_stats(result.result_cache),
-        "artifact": artifact_info(&result.artifact),
+        "artifact": result.artifact.as_ref().map(artifact_info),
         "recipe_id": recipe_id.to_string(),
         "content_id": content_id.to_string(),
         "replayed": outer_value(&result.value),
@@ -236,13 +239,6 @@ pub fn trace(trace: &DurableTrace) -> Value {
         "content_id": trace.content_id.to_string(),
         "trace": trace.rendered,
     })
-}
-
-fn artifact_cache(status: tima::backend::wasm_runtime::ArtifactCacheStatus) -> &'static str {
-    match status {
-        tima::backend::wasm_runtime::ArtifactCacheStatus::Hit => "hit",
-        tima::backend::wasm_runtime::ArtifactCacheStatus::Miss => "miss",
-    }
 }
 
 fn cache_stats(stats: CacheStats) -> Value {

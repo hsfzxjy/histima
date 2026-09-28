@@ -4,9 +4,8 @@ use std::process::ExitCode;
 
 use tima::backend::ArtifactBackend;
 use tima::backend::wasm::WasmBackend;
-use tima::backend::wasm_runtime::{DEFAULT_MEMORY_LIMIT, WasmArtifactCache, WasmSession};
 use tima::cache::TransformResultCache;
-use tima::capability::RuntimeCapabilities;
+use tima::capability::World;
 use tima::runtime::{OuterValue, ValueData};
 use tima::source::SourceFile;
 
@@ -54,32 +53,10 @@ fn run() -> Result<(), ()> {
             }
         }
         "run" => {
-            let generated = WasmBackend
-                .emit(&compiled.transforms)
-                .map_err(|diagnostics| {
-                    for diagnostic in diagnostics {
-                        eprint!("{}", diagnostic.render(&compiled.source));
-                    }
-                })?;
-            let transform_ids = compiled.identities.iter().collect::<Vec<_>>();
-            let cached_artifact = WasmArtifactCache
-                .store(&generated, &transform_ids, "build/cache")
-                .map_err(|error| {
-                    eprintln!("error: {error}");
-                })?;
-            let wasm = WasmSession::instantiate(
-                &cached_artifact.artifact,
-                &compiled.transforms,
-                DEFAULT_MEMORY_LIMIT,
-            )
-            .map_err(|error| {
-                eprintln!("error: could not instantiate Wasm transform artifact: {error}");
-            })?;
             let mut result_cache = TransformResultCache::default();
             let capabilities = CliCapabilities;
-            let execution = tima::runtime::execute_wasm_cached_with_capabilities(
+            let execution = tima::runtime::execute_cached_with_capabilities(
                 &compiled,
-                &wasm,
                 &mut result_cache,
                 &capabilities,
             )
@@ -125,7 +102,7 @@ fn run() -> Result<(), ()> {
 
 struct CliCapabilities;
 
-impl RuntimeCapabilities for CliCapabilities {
+impl World for CliCapabilities {
     fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
         Err(format!(
             "environment value `{name}` was not provided by the CLI"

@@ -3,12 +3,15 @@ use std::fmt;
 
 use crate::ast::BinaryOp;
 use crate::diagnostic::Diagnostic;
-use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, TypedModule, ValueKind};
+use crate::ir::{
+    Capability, Constant, RuntimeCall, Terminator, TransformId, Type, TypedModule, ValueKind,
+};
 use crate::runtime::{OuterValue, ValueData};
 
 /// Version of Tima's canonical semantic encoding. Incrementing this does not
 /// change the native ABI version; it deliberately invalidates semantic IDs.
 pub const SEMANTIC_ID_VERSION: u32 = 1;
+const TRANSFORM_ID_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Digest([u8; 32]);
@@ -237,7 +240,15 @@ impl TransformIdentityResolver<'_> {
         }
 
         let mut hasher = CanonicalHasher::new(b"tima.transform");
-        hasher.u32(SEMANTIC_ID_VERSION);
+        hasher.u32(TRANSFORM_ID_VERSION);
+        hasher.u32(transform.capabilities.len() as u32);
+        for capability in &transform.capabilities {
+            hasher.u8(match capability {
+                Capability::EnvironmentRead => 1,
+                Capability::FileRead => 2,
+                Capability::HttpGet => 3,
+            });
+        }
         hasher.u32(transform.parameters.len() as u32);
         for parameter in &transform.parameters {
             encode_type(&mut hasher, parameter.ty);
@@ -253,7 +264,7 @@ impl TransformIdentityResolver<'_> {
                 }
                 ValueKind::Constant(constant) => {
                     hasher.u8(1);
-                    encode_constant(&mut hasher, *constant);
+                    encode_constant(&mut hasher, constant);
                 }
                 ValueKind::Binary { op, left, right } => {
                     hasher.u8(2);
@@ -311,6 +322,21 @@ impl TransformIdentityResolver<'_> {
                     hasher.u8(4);
                     hasher.u8(0);
                     hasher.bytes(name.as_bytes());
+                }
+                ValueKind::RuntimeCall(RuntimeCall::EnvironmentRead { name }) => {
+                    hasher.u8(4);
+                    hasher.u8(1);
+                    hasher.u32(name.0);
+                }
+                ValueKind::RuntimeCall(RuntimeCall::FileRead { path }) => {
+                    hasher.u8(4);
+                    hasher.u8(2);
+                    hasher.u32(path.0);
+                }
+                ValueKind::RuntimeCall(RuntimeCall::HttpGet { url }) => {
+                    hasher.u8(4);
+                    hasher.u8(3);
+                    hasher.u32(url.0);
                 }
             }
         }
@@ -564,22 +590,30 @@ fn encode_type(hasher: &mut CanonicalHasher, ty: Type) {
         Type::Image => 3,
         Type::ImageView => 4,
         Type::U8 => 5,
+        Type::String => 6,
+        Type::StringView => 7,
+        Type::Bytes => 8,
+        Type::BytesView => 9,
     });
 }
 
-fn encode_constant(hasher: &mut CanonicalHasher, constant: Constant) {
+fn encode_constant(hasher: &mut CanonicalHasher, constant: &Constant) {
     match constant {
         Constant::Bool(value) => {
             hasher.u8(0);
-            hasher.u8(u8::from(value));
+            hasher.u8(u8::from(*value));
         }
         Constant::I64(value) => {
             hasher.u8(1);
-            hasher.i64(value);
+            hasher.i64(*value);
         }
         Constant::F32(value) => {
             hasher.u8(2);
             hasher.u32(value.to_bits());
+        }
+        Constant::String(value) => {
+            hasher.u8(3);
+            hasher.bytes(value.as_bytes());
         }
     }
 }
@@ -1039,17 +1073,32 @@ mod tests {
     fn capability_operation_and_key_are_part_of_transform_identity() {
         let first = crate::compile(
             "one.tima",
-            "transform configured() -> i64 { return environment_i64(\"MODE\") }\n",
+            "transform configured() -> i64 uses env.read { return environment_i64(\"MODE\") }\n",
         )
         .unwrap();
         let second = crate::compile(
             "two.tima",
-            "transform configured() -> i64 { return environment_i64(\"QUALITY\") }\n",
+            "transform configured() -> i64 uses env.read { return environment_i64(\"QUALITY\") }\n",
         )
         .unwrap();
         assert_ne!(
             first.identities.get(TransformId(0)),
             second.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
+    fn declared_capabilities_are_part_of_transform_identity() {
+        let plain =
+            crate::compile("plain.tima", "transform configured() -> i64 { return 1 }\n").unwrap();
+        let declared = crate::compile(
+            "declared.tima",
+            "transform configured() -> i64 uses env.read { return 1 }\n",
+        )
+        .unwrap();
+        assert_ne!(
+            plain.identities.get(TransformId(0)),
+            declared.identities.get(TransformId(0))
         );
     }
 

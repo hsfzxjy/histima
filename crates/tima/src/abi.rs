@@ -31,10 +31,10 @@ pub fn lower_type(ty: Type) -> AbiType {
         Type::F32 => AbiType {
             ownership: Ownership::Scalar,
         },
-        Type::Image => AbiType {
+        Type::String | Type::Bytes | Type::Image => AbiType {
             ownership: Ownership::Owned,
         },
-        Type::ImageView => AbiType {
+        Type::StringView | Type::BytesView | Type::ImageView => AbiType {
             ownership: Ownership::ReadOnlyView,
         },
     }

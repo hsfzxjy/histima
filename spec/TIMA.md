@@ -21,8 +21,8 @@ Tima is Histima's embedded language for asset-transformation pipelines. It has
 one source language with two execution strata:
 
 - **outer code** is dynamic, immutable, and orchestration-oriented;
-- **inner code**, introduced by `transform`, is statically checked and runs as
-  WebAssembly through the host runtime.
+- **inner code**, introduced by `transform`, is statically checked and is
+  currently executed directly from typed IR by the host runtime.
 
 Both strata use the same lexer, parser, expression syntax tree, source spans,
 and diagnostic model. Semantic context determines which syntax and values are
@@ -35,15 +35,15 @@ Tima source
     -> shared lexer/parser/AST
     -> inner semantic checking
     -> backend-neutral typed Tima IR
-    -> WebAssembly memory64 module
-    -> Wasmtime
+    -> typed-IR interpreter
 ```
 
-WebAssembly is the sole inner-language backend. It is a backend output, not
-Tima's IR. The typed IR remains backend-neutral so language semantics are not
-defined by Wasm instructions or by Wasmtime's internal Cranelift compiler.
-Portable `.wasm` modules are the durable compiled artifacts; host machine-code
-caches are non-semantic and may be discarded at any time.
+The interpreter is the product execution engine in this version. A future
+native backend is planned to compile the same typed IR ahead of time with
+Cranelift. It must remain an additive implementation of `TypedIR ->
+NativeArtifact`; Cranelift IR is not Tima's semantic IR and JIT execution is not
+planned. WebAssembly is reserved for separately registered plugin transforms,
+whose ABI is not yet part of this contract.
 
 ## 2. Core invariants
 
@@ -68,9 +68,9 @@ The conceptual boundary is:
 ```text
 OuterValue
     -> validate / lower / acquire or detach
-WasmValue / linear-memory offset
+NativeValue
     -> execute transform
-WasmValue / linear-memory offset
+NativeValue
     -> validate / freeze / box / attach lineage
 OuterValue
 ```
@@ -88,7 +88,7 @@ letters, digits, or `_`.
 The reserved keywords are:
 
 ```text
-transform  return  if  else  for  in  true  false  null
+transform  uses  return  if  else  for  in  true  false  null
 ```
 
 Identifiers are case-sensitive. Type names are also case-sensitive.
@@ -350,10 +350,16 @@ existing output.
 The syntax is:
 
 ```tima
-transform name(parameter: Type, ...) -> Type {
+transform name(parameter: Type, ...) -> Type uses capability, ... {
     statements
 }
 ```
+
+The `uses` clause is optional. Its currently recognized capabilities are
+`env.read`, `file.read`, and `http.get`. Duplicate and unknown capabilities are
+errors. Declarations are broad authority requirements and are part of
+Transform identity; successful runtime reads record precise resource keys and
+observed content identities.
 
 Every parameter and result has an explicit native-safe type. Transform names
 and parameter names must be unique in their respective scopes. The names
@@ -370,6 +376,10 @@ The implemented inner types are:
 | `u8` | Unsigned 8-bit scalar |
 | `i64` | Signed 64-bit scalar |
 | `f32` | IEEE-754 single-precision scalar |
+| `String` | Uniquely owned UTF-8 storage |
+| `StringView` | Read-only, aliasable UTF-8 storage |
+| `Bytes` | Uniquely owned byte storage |
+| `BytesView` | Read-only, aliasable byte storage |
 | `Image` | Uniquely owned, mutable image storage |
 | `ImageView` | Read-only, aliasable image view |
 
@@ -402,35 +412,32 @@ must return a value of its declared type on every path. A statement after a
 
 ### 7.3 Inner expressions
 
-Inner expressions support `bool`, integer, and float literals; names; scalar
-binary operators; direct transform calls; and the three reserved runtime
-operations. Strings are allowed only as the literal key argument of
-`environment_i64`.
+Inner expressions support `bool`, integer, float, and string literals; names;
+scalar binary operators; direct transform calls; and reserved runtime
+operations. An inner string literal has type `StringView`.
 
-Inner arithmetic requires operands of the same type and is defined for `f32`.
-The checker and reference interpreter retain checked `i64` arithmetic, but the
-Wasm executor rejects a transform whose reachable IR contains it: portable
-overflow and division-error semantics have not been chosen. Inner `i64`
-arithmetic is therefore not part of the executable v0 contract. `u8`
-arithmetic is unsupported.
+Inner arithmetic requires operands of the same type. `f32` uses IEEE-754
+arithmetic. `i64` arithmetic is checked; overflow and division by zero abort
+the invocation with a diagnostic. `u8` arithmetic is unsupported.
 
 Equality supports same-typed `bool`, `u8`, `i64`, and `f32`. Ordering supports
 same-typed `u8`, `i64`, and `f32`. Image equality is unsupported.
 
-Outer-only syntax and values—including `null`, general strings, lists,
-records, member access outside a constrained image loop, and pipelines—are
+Outer-only syntax and values—including `null`, lists, records, general member
+access outside World calls or a constrained image loop, and pipelines—are
 rejected inside transforms.
 
 ### 7.4 Calls and ownership
 
 Calling another transform requires an exact argument count and exact types.
-Passing an `Image` consumes that inner value. Using the consumed value again is
-an error, including after any branch on which it may have been consumed.
-Passing the same owned value to two owned parameters is therefore rejected.
+Passing an owned `String`, `Bytes`, or `Image` consumes that inner value. Using
+the consumed value again is an error, including after any branch on which it
+may have been consumed. Passing the same owned value to two owned parameters
+is therefore rejected.
 
 Owned values transfer directly between inner calls; they are not boxed as
-outer values between calls. `ImageView` arguments do not transfer ownership
-and may alias.
+outer values between calls. `StringView`, `BytesView`, and `ImageView`
+arguments do not transfer ownership and may alias.
 
 ## 8. Implemented image operations
 
@@ -444,7 +451,7 @@ format:
   with `stride >= width * 4` and `len == stride * height`.
 
 Layout multiplication must not overflow. Format and layout participate in
-content identity. Wasm results are revalidated before freezing.
+content identity. Results are revalidated before freezing.
 
 Byte operations support both formats. Pixel operations require RGBA8.
 
@@ -507,41 +514,21 @@ General pixel expressions and `=` channel replacement are unsupported.
 
 ## 9. Outer/inner boundary, memory, and ABI
 
-Scalars are range- and type-checked at the boundary. `bool` and `u8` lower to
-Wasm `i32`, `i64` to Wasm `i64`, and `f32` to Wasm `f32`.
+Scalars are range- and type-checked at the boundary. The interpreter lowers
+outer strings, bytes, and images into distinct inner representations. Owned
+parameters receive detached mutable storage; views retain immutable shared
+storage and may alias. Multiple owned arguments and simultaneous owned/view
+arguments therefore cannot expose a mutable alias.
 
-Each program run or replay creates one Wasm memory64 session and one arena in
-its imported linear memory. Buffer descriptors use 64-bit byte offsets and
-lengths, never host pointers. An image is flattened as offset, byte length,
-width, height, stride, and format tag. Dynamic outer tags, Rust objects,
-lineage, and cache metadata do not cross this ABI. WASI is not available.
+Returned owned storage is frozen into an immutable outer value. Interpreter
+buffers transfer from their owned `Vec` into reference-counted immutable
+storage. Lineage is attached beside the outer payload and never enters the
+inner representation.
 
-Host-backed bytes must be copied once when first admitted to the Wasm arena.
-The session retains a weak mirror keyed by host storage identity, so repeated
-read-only views of that same outer storage reuse one allocation. Values
-already backed by the current session enter without a host copy.
-
-For an `Image` parameter, the runtime acquires unique mutable storage. Unique
-current-session storage transfers directly. Shared or aliased current-session
-storage is detached with one linear-memory-to-linear-memory copy. Host storage
-is copied into a fresh arena allocation. Multiple owned arguments and
-simultaneous owned/view arguments therefore cannot expose a mutable alias.
-
-For an `ImageView` parameter, the runtime reuses current-session storage or the
-session's host mirror. Wasm code receives no mutating operation for a view.
-
-A returned owned image must reference an allocation acquired by that
-invocation. Its descriptor and layout are validated, then the allocation is
-wrapped as immutable outer storage without copying it out of linear memory.
-The session remains alive while such outer values exist. Lineage is attached
-beside the outer payload and never enters linear memory.
-
-Arena allocations are 16-byte aligned and use a coalescing free list. The
-runtime does not compact live buffers. This keeps offsets stable across a run
-and makes zero-copy freeze possible.
-
-The Wasm ABI is versioned independently from semantic identity. It does not
-use Rust ABI or accept arbitrary dynamic outer objects.
+The future AOT ABI must preserve these ownership rules, use a narrow
+C-compatible descriptor surface, and must not pass Rust or dynamic outer
+objects. Its version and machine representation will belong to Artifact
+identity, not Transform identity.
 
 ## 10. Runtime-mediated capabilities
 
@@ -550,29 +537,55 @@ or randomness state. A host explicitly supplies capabilities. Semantically
 relevant observations are recorded precisely and included in lineage and
 Recipe identity.
 
-The first inner capability operation is:
+The inner World operations are:
 
 ```tima
+env.read(name: StringView) -> String
+file.read(path: StringView) -> Bytes
+http.get(url: StringView) -> Bytes
 environment_i64("NAME")
 ```
 
-Its key must be a non-empty string literal. The host supplies raw bytes; Tima
-requires valid UTF-8 decimal `i64` text. The raw bytes are content-hashed as an
-external observation. Missing capabilities, invalid UTF-8, and invalid integer
-text are errors.
+Each operation requires its corresponding `uses` declaration. `env.read`
+requires UTF-8. `file.read` and `http.get` preserve response bytes exactly.
+`environment_i64` remains as a compatibility operation for reading a non-empty
+literal environment name as UTF-8 decimal `i64`, and requires `uses env.read`.
+Missing grants, invalid UTF-8, invalid integer text, host I/O failures, and
+oversized HTTP responses abort the invocation with a source-spanned
+diagnostic. Structured `Result` values are deferred.
+
+Reading the same capability/key more than once during one outer transform
+invocation must observe one stable Content ID. If it changes mid-invocation,
+execution fails rather than recording an ambiguous recipe or snapshot.
+
+The Histima host grants workspace files automatically. Additional file roots,
+environment names, and exact URL prefixes are configured in `.histima.toml`:
+
+```toml
+[world]
+environment = ["MODE"]
+retain_environment = ["MODE"]
+file_roots = ["../shared-assets"]
+http_prefixes = ["https://assets.example.test/v1/"]
+```
+
+Relative file paths resolve from the workspace. Existing paths are
+canonicalized before the root check, so `..` and filesystem links cannot
+escape the granted roots. URL prefixes are matched byte-for-byte. Redirects are
+rejected because their target has not been independently granted. HTTP bodies
+are limited to 64 MiB and a request has a 30-second global timeout.
 
 The outer `read(asset)` builtin observes an asset locator through the explicit
-asset capability. Arbitrary OS access from Wasm is not part of v0.
+asset capability. Tima code has no ambient OS access outside the World.
 
 ## 11. Registered standard transforms
 
 Registered transforms use normal outer call and pipeline syntax. They have
 versioned semantic identities and use the same normalized arguments, lineage,
-result cache, and replay machinery as user transforms, but are not emitted into
-the user-transform Wasm artifact. Decoders place their image result in the
-active Wasm arena when one exists, so following inner transforms do not need a
-host round trip. The registry is a deliberately small Tima runtime interface;
-it is not general native-library FFI.
+result cache, and replay machinery as user transforms. The current codecs are
+provisional host implementations behind that registry. A future registered
+Wasm plugin may implement the same transform contract, but the plugin ABI is
+not yet specified. The registry is not general native-library FFI.
 
 | Transform | Parameters | Result | Contract |
 | --- | --- | --- | --- |
@@ -623,7 +636,7 @@ hexadecimal characters. Each identity kind has a distinct hash domain.
   content domain.
 - **Source ID** identifies a locator together with its observed source content.
 - **Dependency ID** identifies capability, precise key, and observed content.
-- **Artifact ID** identifies compiled Wasm for one Transform ID and also
+- **Artifact ID** identifies compiled native code for one Transform ID and also
   includes backend and backend version, compiler version, target, normalized
   CPU features, optimization configuration, and ABI version.
 - **Artifact Bundle ID** identifies the ordered artifacts in one compilation
@@ -634,13 +647,11 @@ not interchangeable: distinct recipes may produce identical content.
 
 ### 12.3 Result and artifact caches
 
-Portable Wasm artifacts are cached under
-`cache/artifacts/wasm/<Artifact-Bundle-ID>/module.wasm`, independently from
-semantic transform results. Their identity includes the Wasm emitter version,
-memory64 target, optimization mode, and ABI version. Source spans, formatting,
-and local or transform names do not enter the module bytes when they do not
-enter Transform identity. Wasmtime's workspace-local machine cache lives under
-`cache/wasmtime` and is not a durable Histima artifact.
+The interpreter does not produce an Artifact ID or artifact cache entry.
+Artifact records remain a separate namespace for the future AOT Cranelift
+backend and for migration/inspection of older workspaces. A future artifact's
+identity must include backend, compiler version, target, CPU features,
+optimization configuration, and ABI version independently from Transform ID.
 
 Transform results are cached by Recipe ID and validated against immutable
 content.
@@ -671,12 +682,22 @@ Replay must:
 
 Replay does not repeat `save` effects. Applying an ancestor derivation to a
 different input, arbitrary ancestor substitution, and replay of unavailable
-non-materialized values are deferred.
+non-materialized values are deferred. Strict replay is the default: external
+dependencies are read again and must have the recorded Content ID.
+
+Histima also implements snapshot replay, selected by `histima replay ...
+--snapshot`. File and HTTP observations are retained as raw immutable CAS
+content by default. Environment observations remain hash-only unless their
+name appears in `[world].retain_environment` as well as `[world].environment`.
+Snapshot replay resolves every recorded dependency from retained bytes and
+does not access that external resource. A missing snapshot is an error. Source
+assets retain their separate source-validation behavior. Retention metadata
+and policy do not enter Dependency, Recipe, or Content identity.
 
 ## 13. Diagnostics
 
-Lexer, parser, semantic checker, boundary validation, runtime capabilities,
-Wasm loading, caching, and replay report source-spanned diagnostics.
+Lexer, parser, semantic checker, boundary validation, World operations,
+caching, and replay report source-spanned diagnostics.
 Diagnostics may contain a primary label, related labels, and explanatory
 notes. Implementations should identify the violated stratum or boundary rule,
 not merely report a backend failure.
@@ -690,32 +711,29 @@ Examples include:
 - an RGBA8 pixel operation applied to opaque-byte storage;
 - an unavailable runtime capability;
 - changed source or dependency content during replay;
-- a returned Wasm descriptor with an invalid layout.
+- an invalid native value or image layout at the outer/inner boundary.
 
 ## 14. Execution and backend contract
 
-The Wasm engine is the production executor for inner transforms. The typed-IR
-interpreter is a test oracle and must produce the same semantic result and
-lineage for supported programs; it is not an independently selectable product
-backend. Wasmtime currently compiles Wasm with its Cranelift implementation,
-but Cranelift IR and machine code are not Tima artifacts or language contracts.
+The typed-IR interpreter is the production executor for inner transforms. It
+defines current evaluation, ownership, World-observation, lineage, and error
+behavior together with the typed IR contract.
 
 The backend boundary is conceptually:
 
 ```text
-TypedIR -> WasmArtifact
+TypedIR -> NativeArtifact
 ```
 
-The backend must preserve typed evaluation order, ownership transfer,
-capability observations, boundary validation, and error behavior specified
-here.
+A future native backend will use AOT Cranelift compilation and must preserve
+typed evaluation order, ownership transfer, World observations, boundary
+validation, and error behavior specified here. Backend selection and machine
+details must not affect semantic lineage. JIT compilation is out of scope.
 
-The default maximum linear-memory size is 4 GiB and must be a positive multiple
-of 64 KiB. Histima resolves an override in this order: CLI
-`--wasm-memory-limit <size>`, `HISTIMA_WASM_MEMORY_LIMIT`, workspace
-`.histima.toml` key `[wasm].memory_limit`, then the default. Sizes use exact
-`B`, `KiB`, `MiB`, `GiB`, or `TiB` suffixes. The cap is an execution policy and
-does not affect Transform or Recipe identity.
+The repository may temporarily retain a legacy generated-Wasm implementation
+for regression tests over the older scalar/image subset. Histima does not use
+it for product execution, it rejects the new World string/byte operations, and
+its behavior is not a current language/backend contract.
 
 ## 15. Deliberately unsupported in v0
 
@@ -735,7 +753,8 @@ The current language does not include:
 - arbitrary native FFI or WASI;
 - a Tima-level JIT backend, LLVM IR as the language IR, or LLVM as a required
   backend;
-- general filesystem/network/clock/random access;
+- clock/random access and any filesystem/network access outside granted World
+  operations;
 - tracing of scalar temporaries;
 - ancestor substitution during replay;
 - multi-output transforms;
@@ -770,5 +789,6 @@ replayed = replay(out)
 
 The source asset remains immutable. `darken` receives unique mutable image
 storage, the returned image is frozen before `webp.encode` sees it, each
-transform result carries semantic lineage, and valid compiled artifacts and
-Recipe results may be reused without changing that lineage.
+transform result carries semantic lineage, and valid Recipe results may be
+reused without changing that lineage. Future compiled artifacts will remain
+execution details outside semantic lineage.

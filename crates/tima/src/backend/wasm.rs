@@ -28,6 +28,38 @@ pub struct WasmBackend;
 
 impl ArtifactBackend for WasmBackend {
     fn emit(&self, module: &TypedModule) -> Result<BackendArtifact, Vec<Diagnostic>> {
+        let diagnostics = module
+            .transforms
+            .iter()
+            .filter(|transform| {
+                transform
+                    .parameters
+                    .iter()
+                    .any(|parameter| is_world_value_type(parameter.ty))
+                    || is_world_value_type(transform.return_type)
+                    || transform.values.iter().any(|value| {
+                        is_world_value_type(value.ty)
+                            || matches!(
+                                value.kind,
+                                ValueKind::RuntimeCall(
+                                    RuntimeCall::EnvironmentRead { .. }
+                                        | RuntimeCall::FileRead { .. }
+                                        | RuntimeCall::HttpGet { .. }
+                                ) | ValueKind::Constant(Constant::String(_))
+                            )
+                    })
+            })
+            .map(|transform| {
+                Diagnostic::error(
+                    "the legacy Wasm backend cannot lower World string/byte operations",
+                    transform.span,
+                )
+                .with_note("execute this transform with the typed-IR interpreter")
+            })
+            .collect::<Vec<_>>();
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
         let bytes = emit_module(module);
         Ok(BackendArtifact {
             backend: "wasm",
@@ -37,6 +69,13 @@ impl ArtifactBackend for WasmBackend {
             static_size: static_size(module),
         })
     }
+}
+
+fn is_world_value_type(ty: Type) -> bool {
+    matches!(
+        ty,
+        Type::String | Type::StringView | Type::Bytes | Type::BytesView
+    )
 }
 
 fn static_size(module: &TypedModule) -> u64 {
@@ -151,6 +190,9 @@ fn wasm_types(ty: Type) -> Vec<ValType> {
         Type::Bool | Type::U8 => &[ValType::I32],
         Type::I64 => &[ValType::I64],
         Type::F32 => &[ValType::F32],
+        Type::String | Type::StringView | Type::Bytes | Type::BytesView => {
+            unreachable!("World string/byte types are rejected before legacy Wasm emission")
+        }
         Type::Image | Type::ImageView => &[
             ValType::I64,
             ValType::I64,
@@ -477,6 +519,9 @@ fn emit_simple_value(
         ValueKind::Constant(Constant::F32(value)) => {
             function.instruction(&Instruction::F32Const((*value).into()));
         }
+        ValueKind::Constant(Constant::String(_)) => {
+            unreachable!("string constants are rejected before legacy Wasm emission")
+        }
         ValueKind::Binary { op, left, right } => {
             function.instruction(&Instruction::LocalGet(layout.value(*left)[0]));
             function.instruction(&Instruction::LocalGet(layout.value(*right)[0]));
@@ -503,6 +548,11 @@ fn emit_simple_value(
             function.instruction(&Instruction::I64Const(name.len() as i64));
             function.instruction(&Instruction::Call(ENVIRONMENT_I64_IMPORT));
         }
+        ValueKind::RuntimeCall(
+            RuntimeCall::EnvironmentRead { .. }
+            | RuntimeCall::FileRead { .. }
+            | RuntimeCall::HttpGet { .. },
+        ) => unreachable!("World calls are rejected before legacy Wasm emission"),
         ValueKind::ImageZero { .. }
         | ValueKind::ImageFill { .. }
         | ValueKind::ImageByteMap { .. }

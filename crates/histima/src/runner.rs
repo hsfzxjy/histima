@@ -1,14 +1,13 @@
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt;
 
 use tima::CompiledProgram;
 use tima::ast::Item;
-use tima::backend::ArtifactBackend;
-use tima::backend::wasm::WasmBackend;
-use tima::backend::wasm_runtime::{ArtifactCacheStatus, WasmArtifactCache, WasmError, WasmSession};
 use tima::cache::{CacheError, CacheStats, ResultCache, TransformResultCache};
-use tima::diagnostic::Diagnostic;
-use tima::identity::{ContentIdentity, RecipeIdentity};
+use tima::capability::World;
+use tima::identity::{ContentIdentity, RecipeIdentity, byte_content_identity};
+use tima::lineage::{Lineage, LineageNode};
 use tima::runtime::{Execution, OuterValue};
 
 use crate::{ArtifactInfo, Workspace};
@@ -16,12 +15,11 @@ use crate::{ArtifactInfo, Workspace};
 /// The observable result of one Tima program execution in a Histima workspace.
 ///
 /// Result-cache statistics include both process-local and validated durable
-/// workspace lookups. The portable artifact status reports its separate cache.
+/// workspace lookups. Interpreted execution does not produce a native artifact.
 #[derive(Debug)]
 pub struct ProgramExecution {
     pub execution: Execution,
-    pub artifact_cache: ArtifactCacheStatus,
-    pub artifact: ArtifactInfo,
+    pub artifact: Option<ArtifactInfo>,
     pub result_cache: CacheStats,
 }
 
@@ -29,9 +27,24 @@ pub struct ProgramExecution {
 #[derive(Debug)]
 pub struct RecipeReplay {
     pub value: OuterValue,
-    pub artifact_cache: ArtifactCacheStatus,
-    pub artifact: ArtifactInfo,
+    pub policy: ReplayPolicy,
+    pub artifact: Option<ArtifactInfo>,
     pub result_cache: CacheStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayPolicy {
+    Strict,
+    Snapshot,
+}
+
+impl ReplayPolicy {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Snapshot => "snapshot",
+        }
+    }
 }
 
 /// Result of evaluating one command-line outer pipeline expression.
@@ -47,9 +60,7 @@ pub struct PipelineExecution {
 #[derive(Debug)]
 pub enum RunError {
     Storage(crate::Error),
-    CodeGeneration(Vec<Diagnostic>),
-    Artifact(WasmError),
-    Runtime(Vec<Diagnostic>),
+    Runtime(Vec<tima::diagnostic::Diagnostic>),
     InvalidPipeline(String),
 }
 
@@ -79,22 +90,16 @@ impl Workspace {
         })
     }
 
-    /// Executes checked Tima through the WebAssembly backend with this
+    /// Executes checked inner Tima through the typed-IR interpreter with this
     /// workspace as the only host capability provider.
     pub fn execute(&self, program: &CompiledProgram) -> Result<ProgramExecution, RunError> {
-        let (artifact_cache, artifact, wasm) = self.load_wasm(program)?;
         let mut result_cache = WorkspaceResultCache::new(self);
-        let execution = tima::runtime::execute_wasm_cached_with_capabilities(
-            program,
-            &wasm,
-            &mut result_cache,
-            self,
-        )
-        .map_err(RunError::Runtime)?;
+        let execution =
+            tima::runtime::execute_cached_with_capabilities(program, &mut result_cache, self)
+                .map_err(RunError::Runtime)?;
         Ok(ProgramExecution {
             execution,
-            artifact_cache,
-            artifact,
+            artifact: None,
             result_cache: result_cache.stats,
         })
     }
@@ -107,48 +112,128 @@ impl Workspace {
         program: &CompiledProgram,
         recipe: RecipeIdentity,
     ) -> Result<RecipeReplay, RunError> {
+        self.replay_recipe_with_policy(program, recipe, ReplayPolicy::Strict)
+    }
+
+    pub fn replay_recipe_with_policy(
+        &self,
+        program: &CompiledProgram,
+        recipe: RecipeIdentity,
+        policy: ReplayPolicy,
+    ) -> Result<RecipeReplay, RunError> {
         let target = self.replay_target(recipe).map_err(RunError::Storage)?;
-        let (artifact_cache, artifact, wasm) = self.load_wasm(program)?;
         let mut result_cache = WorkspaceResultCache::new(self);
-        let value = tima::runtime::replay_wasm_with_capabilities(
-            program,
-            &wasm,
-            &target,
-            &mut result_cache,
-            self,
-        )
-        .map_err(|diagnostic| RunError::Runtime(vec![diagnostic]))?;
+        let snapshots;
+        let world: &dyn World = match policy {
+            ReplayPolicy::Strict => self,
+            ReplayPolicy::Snapshot => {
+                snapshots = SnapshotWorld::load(self, &target).map_err(RunError::Storage)?;
+                &snapshots
+            }
+        };
+        let value =
+            tima::runtime::replay_with_capabilities(program, &target, &mut result_cache, world)
+                .map_err(|diagnostic| RunError::Runtime(vec![diagnostic]))?;
         Ok(RecipeReplay {
             value,
-            artifact_cache,
-            artifact,
+            policy,
+            artifact: None,
             result_cache: result_cache.stats,
         })
     }
+}
 
-    fn load_wasm(
-        &self,
-        program: &CompiledProgram,
-    ) -> Result<(ArtifactCacheStatus, ArtifactInfo, WasmSession), RunError> {
-        let generated = WasmBackend
-            .emit(&program.transforms)
-            .map_err(RunError::CodeGeneration)?;
-        let transform_ids = program.identities.iter().collect::<Vec<_>>();
-        let cached_artifact = WasmArtifactCache
-            .store(&generated, &transform_ids, self.artifact_cache_root())
-            .map_err(RunError::Artifact)?;
-        let artifact_info = self
-            .catalog
-            .record_artifact(&cached_artifact, &transform_ids, self.root())
-            .map_err(RunError::Storage)?;
-        let wasm = WasmSession::instantiate(
-            &cached_artifact.artifact,
-            &program.transforms,
-            self.wasm_memory_limit(),
-        )
-        .map_err(RunError::Artifact)?;
-        Ok((cached_artifact.status, artifact_info, wasm))
+struct SnapshotWorld<'workspace> {
+    workspace: &'workspace Workspace,
+    values: BTreeMap<(String, Vec<u8>), Vec<u8>>,
+}
+
+impl<'workspace> SnapshotWorld<'workspace> {
+    fn load(workspace: &'workspace Workspace, target: &OuterValue) -> crate::Result<Self> {
+        let mut values = BTreeMap::new();
+        if let Some(lineage) = &target.lineage {
+            collect_snapshots(workspace, lineage, &mut values)?;
+        }
+        Ok(Self { workspace, values })
     }
+
+    fn value(&self, capability: &str, key: &[u8]) -> Result<Vec<u8>, String> {
+        self.values
+            .get(&(capability.to_owned(), key.to_vec()))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "no retained snapshot is available for `{capability}` dependency {:?}",
+                    String::from_utf8_lossy(key)
+                )
+            })
+    }
+}
+
+impl World for SnapshotWorld<'_> {
+    fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
+        self.value(tima::capability::ENVIRONMENT_CAPABILITY, name.as_bytes())
+    }
+
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.value(tima::capability::FILE_READ_CAPABILITY, path.as_bytes())
+    }
+
+    fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
+        self.value(tima::capability::HTTP_GET_CAPABILITY, url.as_bytes())
+    }
+
+    fn read_asset(&self, locator: &str) -> Result<Vec<u8>, String> {
+        World::read_asset(self.workspace, locator)
+    }
+
+    fn write_asset(&self, locator: &str, bytes: &[u8]) -> Result<(), String> {
+        World::write_asset(self.workspace, locator, bytes)
+    }
+}
+
+fn collect_snapshots(
+    workspace: &Workspace,
+    lineage: &Lineage,
+    values: &mut BTreeMap<(String, Vec<u8>), Vec<u8>>,
+) -> crate::Result<()> {
+    match lineage.node() {
+        LineageNode::Source(_) => {}
+        LineageNode::ExternalObservation(observation) => {
+            let bytes = workspace
+                .world_snapshot(observation.dependency_id)
+                .map_err(crate::Error::catalog)?
+                .ok_or_else(|| {
+                    crate::Error::catalog(format!(
+                        "no retained snapshot is available for `{}` dependency {:?}",
+                        observation.capability,
+                        String::from_utf8_lossy(&observation.key)
+                    ))
+                })?;
+            let observed = byte_content_identity(&bytes);
+            if observed != observation.observed_content {
+                return Err(crate::Error::catalog(format!(
+                    "retained snapshot for dependency {} has content {observed}, expected {}",
+                    observation.dependency_id, observation.observed_content
+                )));
+            }
+            values.insert(
+                (observation.capability.to_string(), observation.key.to_vec()),
+                bytes,
+            );
+        }
+        LineageNode::Invocation(invocation) => {
+            for argument in invocation.arguments.iter() {
+                if let Some(parent) = &argument.lineage {
+                    collect_snapshots(workspace, parent, values)?;
+                }
+            }
+            for observation in invocation.observations.iter() {
+                collect_snapshots(workspace, observation, values)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 struct WorkspaceResultCache<'workspace> {
@@ -238,12 +323,6 @@ impl fmt::Display for RunError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage(error) => error.fmt(formatter),
-            Self::CodeGeneration(diagnostics) => write!(
-                formatter,
-                "WebAssembly code generation failed with {} diagnostic(s)",
-                diagnostics.len()
-            ),
-            Self::Artifact(error) => error.fmt(formatter),
             Self::Runtime(diagnostics) => write!(
                 formatter,
                 "Tima execution failed with {} diagnostic(s)",
@@ -258,8 +337,7 @@ impl StdError for RunError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Storage(error) => Some(error),
-            Self::Artifact(error) => Some(error),
-            Self::CodeGeneration(_) | Self::Runtime(_) | Self::InvalidPipeline(_) => None,
+            Self::Runtime(_) | Self::InvalidPipeline(_) => None,
         }
     }
 }

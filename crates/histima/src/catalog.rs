@@ -6,8 +6,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use tima::backend::wasm_runtime::CachedWasmArtifact;
 use tima::identity::{
     ArtifactBundleIdentity, ArtifactConfiguration, ArtifactIdentity, ContentIdentity,
-    RecipeIdentity, SemanticValueIdentity, SourceIdentity, TransformIdentity,
-    artifact_bundle_identity, artifact_identity, byte_content_identity,
+    DependencyIdentity, RecipeIdentity, SemanticValueIdentity, SourceIdentity, TransformIdentity,
+    artifact_bundle_identity, artifact_identity, byte_content_identity, dependency_identity,
 };
 use tima::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
 
@@ -15,7 +15,7 @@ use crate::cas::{ContentKind, StoredContent};
 use crate::error::{Error, Result};
 use crate::stored_lineage::StoredRecipe;
 
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 5;
 pub const CATALOG_LIST_LIMIT: usize = 100;
 
 const MIGRATION_1: &str = r#"
@@ -137,6 +137,17 @@ ALTER TABLE native_artifacts RENAME TO artifacts;
 ALTER TABLE native_artifact_bundle_members RENAME TO artifact_bundle_members;
 DROP INDEX native_artifact_members_artifact_idx;
 CREATE INDEX artifact_members_artifact_idx ON artifact_bundle_members(artifact_id);
+"#;
+
+const MIGRATION_5: &str = r#"
+CREATE TABLE world_snapshots (
+    dependency_id TEXT PRIMARY KEY CHECK (length(dependency_id) = 64),
+    content_id    TEXT NOT NULL REFERENCES contents(content_id) ON DELETE RESTRICT,
+    FOREIGN KEY (dependency_id)
+        REFERENCES external_observations(dependency_id)
+        ON DELETE CASCADE
+) STRICT;
+CREATE INDEX world_snapshots_content_idx ON world_snapshots(content_id);
 "#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -374,6 +385,106 @@ impl Catalog {
                     byte_len,
                     relative_path,
                     kind: ContentKind::parse(&kind)?,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn record_world_snapshot(
+        &self,
+        capability: &str,
+        key: &[u8],
+        content: &StoredContent,
+    ) -> Result<DependencyIdentity> {
+        if content.kind != ContentKind::Raw {
+            return Err(Error::catalog(
+                "World snapshots must use raw content identity",
+            ));
+        }
+        let dependency = dependency_identity(capability, key, content.identity);
+        let dependency_id = dependency.to_string();
+        let content_id = content.identity.to_string();
+        let transaction = self.connection.unchecked_transaction()?;
+        insert_content(&transaction, content)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO external_observations(
+                 dependency_id, capability, observation_key, observed_content_id
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![dependency_id, capability, key, content_id],
+        )?;
+        let recorded_observation = transaction.query_row(
+            "SELECT capability, observation_key, observed_content_id
+             FROM external_observations WHERE dependency_id = ?1",
+            [&dependency_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if recorded_observation != (capability.to_owned(), key.to_vec(), content_id.clone()) {
+            return Err(Error::catalog(format!(
+                "dependency {dependency_id} already has incompatible observation metadata"
+            )));
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO world_snapshots(dependency_id, content_id)
+             VALUES (?1, ?2)",
+            params![dependency_id, content_id],
+        )?;
+        let recorded_content = transaction.query_row(
+            "SELECT content_id FROM world_snapshots WHERE dependency_id = ?1",
+            [&dependency_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        if recorded_content != content_id {
+            return Err(Error::catalog(format!(
+                "dependency {dependency_id} already has snapshot content {recorded_content}, not {content_id}"
+            )));
+        }
+        transaction.commit()?;
+        Ok(dependency)
+    }
+
+    pub fn world_snapshot(&self, dependency: DependencyIdentity) -> Result<Option<CatalogObject>> {
+        let dependency = dependency.to_string();
+        self.connection
+            .query_row(
+                "SELECT content.content_id, content.byte_length,
+                        content.relative_path, content.kind
+                 FROM world_snapshots AS snapshot
+                 JOIN contents AS content ON content.content_id = snapshot.content_id
+                 WHERE snapshot.dependency_id = ?1",
+                [&dependency],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(content_id, byte_len, relative_path, kind)| {
+                let byte_len = u64::try_from(byte_len).map_err(|_| {
+                    Error::catalog(format!(
+                        "snapshot content {content_id} has a negative byte length"
+                    ))
+                })?;
+                let kind = ContentKind::parse(&kind)?;
+                if kind != ContentKind::Raw {
+                    return Err(Error::catalog(format!(
+                        "World snapshot {dependency} points to non-raw content {content_id}"
+                    )));
+                }
+                Ok(CatalogObject {
+                    content_id,
+                    byte_len,
+                    relative_path,
+                    kind,
                 })
             })
             .transpose()
@@ -635,6 +746,9 @@ impl Catalog {
         crate::stored_lineage::load(&self.connection, recipe)
     }
 
+    // Retained until the legacy Wasm artifact writer is removed and the
+    // backend-neutral AOT artifact catalog API replaces it.
+    #[allow(dead_code)]
     pub fn record_artifact(
         &self,
         cached: &CachedWasmArtifact,
@@ -1033,6 +1147,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         (2_i64, "durable recipe results", MIGRATION_2),
         (3_i64, "native artifact metadata", MIGRATION_3),
         (4_i64, "backend-neutral artifact metadata", MIGRATION_4),
+        (5_i64, "retained World observations", MIGRATION_5),
     ] {
         if version <= current {
             continue;
@@ -1411,7 +1526,7 @@ mod tests {
 
         let catalog = Catalog::open(&database).unwrap();
 
-        assert_eq!(catalog.info().unwrap().schema_version, 4);
+        assert_eq!(catalog.info().unwrap().schema_version, 5);
         assert_eq!(
             catalog
                 .connection

@@ -6,8 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use histima::{RunError, Workspace};
-use tima::backend::wasm_runtime::ArtifactCacheStatus;
+use histima::{ReplayPolicy, RunError, Workspace};
 use tima::identity::{ArtifactIdentity, ContentIdentity, RecipeIdentity, content_identity};
 use tima::lineage::{LineageNode, RecordedValue};
 use tima::runtime::{OuterValue, ValueData};
@@ -48,31 +47,7 @@ fn main() -> ExitCode {
         return report_error(output, "--json may be supplied only once".to_owned());
     }
     arguments.retain(|argument| argument != "--json");
-    let mut wasm_memory_limit = None;
-    while let Some(index) = arguments
-        .iter()
-        .position(|argument| argument == "--wasm-memory-limit")
-    {
-        if wasm_memory_limit.is_some() {
-            return report_error(
-                output,
-                "--wasm-memory-limit may be supplied only once".to_owned(),
-            );
-        }
-        if index + 1 >= arguments.len() {
-            return report_error(
-                output,
-                "--wasm-memory-limit requires a size such as 4GiB".to_owned(),
-            );
-        }
-        let value = arguments.remove(index + 1);
-        arguments.remove(index);
-        wasm_memory_limit = match tima::backend::wasm_runtime::parse_memory_limit(&value) {
-            Ok(limit) => Some(limit),
-            Err(error) => return report_error(output, error.to_string()),
-        };
-    }
-    match run(arguments.into_iter(), output, wasm_memory_limit) {
+    match run(arguments.into_iter(), output) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => report_error(output, message),
     }
@@ -90,11 +65,7 @@ fn report_error(output: OutputMode, message: String) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn run(
-    arguments: impl Iterator<Item = String>,
-    output: OutputMode,
-    wasm_memory_limit: Option<u64>,
-) -> Result<(), String> {
+fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<(), String> {
     let mut arguments = arguments.collect::<VecDeque<_>>();
     let command = arguments.pop_front().unwrap_or_else(|| "help".to_owned());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
@@ -105,9 +76,7 @@ fn run(
         "init" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
-            let workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let info = workspace
                 .catalog_info()
                 .map_err(|error| error.to_string())?;
@@ -122,8 +91,7 @@ fn run(
             let source_path = required(&mut arguments, "source asset path")?;
             finished(&mut arguments)?;
             let mut workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+                Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let imported = workspace
                 .import_file(&source_path)
                 .map_err(|error| error.to_string())?;
@@ -137,9 +105,7 @@ fn run(
         "stats" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
-            let workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let info = workspace
                 .catalog_info()
                 .map_err(|error| error.to_string())?;
@@ -160,9 +126,7 @@ fn run(
         "assets" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
-            let workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let page = workspace.assets().map_err(|error| error.to_string())?;
             output.emit(cli_json::assets(&page), || {
                 println!("count = {}", page.items.len());
@@ -178,9 +142,7 @@ fn run(
         "recipes" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
-            let workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let page = workspace.recipes().map_err(|error| error.to_string())?;
             output.emit(cli_json::recipes(&page), || {
                 println!("count = {}", page.items.len());
@@ -202,9 +164,7 @@ fn run(
             let workspace_path = workspace_path(&mut arguments, 1)?;
             let identity_text = required(&mut arguments, "identity")?;
             finished(&mut arguments)?;
-            let workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             match kind.as_str() {
                 "content" => {
                     let identity = identity_text
@@ -356,9 +316,7 @@ fn run(
             let identity = identity_text
                 .parse::<ContentIdentity>()
                 .map_err(|error| format!("invalid Content ID: {error}"))?;
-            let workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             workspace
                 .materialize_content(identity, &destination)
                 .map_err(|error| error.to_string())?;
@@ -381,8 +339,7 @@ fn run(
                 )
             })?;
             let mut workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+                Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let result = workspace
                 .evaluate_pipeline(&compiled)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
@@ -430,8 +387,7 @@ fn run(
                 )
             })?;
             let mut workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+                Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let result = workspace
                 .execute(&compiled)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
@@ -449,31 +405,11 @@ fn run(
                 .transpose()?;
             let json = cli_json::run(&result, record_binding.as_deref().zip(recorded.as_ref()));
             output.emit(json, || {
-                println!(
-                    "artifact_cache = {}",
-                    match result.artifact_cache {
-                        ArtifactCacheStatus::Hit => "hit",
-                        ArtifactCacheStatus::Miss => "miss",
-                    }
-                );
+                println!("execution_engine = interpreter");
+                println!("artifact_cache = none");
                 println!("result_cache_hits = {}", result.result_cache.hits);
                 println!("result_cache_misses = {}", result.result_cache.misses);
                 println!("result_cache_stores = {}", result.result_cache.stores);
-                println!("artifact_bundle_id = {}", result.artifact.bundle_id);
-                println!(
-                    "artifact_ids = {}",
-                    result
-                        .artifact
-                        .artifact_ids
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                println!(
-                    "artifact_content_id = {}",
-                    result.artifact.artifact_content_id
-                );
                 let unbound_trace = result.execution.last_value.as_ref().and_then(|last| {
                     let ValueData::Lineage(lineage) = &last.data else {
                         return None;
@@ -500,6 +436,11 @@ fn run(
             })?;
         }
         "replay" => {
+            let policy = if take_flag(&mut arguments, "--snapshot")? {
+                ReplayPolicy::Snapshot
+            } else {
+                ReplayPolicy::Strict
+            };
             let workspace_path = workspace_path(&mut arguments, 2)?;
             let script_path = required(&mut arguments, "Tima source path")?;
             let recipe_text = required(&mut arguments, "Recipe ID")?;
@@ -516,40 +457,19 @@ fn run(
                     render_diagnostics(&diagnostic_source, &diagnostics)
                 )
             })?;
-            let workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let replayed = workspace
-                .replay_recipe(&compiled, recipe)
+                .replay_recipe_with_policy(&compiled, recipe, policy)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
             let content_id = content_identity(&replayed.value)
                 .map_err(|error| format!("replayed value has no content identity: {error}"))?;
             output.emit(cli_json::replay(recipe, content_id, &replayed), || {
-                println!(
-                    "artifact_cache = {}",
-                    match replayed.artifact_cache {
-                        ArtifactCacheStatus::Hit => "hit",
-                        ArtifactCacheStatus::Miss => "miss",
-                    }
-                );
+                println!("execution_engine = interpreter");
+                println!("replay_policy = {}", replayed.policy.name());
+                println!("artifact_cache = none");
                 println!("result_cache_hits = {}", replayed.result_cache.hits);
                 println!("result_cache_misses = {}", replayed.result_cache.misses);
                 println!("result_cache_stores = {}", replayed.result_cache.stores);
-                println!("artifact_bundle_id = {}", replayed.artifact.bundle_id);
-                println!(
-                    "artifact_ids = {}",
-                    replayed
-                        .artifact
-                        .artifact_ids
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                println!(
-                    "artifact_content_id = {}",
-                    replayed.artifact.artifact_content_id
-                );
                 println!("recipe_id = {recipe}");
                 println!("content_id = {content_id}");
                 println!("replayed = {}", display(&replayed.value));
@@ -565,9 +485,7 @@ fn run(
             let recipe = recipe_text
                 .parse::<RecipeIdentity>()
                 .map_err(|error| format!("invalid Recipe ID: {error}"))?;
-            let workspace =
-                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
-                    .map_err(|error| error.to_string())?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let trace = workspace
                 .trace_recipe(recipe)
                 .map_err(|error| error.to_string())?;
@@ -629,6 +547,18 @@ fn take_record_option(arguments: &mut VecDeque<String>) -> Result<Option<String>
     Ok(Some(binding))
 }
 
+fn take_flag(arguments: &mut VecDeque<String>, flag: &str) -> Result<bool, String> {
+    let count = arguments
+        .iter()
+        .filter(|argument| argument.as_str() == flag)
+        .count();
+    if count > 1 {
+        return Err(format!("{flag} may be supplied only once"));
+    }
+    arguments.retain(|argument| argument != flag);
+    Ok(count == 1)
+}
+
 fn required(arguments: &mut VecDeque<String>, name: &str) -> Result<String, String> {
     arguments
         .pop_front()
@@ -644,7 +574,7 @@ fn finished(arguments: &mut VecDeque<String>) -> Result<(), String> {
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  histima [--json] [--wasm-memory-limit <size>] <command> ...");
+    eprintln!("  histima [--json] <command> ...");
     eprintln!("  histima init [workspace]");
     eprintln!("  histima import [workspace] <source-file>");
     eprintln!("  histima stats [workspace]");
@@ -656,13 +586,12 @@ fn print_usage() {
     eprintln!("  histima materialize [workspace] <content-id> <destination>");
     eprintln!("  histima pipeline [workspace] <tima-expression>");
     eprintln!("  histima run [workspace] <file.tima> [--record <binding>]");
-    eprintln!("  histima replay [workspace] <file.tima> <recipe-id>");
+    eprintln!("  histima replay [workspace] <file.tima> <recipe-id> [--snapshot]");
     eprintln!("  histima trace [workspace] <recipe-id>");
     eprintln!(
         "  omitted workspaces resolve to the nearest initialized workspace at or above the current directory"
     );
     eprintln!("  --json may appear anywhere in the command");
-    eprintln!("  Wasm memory limits use B, KiB, MiB, GiB, or TiB (default 4GiB)");
 }
 
 fn print_content_inspection(inspection: &histima::ContentInspection) {
@@ -722,10 +651,6 @@ fn display_observation_key(key: &[u8]) -> String {
 fn render_run_error(source: &SourceFile, error: RunError) -> String {
     match error {
         RunError::Storage(error) => error.to_string(),
-        RunError::CodeGeneration(diagnostics) => format!(
-            "WebAssembly code generation failed:\n{}",
-            render_diagnostics(source, &diagnostics)
-        ),
         RunError::Runtime(diagnostics) => format!(
             "Tima execution failed:\n{}",
             render_diagnostics(source, &diagnostics)

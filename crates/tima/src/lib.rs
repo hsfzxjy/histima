@@ -1,8 +1,9 @@
 //! The Tima language frontend, typed transform IR, and outer runtime.
 //!
 //! Tima deliberately shares one syntax tree between its dynamic outer layer
-//! and statically checked `transform` declarations. The WebAssembly backend
-//! consumes [`ir::TypedModule`], never syntax or a host-specific code format.
+//! and statically checked `transform` declarations. Execution and future AOT
+//! backends consume [`ir::TypedModule`], never syntax or a host-specific code
+//! format.
 
 pub mod abi;
 pub mod ast;
