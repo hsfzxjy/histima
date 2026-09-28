@@ -11,22 +11,22 @@ The `tima` crate provides:
 - an immutable outer value model, including encoded byte values, and a small
   interpreter;
 - static checking and backend-neutral typed control-flow IR for transforms;
-- an inspectable generated-C backend, LLVM/Clang artifact compilation, and
-  dynamic loading behind IR/backend boundaries;
-- an explicit native ABI distinction between owned `Image` and read-only,
+- a deterministic WebAssembly memory64 backend and Wasmtime execution behind
+  the typed-IR/backend boundary;
+- an explicit Wasm ABI distinction between owned `Image` and read-only,
   aliasable `ImageView`;
 - explicit image layout metadata for opaque byte rows and validated interleaved
   RGBA8 pixels;
-- immutable semantic lineage DAGs kept entirely outside native payloads;
-- separate native-artifact and transform-result caches keyed by semantic IDs;
+- immutable semantic lineage DAGs kept entirely outside Wasm payloads;
+- separate Wasm-artifact and transform-result caches keyed by semantic IDs;
 - host-mediated asset and environment observations shared by the outer runtime,
-  reference interpreter, and generated-C runtime ABI.
+  reference interpreter, and Wasm runtime ABI.
 
 The separate `histima` crate now owns the beginning of the product boundary. A
 configurable workspace combines a migration-managed SQLite catalog with a
 filesystem content-addressed store. SQLite runs with foreign keys and WAL mode,
 stores queryable content/source metadata, preserves immutable source versions,
-tracks the current observation for each locator, and catalogs native artifacts
+tracks the current observation for each locator, and catalogs compiled artifacts
 separately from semantic transform results. Imported payloads are atomically
 published outside SQLite under their Tima Content IDs; repeat imports
 deduplicate bytes, and every read revalidates stored content before returning
@@ -56,12 +56,20 @@ same rule. For example, after building the CLI, running
 The catalog and workspace-discovery marker is `.histima.sql3`; opening an early
 workspace that still has `catalog.sqlite3` migrates that filename in place.
 
+Inner execution uses one memory64 linear-memory arena per run or replay. The
+default cap is 4 GiB and can be changed with the global CLI option
+`--wasm-memory-limit 512MiB`, the `HISTIMA_WASM_MEMORY_LIMIT` environment
+variable, or `[wasm].memory_limit = "512MiB"` in `.histima.toml`, in that
+precedence order. Host payloads enter an arena once, views reuse a session
+mirror, owned aliases detach within linear memory, and returned owned images
+remain backed by the session rather than being copied out.
+
 Materialization verifies the stored Content ID, publishes through a temporary
 file, and refuses to replace an existing destination. Tima identities use one
 canonical durable text form: 64 lowercase hexadecimal characters.
 
 `histima run` uses the workspace as Tima's host boundary: `asset(...)` can read
-only locators already imported into that catalog, generated-C artifacts are
+only locators already imported into that catalog, portable Wasm artifacts are
 cached under the workspace, and `save(...)` atomically refuses to replace an
 existing output. `--record <binding>` persists an invocation-derived immutable
 byte value in the filesystem CAS, stores its Recipe-to-Content mapping and
@@ -70,7 +78,7 @@ normalized semantic lineage in SQLite, and prints the durable identities.
 
 For one-off outer pipelines, `histima pipeline <workspace> <expression>` runs
 exactly one quoted Tima expression without requiring a source file or compiling
-an empty native module. It still uses catalog-only assets, registered-transform
+an empty Wasm module. It still uses catalog-only assets, registered-transform
 lineage, and the durable Recipe cache. Invocation-derived byte results are
 automatically added to workspace stock, so a later process can reuse the same
 Recipe-to-Content result; scalar and image results remain ephemeral. Bindings,
@@ -84,7 +92,7 @@ Recorded byte results now participate in later `histima run` processes through
 a host-provided result-cache layer. Tima computes the current Recipe ID before
 lookup, validates source observations first, and attaches current invocation
 lineage to a hit; cache execution history never enters derivation lineage. The
-CLI reports native and result-cache statistics separately. Transforms whose
+CLI reports artifact and result-cache statistics separately. Transforms whose
 external observations cannot be known before execution are not early-hit by
 this initial adapter.
 
@@ -92,45 +100,44 @@ this initial adapter.
 Source, Dependency, Recipe, and argument identities, resolves every recorded
 transform against the supplied current Tima program, and validates all source
 and external observations before accepting a cached result. It then reuses
-valid durable intermediates or executes the generated-C path and verifies the
+valid durable intermediates or executes the Wasm path and verifies the
 expected Content ID. Replay reconstructs the recorded derivation without
 repeating outer `save(...)` effects; ancestor substitution and non-byte result
 serialization remain deferred.
 
 The intentionally small executable subset supports outer bindings, scalar and
 string literals, immutable lists/records, `asset(...)`, arithmetic, scalar
-comparisons, transform calls, and pipelines. `tima run` compiles checked scalar
-transforms to a temporary DLL with LLVM/Clang and invokes them through generated
-C ABI adapters; the IR interpreter remains available as a reference execution
-path.
+comparisons, transform calls, and pipelines. `tima run` emits checked
+transforms as a portable memory64 `.wasm` module and invokes them through
+Wasmtime; the IR interpreter remains a test oracle.
 Transform bodies may contain inferred immutable local bindings, typed returns,
 and `if` statements with required `else` arms. Either branch may return early
 or fall through to a continuation; branch-local bindings do not escape that
 join. The typed IR represents control flow as explicit basic-block branches and
-jumps consumed by both the reference interpreter and C backend. Merged branch
+jumps consumed by both the reference interpreter and Wasm backend. Merged branch
 values, rebinding, and general loop bodies remain intentionally unsupported.
-Host-provided immutable images can cross the native boundary: `Image` acquires
+Host-provided immutable images can cross the Wasm boundary: `Image` acquires
 unique mutable storage by transfer or detach, multiple owned arguments cannot
 alias, `ImageView` shares storage zero-copy, and returned descriptors are frozen
 only when they reference storage retained by the invocation. Inner-to-inner
 calls transfer owned `Image` arguments without returning through the outer
 representation; passing the same owned value twice or using it after the call
-is rejected. Native `i64` arithmetic is still held back until its overflow and
+is rejected. Inner `i64` arithmetic is still held back until its overflow and
 division-error semantics are specified.
 
 The first concrete owned-image operation is the inner-only
 `image_zero(image)`. It consumes an owned `Image`, zeros its byte storage in
 place, and returns the same ownership under a new value; aliases to the consumed
 value are rejected, including unsafe uses after branch joins. Both the reference
-interpreter and generated-C backend implement the same typed IR operation, while
+interpreter and Wasm backend implement the same typed IR operation, while
 the outer input remains immutable because shared storage is detached at the
 boundary. This is intentionally narrower than general field or buffer mutation.
 
 The same ownership path now supports `image_fill(image, value)`, where `value`
-is a native-safe `u8`. Outer integers cross a `u8` parameter only after a
+is a Wasm-safe `u8`. Outer integers cross a `u8` parameter only after a
 `0..=255` range check; inner integer literals remain `i64`, and implicit numeric
 conversions or `u8` arithmetic are intentionally deferred. `u8` equality and
-ordering are statically checked and execute consistently in the reference and C
+ordering are statically checked and execute consistently in the reference and Wasm
 paths.
 
 The first constrained loop surface is
@@ -139,15 +146,15 @@ exactly one assignment producing `u8`. A loop-invariant assignment canonicalizes
 to the same backend-neutral `ImageFill` operation as `image_fill`, so equivalent
 source forms share Transform identity. A byte-dependent assignment lowers to a
 structured `ImageByteMap` IR operation containing its typed scalar instruction
-sequence; both the reference interpreter and generated C execute it once per
+sequence; both the reference interpreter and Wasm execute it once per
 byte. General/nested loop statements, arbitrary indexing, and consuming other
 owned values inside the loop remain deferred.
 
 Images now carry a semantic format through the outer value, ownership boundary,
-reference interpreter, and generated-C ABI. Existing `ImageValue::new` values
+reference interpreter, and Wasm ABI. Existing `ImageValue::new` values
 remain opaque byte rows; `ImageValue::new_rgba8` validates four interleaved
 8-bit channels per pixel and row stride. Format participates in content identity
-and is revalidated when a native result is frozen. Byte loops work with either
+and is revalidated when a Wasm result is frozen. Byte loops work with either
 layout.
 
 The first RGBA8 pixel surface supports the target-shaped loop
@@ -167,8 +174,9 @@ deterministic immutable P3 bytes. `asset(...)` remains a lazy locator and the
 explicit `read` builtin is the capability-mediated source observation that
 produces those bytes and fixes source lineage. The versioned registered
 transforms participate in semantic lineage, result caching, and replay, but
-remain outside typed inner IR and the generated-C artifact cache. The CLI
-explicitly supplies catalog-backed asset access; the library has no ambient
+remain outside typed inner IR and the Wasm artifact cache. Decoders allocate
+their image result in the active Wasm arena so following inner transforms avoid
+a host round trip. The CLI explicitly supplies catalog-backed asset access; the library has no ambient
 filesystem fallback.
 
 The same boundary now provides `png.decode` and
@@ -205,37 +213,38 @@ Calls and pipeline stages may assert that identity with `name#hash`, where
 prefix. A mismatch fails compilation; the assertion does not itself change
 semantic identity. The same syntax works for namespaced registered transforms,
 for example `png.decode#4f26a3`.
-Content, invocation recipe, observed dependency, and native artifact identities
+Content, invocation recipe, observed dependency, and Wasm artifact identities
 use separate hash domains; artifact identity additionally includes the actual
-backend, Clang version, target, optimization mode, and native ABI version.
+backend, emitter version, target, optimization mode, and Wasm ABI version.
 Lazy `asset(...)` values now begin with source lineage, and every outer-to-inner
 transform call records a stable invocation recipe, semantic argument snapshots,
-and ancestor edges without retaining owned native storage. `trace(value)`
+and ancestor edges without retaining owned inner storage. `trace(value)`
 returns the derivation as an inspectable outer value.
 
 The first tracked capability is the literal-key inner call
 `environment_i64("NAME")`. A Histima host must explicitly implement
 `RuntimeCapabilities`; Tima never falls back to ambient process state. The
-reference interpreter and generated C both parse the supplied bytes as an
+reference interpreter and Wasm executor both parse the supplied bytes as an
 `i64`, record the raw bytes as an external observation, and include that
 dependency in Recipe identity. Different observed bytes therefore produce
 different recipes, while replay validates the recorded observation before
 cache reuse or re-execution.
 
-Native C bundles are cached persistently under `build/cache` using the ordered
-Artifact IDs of their transforms and are validated against the generated source
-and compiled-library Content ID before reuse. Transform results use a separate
+Portable Wasm bundles are cached persistently under
+`cache/artifacts/wasm/<bundle-id>/module.wasm` using the ordered Artifact IDs
+of their transforms and are validated against module Content ID before reuse.
+Wasmtime's machine-code cache is separate and non-semantic. Transform results use a separate
 Recipe-ID index over an immutable content-addressed store. Cache hits reconstruct
 lineage from the current semantic invocation rather than recording cache
 execution history; conflicting content for one recipe is rejected as a
 reproducibility failure.
 
-Histima additionally records each native bundle and its ordered Artifact IDs in
+Histima additionally records each artifact bundle and its ordered Artifact IDs in
 SQLite. The catalog keeps backend and compiler versions, target, CPU-feature
-selection, optimization configuration, ABI version, DLL Content ID, and
+selection, optimization configuration, ABI version, module Content ID, and
 workspace-relative cache location. Each load compares those records with the
-Tima-computed identities and the bytes currently on disk before loading native
-code. These records have no identity relationship to Recipe IDs: changing a
+Tima-computed identities and the bytes currently on disk before instantiating
+Wasm. These records have no identity relationship to Recipe IDs: changing a
 compiler or backend affects artifact reuse, never semantic lineage.
 
 `replay(value)` now resolves recorded inner and registered transforms by semantic
@@ -253,7 +262,7 @@ cargo run -p tima -- check examples/first.tima
 cargo run -p tima -- check examples/darken.tima
 cargo run -p tima -- run examples/first.tima
 cargo run -p tima -- run examples/image_pipeline.tima
-cargo run -p tima -- emit-c examples/first.tima
+cargo run -p tima -- emit-wasm examples/first.tima
 ```
 
 The implemented language and runtime contract is specified in

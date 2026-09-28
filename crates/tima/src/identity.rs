@@ -403,7 +403,7 @@ fn encode_outer_value(
             hasher.u64(image.width() as u64);
             hasher.u64(image.height() as u64);
             hasher.u64(image.stride() as u64);
-            hasher.bytes(image.bytes());
+            image.with_bytes(|bytes| hasher.bytes(bytes));
         }
         ValueData::Asset(asset) => {
             return Err(IdentityError::unavailable(format!(

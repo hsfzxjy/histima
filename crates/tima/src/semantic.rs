@@ -152,7 +152,7 @@ impl<'a> Checker<'a> {
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        format!("unknown native transform type `{}`", reference.name),
+                        format!("unknown inner transform type `{}`", reference.name),
                         reference.span,
                     )
                     .with_note(
@@ -1002,7 +1002,7 @@ impl<'a> Lowerer<'a> {
             | ExprKind::Pipeline { .. } => {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        "outer-only value or syntax is not available inside a native transform",
+                        "outer-only value or syntax is not available inside an inner transform",
                         expression.span,
                     )
                     .with_note("only native-safe typed values may cross the transform boundary"),

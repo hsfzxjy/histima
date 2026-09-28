@@ -1,5 +1,5 @@
-pub mod c;
-pub mod native;
+pub mod wasm;
+pub mod wasm_runtime;
 
 use crate::diagnostic::Diagnostic;
 use crate::ir::TypedModule;
@@ -9,13 +9,15 @@ use crate::ir::TypedModule;
 /// Semantic transform identity belongs to the IR. Backend, target, compiler,
 /// optimization settings, and `abi_version` belong to artifact identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NativeArtifact {
+pub struct BackendArtifact {
     pub backend: &'static str,
     pub backend_version: &'static str,
     pub abi_version: u32,
-    pub source: String,
+    pub bytes: Vec<u8>,
+    /// Bytes occupied by immutable data segments before dynamic allocations.
+    pub static_size: u64,
 }
 
-pub trait NativeBackend {
-    fn emit(&self, module: &TypedModule) -> Result<NativeArtifact, Vec<Diagnostic>>;
+pub trait ArtifactBackend {
+    fn emit(&self, module: &TypedModule) -> Result<BackendArtifact, Vec<Diagnostic>>;
 }

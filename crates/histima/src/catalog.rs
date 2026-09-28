@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use tima::backend::native::CachedNativeArtifact;
+use tima::backend::wasm_runtime::CachedWasmArtifact;
 use tima::identity::{
     ArtifactBundleIdentity, ArtifactConfiguration, ArtifactIdentity, ContentIdentity,
     RecipeIdentity, SemanticValueIdentity, SourceIdentity, TransformIdentity,
@@ -15,7 +15,7 @@ use crate::cas::{ContentKind, StoredContent};
 use crate::error::{Error, Result};
 use crate::stored_lineage::StoredRecipe;
 
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const LATEST_SCHEMA_VERSION: i64 = 4;
 pub const CATALOG_LIST_LIMIT: usize = 100;
 
 const MIGRATION_1: &str = r#"
@@ -128,6 +128,17 @@ CREATE INDEX native_artifact_members_artifact_idx
     ON native_artifact_bundle_members(artifact_id);
 "#;
 
+const MIGRATION_4: &str = r#"
+ALTER TABLE native_artifact_bundles RENAME TO artifact_bundles;
+ALTER TABLE artifact_bundles RENAME COLUMN library_content_id TO artifact_content_id;
+ALTER TABLE artifact_bundles RENAME COLUMN library_byte_length TO artifact_byte_length;
+ALTER TABLE artifact_bundles RENAME COLUMN library_relative_path TO artifact_relative_path;
+ALTER TABLE native_artifacts RENAME TO artifacts;
+ALTER TABLE native_artifact_bundle_members RENAME TO artifact_bundle_members;
+DROP INDEX native_artifact_members_artifact_idx;
+CREATE INDEX artifact_members_artifact_idx ON artifact_bundle_members(artifact_id);
+"#;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogInfo {
     pub schema_version: u32,
@@ -142,15 +153,15 @@ pub struct CatalogStats {
     pub source_heads: u64,
     pub lineage_invocations: u64,
     pub recipe_results: u64,
-    pub native_artifact_bundles: u64,
-    pub native_artifacts: u64,
+    pub artifact_bundles: u64,
+    pub artifacts: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NativeArtifactInfo {
+pub struct ArtifactInfo {
     pub bundle_id: ArtifactBundleIdentity,
     pub artifact_ids: Vec<ArtifactIdentity>,
-    pub library_content_id: ContentIdentity,
+    pub artifact_content_id: ContentIdentity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,9 +210,9 @@ pub(crate) struct CatalogArtifactBundle {
     pub cpu_features: String,
     pub optimization: String,
     pub abi_version: u32,
-    pub library_content_id: ContentIdentity,
-    pub library_byte_len: u64,
-    pub library_relative_path: String,
+    pub artifact_content_id: ContentIdentity,
+    pub artifact_byte_len: u64,
+    pub artifact_relative_path: String,
     pub members: Vec<ArtifactBundleMember>,
 }
 
@@ -506,7 +517,7 @@ impl Catalog {
             .connection
             .query_row(
                 "SELECT artifact_id, transform_id
-                 FROM native_artifacts WHERE artifact_id = ?1",
+                 FROM artifacts WHERE artifact_id = ?1",
                 [identity],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -534,9 +545,9 @@ impl Catalog {
         let mut statement = self.connection.prepare(
             "SELECT bundle_id
              FROM (
-                 SELECT bundle_id FROM native_artifact_bundles WHERE bundle_id = ?1
+                 SELECT bundle_id FROM artifact_bundles WHERE bundle_id = ?1
                  UNION
-                 SELECT bundle_id FROM native_artifact_bundle_members WHERE artifact_id = ?1
+                 SELECT bundle_id FROM artifact_bundle_members WHERE artifact_id = ?1
              )
              ORDER BY bundle_id = ?1 DESC, bundle_id
              LIMIT ?2",
@@ -624,15 +635,15 @@ impl Catalog {
         crate::stored_lineage::load(&self.connection, recipe)
     }
 
-    pub fn record_native_artifact(
+    pub fn record_artifact(
         &self,
-        cached: &CachedNativeArtifact,
+        cached: &CachedWasmArtifact,
         transforms: &[TransformIdentity],
         workspace_root: &Path,
-    ) -> Result<NativeArtifactInfo> {
+    ) -> Result<ArtifactInfo> {
         if cached.artifact_ids.len() != transforms.len() {
             return Err(Error::catalog(format!(
-                "native bundle {} has {} Artifact IDs for {} transforms",
+                "artifact bundle {} has {} Artifact IDs for {} transforms",
                 cached.bundle_id,
                 cached.artifact_ids.len(),
                 transforms.len()
@@ -647,7 +658,7 @@ impl Catalog {
             let expected = cached.artifact.identity(*transform_id);
             if *artifact_id != expected {
                 return Err(Error::catalog(format!(
-                    "native bundle {} Artifact ID at index {index} is {artifact_id}, expected {expected}",
+                    "artifact bundle {} Artifact ID at index {index} is {artifact_id}, expected {expected}",
                     cached.bundle_id
                 )));
             }
@@ -655,29 +666,25 @@ impl Catalog {
         let expected_bundle = artifact_bundle_identity(&cached.artifact_ids);
         if cached.bundle_id != expected_bundle {
             return Err(Error::catalog(format!(
-                "native bundle ID {} rebuilds as {expected_bundle}",
+                "artifact bundle ID {} rebuilds as {expected_bundle}",
                 cached.bundle_id
             )));
         }
 
-        let library_relative_path = format!("cache/native/{}/module.dll", cached.bundle_id);
-        let source_relative_path = format!("cache/native/{}/module.c", cached.bundle_id);
-        let expected_library = workspace_root.join(Path::new(&library_relative_path));
-        let expected_source = workspace_root.join(Path::new(&source_relative_path));
-        if cached.artifact.library_path != expected_library
-            || cached.artifact.source_path != expected_source
-        {
+        let artifact_relative_path =
+            format!("cache/artifacts/wasm/{}/module.wasm", cached.bundle_id);
+        let expected_artifact = workspace_root.join(Path::new(&artifact_relative_path));
+        if cached.artifact.module_path != expected_artifact {
             return Err(Error::catalog(format!(
-                "native bundle {} is outside its expected workspace cache location",
+                "artifact bundle {} is outside its expected workspace cache location",
                 cached.bundle_id
             )));
         }
-        let library = fs::read(&expected_library)
-            .map_err(|error| Error::io("read cached native artifact", &expected_library, error))?;
-        let library_content_id = byte_content_identity(&library);
-        let library_byte_length = i64::try_from(library.len()).map_err(|_| {
-            Error::catalog("native artifact byte length does not fit SQLite INTEGER")
-        })?;
+        let artifact_bytes = fs::read(&expected_artifact)
+            .map_err(|error| Error::io("read cached Wasm artifact", &expected_artifact, error))?;
+        let artifact_content_id = byte_content_identity(&artifact_bytes);
+        let artifact_byte_length = i64::try_from(artifact_bytes.len())
+            .map_err(|_| Error::catalog("artifact byte length does not fit SQLite INTEGER"))?;
         let abi_version = i64::from(cached.artifact.abi_version);
         // The current compiler targets the baseline architecture. This field
         // stays explicit so adding selected CPU features changes metadata and
@@ -687,22 +694,22 @@ impl Catalog {
         let expected_metadata = (
             cached.artifact.backend.to_owned(),
             cached.artifact.backend_version.to_owned(),
-            cached.artifact.compiler_version.clone(),
-            cached.artifact.target.clone(),
+            cached.artifact.compiler_version.to_owned(),
+            cached.artifact.target.to_owned(),
             cpu_features.to_owned(),
             cached.artifact.optimization.to_owned(),
             abi_version,
-            library_content_id.to_string(),
-            library_byte_length,
-            library_relative_path.clone(),
+            artifact_content_id.to_string(),
+            artifact_byte_length,
+            artifact_relative_path.clone(),
         );
 
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
-            "INSERT OR IGNORE INTO native_artifact_bundles(
+            "INSERT OR IGNORE INTO artifact_bundles(
                  bundle_id, backend, backend_version, compiler_version, target,
-                 cpu_features, optimization, abi_version, library_content_id,
-                 library_byte_length, library_relative_path
+                 cpu_features, optimization, abi_version, artifact_content_id,
+                 artifact_byte_length, artifact_relative_path
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 bundle_id,
@@ -720,9 +727,9 @@ impl Catalog {
         )?;
         let recorded_metadata = transaction.query_row(
             "SELECT backend, backend_version, compiler_version, target,
-                    cpu_features, optimization, abi_version, library_content_id,
-                    library_byte_length, library_relative_path
-             FROM native_artifact_bundles WHERE bundle_id = ?1",
+                    cpu_features, optimization, abi_version, artifact_content_id,
+                    artifact_byte_length, artifact_relative_path
+             FROM artifact_bundles WHERE bundle_id = ?1",
             [&bundle_id],
             |row| {
                 Ok((
@@ -741,7 +748,7 @@ impl Catalog {
         )?;
         if recorded_metadata != expected_metadata {
             return Err(Error::catalog(format!(
-                "native artifact bundle {} has catalog metadata that does not match the on-disk cache",
+                "artifact bundle {} has catalog metadata that does not match the on-disk cache",
                 cached.bundle_id
             )));
         }
@@ -755,12 +762,12 @@ impl Catalog {
             let artifact_id = artifact_id.to_string();
             let transform_id = transform_id.to_string();
             transaction.execute(
-                "INSERT OR IGNORE INTO native_artifacts(artifact_id, transform_id)
+                "INSERT OR IGNORE INTO artifacts(artifact_id, transform_id)
                  VALUES (?1, ?2)",
                 params![artifact_id, transform_id],
             )?;
             let recorded_transform = transaction.query_row(
-                "SELECT transform_id FROM native_artifacts WHERE artifact_id = ?1",
+                "SELECT transform_id FROM artifacts WHERE artifact_id = ?1",
                 [&artifact_id],
                 |row| row.get::<_, String>(0),
             )?;
@@ -770,43 +777,43 @@ impl Catalog {
                 )));
             }
             let index = i64::try_from(index)
-                .map_err(|_| Error::catalog("native artifact index exceeds SQLite INTEGER"))?;
+                .map_err(|_| Error::catalog("artifact index exceeds SQLite INTEGER"))?;
             transaction.execute(
-                "INSERT OR IGNORE INTO native_artifact_bundle_members(
+                "INSERT OR IGNORE INTO artifact_bundle_members(
                      bundle_id, artifact_index, artifact_id
                  ) VALUES (?1, ?2, ?3)",
                 params![bundle_id, index, artifact_id],
             )?;
             let recorded_artifact = transaction.query_row(
-                "SELECT artifact_id FROM native_artifact_bundle_members
+                "SELECT artifact_id FROM artifact_bundle_members
                  WHERE bundle_id = ?1 AND artifact_index = ?2",
                 params![bundle_id, index],
                 |row| row.get::<_, String>(0),
             )?;
             if recorded_artifact != artifact_id {
                 return Err(Error::catalog(format!(
-                    "native bundle {} has a different Artifact ID at index {index}",
+                    "artifact bundle {} has a different Artifact ID at index {index}",
                     cached.bundle_id
                 )));
             }
         }
         let member_count = transaction.query_row(
-            "SELECT COUNT(*) FROM native_artifact_bundle_members WHERE bundle_id = ?1",
+            "SELECT COUNT(*) FROM artifact_bundle_members WHERE bundle_id = ?1",
             [&bundle_id],
             |row| row.get::<_, i64>(0),
         )?;
         if member_count != i64::try_from(cached.artifact_ids.len()).unwrap_or(i64::MAX) {
             return Err(Error::catalog(format!(
-                "native bundle {} has {member_count} recorded members, expected {}",
+                "artifact bundle {} has {member_count} recorded members, expected {}",
                 cached.bundle_id,
                 cached.artifact_ids.len()
             )));
         }
         transaction.commit()?;
-        Ok(NativeArtifactInfo {
+        Ok(ArtifactInfo {
             bundle_id: cached.bundle_id,
             artifact_ids: cached.artifact_ids.clone(),
-            library_content_id,
+            artifact_content_id,
         })
     }
 
@@ -834,8 +841,8 @@ impl Catalog {
             source_heads: count(&self.connection, "source_heads")?,
             lineage_invocations: count(&self.connection, "lineage_invocations")?,
             recipe_results: count(&self.connection, "recipe_results")?,
-            native_artifact_bundles: count(&self.connection, "native_artifact_bundles")?,
-            native_artifacts: count(&self.connection, "native_artifacts")?,
+            artifact_bundles: count(&self.connection, "artifact_bundles")?,
+            artifacts: count(&self.connection, "artifacts")?,
         })
     }
 }
@@ -855,9 +862,9 @@ fn load_artifact_bundle(
 ) -> Result<CatalogArtifactBundle> {
     let metadata = connection.query_row(
         "SELECT bundle_id, backend, backend_version, compiler_version, target,
-                cpu_features, optimization, abi_version, library_content_id,
-                library_byte_length, library_relative_path
-         FROM native_artifact_bundles WHERE bundle_id = ?1",
+                cpu_features, optimization, abi_version, artifact_content_id,
+                artifact_byte_length, artifact_relative_path
+         FROM artifact_bundles WHERE bundle_id = ?1",
         [bundle_identity],
         |row| {
             Ok((
@@ -886,26 +893,26 @@ fn load_artifact_bundle(
         })?;
     let abi_version = u32::try_from(metadata.7).map_err(|_| {
         Error::catalog(format!(
-            "native bundle {bundle_id} has invalid ABI version {}",
+            "artifact bundle {bundle_id} has invalid ABI version {}",
             metadata.7
         ))
     })?;
-    let library_content_id = metadata.8.parse::<ContentIdentity>().map_err(|error| {
+    let artifact_content_id = metadata.8.parse::<ContentIdentity>().map_err(|error| {
         Error::catalog(format!(
-            "native bundle {bundle_id} has invalid library Content ID {:?}: {error}",
+            "artifact bundle {bundle_id} has invalid artifact Content ID {:?}: {error}",
             metadata.8
         ))
     })?;
-    let library_byte_len = u64::try_from(metadata.9).map_err(|_| {
+    let artifact_byte_len = u64::try_from(metadata.9).map_err(|_| {
         Error::catalog(format!(
-            "native bundle {bundle_id} has a negative library byte length"
+            "artifact bundle {bundle_id} has a negative artifact byte length"
         ))
     })?;
 
     let mut statement = connection.prepare(
         "SELECT member.artifact_index, member.artifact_id, artifact.transform_id
-         FROM native_artifact_bundle_members AS member
-         JOIN native_artifacts AS artifact USING (artifact_id)
+         FROM artifact_bundle_members AS member
+         JOIN artifacts AS artifact USING (artifact_id)
          WHERE member.bundle_id = ?1
          ORDER BY member.artifact_index",
     )?;
@@ -923,12 +930,12 @@ fn load_artifact_bundle(
         .map(|(index, artifact_id, transform_id)| {
             let index = u32::try_from(index).map_err(|_| {
                 Error::catalog(format!(
-                    "native bundle {bundle_id} has invalid member index {index}"
+                    "artifact bundle {bundle_id} has invalid member index {index}"
                 ))
             })?;
             let artifact_id = artifact_id.parse::<ArtifactIdentity>().map_err(|error| {
                 Error::catalog(format!(
-                    "native bundle {bundle_id} has invalid Artifact ID {artifact_id:?}: {error}"
+                    "artifact bundle {bundle_id} has invalid Artifact ID {artifact_id:?}: {error}"
                 ))
             })?;
             let transform_id = transform_id.parse::<TransformIdentity>().map_err(|error| {
@@ -946,7 +953,7 @@ fn load_artifact_bundle(
     for (expected, member) in members.iter().enumerate() {
         if usize::try_from(member.index).ok() != Some(expected) {
             return Err(Error::catalog(format!(
-                "native bundle {bundle_id} member indices are not contiguous"
+                "artifact bundle {bundle_id} member indices are not contiguous"
             )));
         }
     }
@@ -960,9 +967,9 @@ fn load_artifact_bundle(
         cpu_features: metadata.5,
         optimization: metadata.6,
         abi_version,
-        library_content_id,
-        library_byte_len,
-        library_relative_path: metadata.10,
+        artifact_content_id,
+        artifact_byte_len,
+        artifact_relative_path: metadata.10,
         members,
     })
 }
@@ -1025,6 +1032,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         (1_i64, "initial catalog", MIGRATION_1),
         (2_i64, "durable recipe results", MIGRATION_2),
         (3_i64, "native artifact metadata", MIGRATION_3),
+        (4_i64, "backend-neutral artifact metadata", MIGRATION_4),
     ] {
         if version <= current {
             continue;
@@ -1403,7 +1411,7 @@ mod tests {
 
         let catalog = Catalog::open(&database).unwrap();
 
-        assert_eq!(catalog.info().unwrap().schema_version, 3);
+        assert_eq!(catalog.info().unwrap().schema_version, 4);
         assert_eq!(
             catalog
                 .connection
@@ -1415,7 +1423,7 @@ mod tests {
         assert_eq!(
             catalog
                 .connection
-                .query_row("SELECT COUNT(*) FROM native_artifact_bundles", [], |row| {
+                .query_row("SELECT COUNT(*) FROM artifact_bundles", [], |row| {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),

@@ -21,8 +21,8 @@ Tima is Histima's embedded language for asset-transformation pipelines. It has
 one source language with two execution strata:
 
 - **outer code** is dynamic, immutable, and orchestration-oriented;
-- **inner code**, introduced by `transform`, is statically checked and can run
-  as native code.
+- **inner code**, introduced by `transform`, is statically checked and runs as
+  WebAssembly through the host runtime.
 
 Both strata use the same lexer, parser, expression syntax tree, source spans,
 and diagnostic model. Semantic context determines which syntax and values are
@@ -35,14 +35,15 @@ Tima source
     -> shared lexer/parser/AST
     -> inner semantic checking
     -> backend-neutral typed Tima IR
-    -> generated C
-    -> external C compiler
-    -> native artifact
+    -> WebAssembly memory64 module
+    -> Wasmtime
 ```
 
-Generated C is a backend output, not Tima's IR. The typed IR and native ABI
-are designed so that another backend, such as Cranelift, can be added without
-changing language semantics.
+WebAssembly is the sole inner-language backend. It is a backend output, not
+Tima's IR. The typed IR remains backend-neutral so language semantics are not
+defined by Wasm instructions or by Wasmtime's internal Cranelift compiler.
+Portable `.wasm` modules are the durable compiled artifacts; host machine-code
+caches are non-semantic and may be discarded at any time.
 
 ## 2. Core invariants
 
@@ -67,9 +68,9 @@ The conceptual boundary is:
 ```text
 OuterValue
     -> validate / lower / acquire or detach
-NativeValue
+WasmValue / linear-memory offset
     -> execute transform
-NativeValue
+WasmValue / linear-memory offset
     -> validate / freeze / box / attach lineage
 OuterValue
 ```
@@ -408,7 +409,7 @@ operations. Strings are allowed only as the literal key argument of
 
 Inner arithmetic requires operands of the same type and is defined for `f32`.
 The checker and reference interpreter retain checked `i64` arithmetic, but the
-native executor rejects a transform whose reachable IR contains it: portable
+Wasm executor rejects a transform whose reachable IR contains it: portable
 overflow and division-error semantics have not been chosen. Inner `i64`
 arithmetic is therefore not part of the executable v0 contract. `u8`
 arithmetic is unsupported.
@@ -443,7 +444,7 @@ format:
   with `stride >= width * 4` and `len == stride * height`.
 
 Layout multiplication must not overflow. Format and layout participate in
-content identity. Native results are revalidated before freezing.
+content identity. Wasm results are revalidated before freezing.
 
 Byte operations support both formats. Pixel operations require RGBA8.
 
@@ -504,26 +505,43 @@ padding remain unchanged.
 
 General pixel expressions and `=` channel replacement are unsupported.
 
-## 9. Outer/inner boundary and ABI
+## 9. Outer/inner boundary, memory, and ABI
 
-Scalars are range- and type-checked at the boundary. `bool`, `u8`, `i64`, and
-`f32` lower to fixed C-compatible scalar representations.
+Scalars are range- and type-checked at the boundary. `bool` and `u8` lower to
+Wasm `i32`, `i64` to Wasm `i64`, and `f32` to Wasm `f32`.
 
-For an `Image` parameter, the runtime acquires unique mutable storage. It may
-transfer already-unique storage; otherwise it detaches a copy. Multiple owned
-arguments and simultaneous owned/view arguments therefore cannot expose a
-mutable alias.
+Each program run or replay creates one Wasm memory64 session and one arena in
+its imported linear memory. Buffer descriptors use 64-bit byte offsets and
+lengths, never host pointers. An image is flattened as offset, byte length,
+width, height, stride, and format tag. Dynamic outer tags, Rust objects,
+lineage, and cache metadata do not cross this ABI. WASI is not available.
 
-For an `ImageView` parameter, the runtime shares immutable backing storage
-without copying. Native code cannot mutate it through the ABI.
+Host-backed bytes must be copied once when first admitted to the Wasm arena.
+The session retains a weak mirror keyed by host storage identity, so repeated
+read-only views of that same outer storage reuse one allocation. Values
+already backed by the current session enter without a host copy.
 
-A returned owned image must reference storage acquired by that invocation. A
-returned image/view descriptor and layout are validated, then boxed as an
-immutable outer image. Lineage is attached beside the outer payload and never
-crosses the C ABI.
+For an `Image` parameter, the runtime acquires unique mutable storage. Unique
+current-session storage transfers directly. Shared or aliased current-session
+storage is detached with one linear-memory-to-linear-memory copy. Host storage
+is copied into a fresh arena allocation. Multiple owned arguments and
+simultaneous owned/view arguments therefore cannot expose a mutable alias.
 
-The ABI is C-compatible and versioned independently from semantic identity.
-It does not use Rust ABI or accept arbitrary dynamic outer objects.
+For an `ImageView` parameter, the runtime reuses current-session storage or the
+session's host mirror. Wasm code receives no mutating operation for a view.
+
+A returned owned image must reference an allocation acquired by that
+invocation. Its descriptor and layout are validated, then the allocation is
+wrapped as immutable outer storage without copying it out of linear memory.
+The session remains alive while such outer values exist. Lineage is attached
+beside the outer payload and never enters linear memory.
+
+Arena allocations are 16-byte aligned and use a coalescing free list. The
+runtime does not compact live buffers. This keeps offsets stable across a run
+and makes zero-copy freeze possible.
+
+The Wasm ABI is versioned independently from semantic identity. It does not
+use Rust ABI or accept arbitrary dynamic outer objects.
 
 ## 10. Runtime-mediated capabilities
 
@@ -544,15 +562,17 @@ external observation. Missing capabilities, invalid UTF-8, and invalid integer
 text are errors.
 
 The outer `read(asset)` builtin observes an asset locator through the explicit
-asset capability. Arbitrary native OS access is not part of v0.
+asset capability. Arbitrary OS access from Wasm is not part of v0.
 
 ## 11. Registered standard transforms
 
 Registered transforms use normal outer call and pipeline syntax. They have
 versioned semantic identities and use the same normalized arguments, lineage,
 result cache, and replay machinery as user transforms, but are not emitted into
-the user-transform native artifact. The registry is a deliberately small Tima
-runtime interface; it is not general native-library FFI.
+the user-transform Wasm artifact. Decoders place their image result in the
+active Wasm arena when one exists, so following inner transforms do not need a
+host round trip. The registry is a deliberately small Tima runtime interface;
+it is not general native-library FFI.
 
 | Transform | Parameters | Result | Contract |
 | --- | --- | --- | --- |
@@ -581,7 +601,7 @@ Lineage is an immutable DAG with three node kinds:
 
 Invocation arguments record small scalar values directly. Materialized large
 values are recorded by semantic/content identity so lineage never retains
-mutable native storage merely to support replay.
+mutable inner storage merely to support replay.
 
 Derivation lineage excludes compiler artifacts, cache-hit status, timestamps,
 profiling data, and other execution history.
@@ -603,7 +623,7 @@ hexadecimal characters. Each identity kind has a distinct hash domain.
   content domain.
 - **Source ID** identifies a locator together with its observed source content.
 - **Dependency ID** identifies capability, precise key, and observed content.
-- **Artifact ID** identifies compiled native code for one Transform ID and also
+- **Artifact ID** identifies compiled Wasm for one Transform ID and also
   includes backend and backend version, compiler version, target, normalized
   CPU features, optimization configuration, and ABI version.
 - **Artifact Bundle ID** identifies the ordered artifacts in one compilation
@@ -614,9 +634,16 @@ not interchangeable: distinct recipes may produce identical content.
 
 ### 12.3 Result and artifact caches
 
-Native artifacts are cached by artifact configuration, independently from
-semantic transform results. Transform results are cached by Recipe ID and
-validated against immutable content.
+Portable Wasm artifacts are cached under
+`cache/artifacts/wasm/<Artifact-Bundle-ID>/module.wasm`, independently from
+semantic transform results. Their identity includes the Wasm emitter version,
+memory64 target, optimization mode, and ABI version. Source spans, formatting,
+and local or transform names do not enter the module bytes when they do not
+enter Transform identity. Wasmtime's workspace-local machine cache lives under
+`cache/wasmtime` and is not a durable Histima artifact.
+
+Transform results are cached by Recipe ID and validated against immutable
+content.
 
 A result-cache hit receives the current semantic invocation lineage. The hit
 does not add an execution-history node. Conflicting content for one Recipe ID
@@ -649,7 +676,7 @@ non-materialized values are deferred.
 ## 13. Diagnostics
 
 Lexer, parser, semantic checker, boundary validation, runtime capabilities,
-native loading, caching, and replay report source-spanned diagnostics.
+Wasm loading, caching, and replay report source-spanned diagnostics.
 Diagnostics may contain a primary label, related labels, and explanatory
 notes. Implementations should identify the violated stratum or boundary rule,
 not merely report a backend failure.
@@ -657,29 +684,38 @@ not merely report a backend failure.
 Examples include:
 
 - an outer-only value used inside a transform;
-- a dynamic outer value that cannot cross a typed native parameter;
+- a dynamic outer value that cannot cross a typed inner parameter;
 - use of an owned image after it has moved;
 - a read-only view passed to a mutating operation;
 - an RGBA8 pixel operation applied to opaque-byte storage;
 - an unavailable runtime capability;
 - changed source or dependency content during replay;
-- a returned native descriptor with an invalid layout.
+- a returned Wasm descriptor with an invalid layout.
 
 ## 14. Execution and backend contract
 
-The reference typed-IR interpreter and generated-C/native engine must produce
-the same semantic result and lineage for supported programs. The initial
-native compiler is LLVM/Clang, but LLVM is a toolchain choice, not a language
-dependency.
+The Wasm engine is the production executor for inner transforms. The typed-IR
+interpreter is a test oracle and must produce the same semantic result and
+lineage for supported programs; it is not an independently selectable product
+backend. Wasmtime currently compiles Wasm with its Cranelift implementation,
+but Cranelift IR and machine code are not Tima artifacts or language contracts.
 
 The backend boundary is conceptually:
 
 ```text
-TypedIR -> NativeArtifact
+TypedIR -> WasmArtifact
 ```
 
-A backend must preserve typed evaluation order, ownership transfer, capability
-observations, boundary validation, and error behavior specified here.
+The backend must preserve typed evaluation order, ownership transfer,
+capability observations, boundary validation, and error behavior specified
+here.
+
+The default maximum linear-memory size is 4 GiB and must be a positive multiple
+of 64 KiB. Histima resolves an override in this order: CLI
+`--wasm-memory-limit <size>`, `HISTIMA_WASM_MEMORY_LIMIT`, workspace
+`.histima.toml` key `[wasm].memory_limit`, then the default. Sizes use exact
+`B`, `KiB`, `MiB`, `GiB`, or `TiB` suffixes. The cap is an execution policy and
+does not affect Transform or Recipe identity.
 
 ## 15. Deliberately unsupported in v0
 
@@ -696,8 +732,9 @@ The current language does not include:
 - macros or arbitrary compile-time/source evaluation;
 - async/await;
 - a borrow checker or general effect system;
-- arbitrary native FFI;
-- JIT execution, LLVM IR as the language IR, or LLVM as a required backend;
+- arbitrary native FFI or WASI;
+- a Tima-level JIT backend, LLVM IR as the language IR, or LLVM as a required
+  backend;
 - general filesystem/network/clock/random access;
 - tracing of scalar temporaries;
 - ancestor substitution during replay;

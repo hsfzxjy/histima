@@ -76,7 +76,7 @@ impl fmt::Display for Error {
             }
             Self::ArtifactNotFound(identity) => write!(
                 formatter,
-                "artifact or native bundle {identity} is not recorded in this workspace"
+                "artifact or artifact bundle {identity} is not recorded in this workspace"
             ),
             Self::ValueNotRecordable(message) => formatter.write_str(message),
             Self::InvalidMaterializationPath(path) => write!(

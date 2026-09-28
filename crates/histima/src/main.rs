@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use histima::{RunError, Workspace};
-use tima::backend::native::NativeCacheStatus;
+use tima::backend::wasm_runtime::ArtifactCacheStatus;
 use tima::identity::{ArtifactIdentity, ContentIdentity, RecipeIdentity, content_identity};
 use tima::lineage::{LineageNode, RecordedValue};
 use tima::runtime::{OuterValue, ValueData};
@@ -48,7 +48,31 @@ fn main() -> ExitCode {
         return report_error(output, "--json may be supplied only once".to_owned());
     }
     arguments.retain(|argument| argument != "--json");
-    match run(arguments.into_iter(), output) {
+    let mut wasm_memory_limit = None;
+    while let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--wasm-memory-limit")
+    {
+        if wasm_memory_limit.is_some() {
+            return report_error(
+                output,
+                "--wasm-memory-limit may be supplied only once".to_owned(),
+            );
+        }
+        if index + 1 >= arguments.len() {
+            return report_error(
+                output,
+                "--wasm-memory-limit requires a size such as 4GiB".to_owned(),
+            );
+        }
+        let value = arguments.remove(index + 1);
+        arguments.remove(index);
+        wasm_memory_limit = match tima::backend::wasm_runtime::parse_memory_limit(&value) {
+            Ok(limit) => Some(limit),
+            Err(error) => return report_error(output, error.to_string()),
+        };
+    }
+    match run(arguments.into_iter(), output, wasm_memory_limit) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => report_error(output, message),
     }
@@ -66,7 +90,11 @@ fn report_error(output: OutputMode, message: String) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<(), String> {
+fn run(
+    arguments: impl Iterator<Item = String>,
+    output: OutputMode,
+    wasm_memory_limit: Option<u64>,
+) -> Result<(), String> {
     let mut arguments = arguments.collect::<VecDeque<_>>();
     let command = arguments.pop_front().unwrap_or_else(|| "help".to_owned());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
@@ -77,7 +105,9 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         "init" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
-            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let workspace =
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             let info = workspace
                 .catalog_info()
                 .map_err(|error| error.to_string())?;
@@ -92,7 +122,8 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let source_path = required(&mut arguments, "source asset path")?;
             finished(&mut arguments)?;
             let mut workspace =
-                Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             let imported = workspace
                 .import_file(&source_path)
                 .map_err(|error| error.to_string())?;
@@ -106,7 +137,9 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         "stats" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
-            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let workspace =
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             let info = workspace
                 .catalog_info()
                 .map_err(|error| error.to_string())?;
@@ -120,17 +153,16 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 println!("source_heads = {}", stats.source_heads);
                 println!("lineage_invocations = {}", stats.lineage_invocations);
                 println!("recipe_results = {}", stats.recipe_results);
-                println!(
-                    "native_artifact_bundles = {}",
-                    stats.native_artifact_bundles
-                );
-                println!("native_artifacts = {}", stats.native_artifacts);
+                println!("artifact_bundles = {}", stats.artifact_bundles);
+                println!("artifacts = {}", stats.artifacts);
             })?;
         }
         "assets" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
-            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let workspace =
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             let page = workspace.assets().map_err(|error| error.to_string())?;
             output.emit(cli_json::assets(&page), || {
                 println!("count = {}", page.items.len());
@@ -146,7 +178,9 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         "recipes" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
-            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let workspace =
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             let page = workspace.recipes().map_err(|error| error.to_string())?;
             output.emit(cli_json::recipes(&page), || {
                 println!("count = {}", page.items.len());
@@ -168,7 +202,9 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let workspace_path = workspace_path(&mut arguments, 1)?;
             let identity_text = required(&mut arguments, "identity")?;
             finished(&mut arguments)?;
-            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let workspace =
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             match kind.as_str() {
                 "content" => {
                     let identity = identity_text
@@ -273,16 +309,19 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                             println!("{prefix}.optimization = {}", bundle.optimization);
                             println!("{prefix}.abi_version = {}", bundle.abi_version);
                             println!(
-                                "{prefix}.library_content_id = {}",
-                                bundle.library_content_id
+                                "{prefix}.artifact_content_id = {}",
+                                bundle.artifact_content_id
                             );
-                            println!("{prefix}.library_byte_length = {}", bundle.library_byte_len);
                             println!(
-                                "{prefix}.library_relative_path = {}",
-                                bundle.library_relative_path
+                                "{prefix}.artifact_byte_length = {}",
+                                bundle.artifact_byte_len
+                            );
+                            println!(
+                                "{prefix}.artifact_relative_path = {}",
+                                bundle.artifact_relative_path
                             );
                             println!("{prefix}.identity_valid = {}", bundle.identity_valid);
-                            println!("{prefix}.library_valid = {}", bundle.library_valid);
+                            println!("{prefix}.artifact_valid = {}", bundle.artifact_valid);
                             println!("{prefix}.valid = {}", bundle.valid);
                             println!("{prefix}.member_count = {}", bundle.members.len());
                             for member in &bundle.members {
@@ -317,7 +356,9 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let identity = identity_text
                 .parse::<ContentIdentity>()
                 .map_err(|error| format!("invalid Content ID: {error}"))?;
-            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let workspace =
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             workspace
                 .materialize_content(identity, &destination)
                 .map_err(|error| error.to_string())?;
@@ -340,7 +381,8 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 )
             })?;
             let mut workspace =
-                Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             let result = workspace
                 .evaluate_pipeline(&compiled)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
@@ -388,7 +430,8 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 )
             })?;
             let mut workspace =
-                Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             let result = workspace
                 .execute(&compiled)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
@@ -407,20 +450,20 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let json = cli_json::run(&result, record_binding.as_deref().zip(recorded.as_ref()));
             output.emit(json, || {
                 println!(
-                    "native_cache = {}",
-                    match result.native_cache {
-                        NativeCacheStatus::Hit => "hit",
-                        NativeCacheStatus::Miss => "miss",
+                    "artifact_cache = {}",
+                    match result.artifact_cache {
+                        ArtifactCacheStatus::Hit => "hit",
+                        ArtifactCacheStatus::Miss => "miss",
                     }
                 );
                 println!("result_cache_hits = {}", result.result_cache.hits);
                 println!("result_cache_misses = {}", result.result_cache.misses);
                 println!("result_cache_stores = {}", result.result_cache.stores);
-                println!("native_bundle_id = {}", result.native_artifact.bundle_id);
+                println!("artifact_bundle_id = {}", result.artifact.bundle_id);
                 println!(
-                    "native_artifact_ids = {}",
+                    "artifact_ids = {}",
                     result
-                        .native_artifact
+                        .artifact
                         .artifact_ids
                         .iter()
                         .map(ToString::to_string)
@@ -428,8 +471,8 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                         .join(",")
                 );
                 println!(
-                    "native_library_content_id = {}",
-                    result.native_artifact.library_content_id
+                    "artifact_content_id = {}",
+                    result.artifact.artifact_content_id
                 );
                 let unbound_trace = result.execution.last_value.as_ref().and_then(|last| {
                     let ValueData::Lineage(lineage) = &last.data else {
@@ -473,7 +516,9 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                     render_diagnostics(&diagnostic_source, &diagnostics)
                 )
             })?;
-            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let workspace =
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             let replayed = workspace
                 .replay_recipe(&compiled, recipe)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
@@ -481,20 +526,20 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 .map_err(|error| format!("replayed value has no content identity: {error}"))?;
             output.emit(cli_json::replay(recipe, content_id, &replayed), || {
                 println!(
-                    "native_cache = {}",
-                    match replayed.native_cache {
-                        NativeCacheStatus::Hit => "hit",
-                        NativeCacheStatus::Miss => "miss",
+                    "artifact_cache = {}",
+                    match replayed.artifact_cache {
+                        ArtifactCacheStatus::Hit => "hit",
+                        ArtifactCacheStatus::Miss => "miss",
                     }
                 );
                 println!("result_cache_hits = {}", replayed.result_cache.hits);
                 println!("result_cache_misses = {}", replayed.result_cache.misses);
                 println!("result_cache_stores = {}", replayed.result_cache.stores);
-                println!("native_bundle_id = {}", replayed.native_artifact.bundle_id);
+                println!("artifact_bundle_id = {}", replayed.artifact.bundle_id);
                 println!(
-                    "native_artifact_ids = {}",
+                    "artifact_ids = {}",
                     replayed
-                        .native_artifact
+                        .artifact
                         .artifact_ids
                         .iter()
                         .map(ToString::to_string)
@@ -502,8 +547,8 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                         .join(",")
                 );
                 println!(
-                    "native_library_content_id = {}",
-                    replayed.native_artifact.library_content_id
+                    "artifact_content_id = {}",
+                    replayed.artifact.artifact_content_id
                 );
                 println!("recipe_id = {recipe}");
                 println!("content_id = {content_id}");
@@ -520,7 +565,9 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let recipe = recipe_text
                 .parse::<RecipeIdentity>()
                 .map_err(|error| format!("invalid Recipe ID: {error}"))?;
-            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let workspace =
+                Workspace::open_with_wasm_memory_limit(&workspace_path, wasm_memory_limit)
+                    .map_err(|error| error.to_string())?;
             let trace = workspace
                 .trace_recipe(recipe)
                 .map_err(|error| error.to_string())?;
@@ -597,7 +644,7 @@ fn finished(arguments: &mut VecDeque<String>) -> Result<(), String> {
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  histima [--json] <command> ...");
+    eprintln!("  histima [--json] [--wasm-memory-limit <size>] <command> ...");
     eprintln!("  histima init [workspace]");
     eprintln!("  histima import [workspace] <source-file>");
     eprintln!("  histima stats [workspace]");
@@ -615,6 +662,7 @@ fn print_usage() {
         "  omitted workspaces resolve to the nearest initialized workspace at or above the current directory"
     );
     eprintln!("  --json may appear anywhere in the command");
+    eprintln!("  Wasm memory limits use B, KiB, MiB, GiB, or TiB (default 4GiB)");
 }
 
 fn print_content_inspection(inspection: &histima::ContentInspection) {
@@ -675,7 +723,7 @@ fn render_run_error(source: &SourceFile, error: RunError) -> String {
     match error {
         RunError::Storage(error) => error.to_string(),
         RunError::CodeGeneration(diagnostics) => format!(
-            "generated-C code generation failed:\n{}",
+            "WebAssembly code generation failed:\n{}",
             render_diagnostics(source, &diagnostics)
         ),
         RunError::Runtime(diagnostics) => format!(
@@ -720,7 +768,7 @@ fn display(value: &OuterValue) -> String {
             image.width(),
             image.height(),
             image.stride(),
-            image.bytes().len()
+            image.byte_len()
         ),
         ValueData::Transform(id) => format!("<transform {}>", id.0),
         ValueData::Lineage(lineage) => lineage.render(),

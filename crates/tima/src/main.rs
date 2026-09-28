@@ -2,9 +2,9 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use tima::backend::NativeBackend;
-use tima::backend::c::CBackend;
-use tima::backend::native::{ClangCompiler, NativeModule};
+use tima::backend::ArtifactBackend;
+use tima::backend::wasm::WasmBackend;
+use tima::backend::wasm_runtime::{DEFAULT_MEMORY_LIMIT, WasmArtifactCache, WasmSession};
 use tima::cache::TransformResultCache;
 use tima::capability::RuntimeCapabilities;
 use tima::runtime::{OuterValue, ValueData};
@@ -21,7 +21,7 @@ fn run() -> Result<(), ()> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next().unwrap_or_else(|| "help".to_owned());
     if command == "help" || command == "--help" || command == "-h" {
-        eprintln!("usage: tima <check|run|emit-c> <file.tima>");
+        eprintln!("usage: tima <check|run|emit-wasm> <file.tima>");
         return Ok(());
     }
     let Some(path) = arguments.next() else {
@@ -54,26 +54,32 @@ fn run() -> Result<(), ()> {
             }
         }
         "run" => {
-            let generated = CBackend.emit(&compiled.transforms).map_err(|diagnostics| {
-                for diagnostic in diagnostics {
-                    eprint!("{}", diagnostic.render(&compiled.source));
-                }
-            })?;
+            let generated = WasmBackend
+                .emit(&compiled.transforms)
+                .map_err(|diagnostics| {
+                    for diagnostic in diagnostics {
+                        eprint!("{}", diagnostic.render(&compiled.source));
+                    }
+                })?;
             let transform_ids = compiled.identities.iter().collect::<Vec<_>>();
-            let cached_artifact = ClangCompiler::default()
-                .compile_cached(&generated, &transform_ids, "build/cache")
+            let cached_artifact = WasmArtifactCache
+                .store(&generated, &transform_ids, "build/cache")
                 .map_err(|error| {
                     eprintln!("error: {error}");
                 })?;
-            let native = NativeModule::load(&cached_artifact.artifact, &compiled.transforms)
-                .map_err(|error| {
-                    eprintln!("error: could not load native transform artifact: {error}");
-                })?;
+            let wasm = WasmSession::instantiate(
+                &cached_artifact.artifact,
+                &compiled.transforms,
+                DEFAULT_MEMORY_LIMIT,
+            )
+            .map_err(|error| {
+                eprintln!("error: could not instantiate Wasm transform artifact: {error}");
+            })?;
             let mut result_cache = TransformResultCache::default();
             let capabilities = CliCapabilities;
-            let execution = tima::runtime::execute_native_cached_with_capabilities(
+            let execution = tima::runtime::execute_wasm_cached_with_capabilities(
                 &compiled,
-                &native,
+                &wasm,
                 &mut result_cache,
                 &capabilities,
             )
@@ -95,17 +101,22 @@ fn run() -> Result<(), ()> {
                 println!("{}", lineage.render());
             }
         }
-        "emit-c" => {
-            let artifact = CBackend.emit(&compiled.transforms).map_err(|diagnostics| {
-                for diagnostic in diagnostics {
-                    eprint!("{}", diagnostic.render(&compiled.source));
-                }
+        "emit-wasm" => {
+            let artifact = WasmBackend
+                .emit(&compiled.transforms)
+                .map_err(|diagnostics| {
+                    for diagnostic in diagnostics {
+                        eprint!("{}", diagnostic.render(&compiled.source));
+                    }
+                })?;
+            fs::write("module.wasm", artifact.bytes).map_err(|error| {
+                eprintln!("error: could not write module.wasm: {error}");
             })?;
-            print!("{}", artifact.source);
+            println!("wrote module.wasm");
         }
         _ => {
             eprintln!("error: unknown command `{command}`");
-            eprintln!("usage: tima <check|run|emit-c> <file.tima>");
+            eprintln!("usage: tima <check|run|emit-wasm> <file.tima>");
             return Err(());
         }
     }
@@ -157,7 +168,7 @@ fn display(value: &OuterValue) -> String {
             image.width(),
             image.height(),
             image.stride(),
-            image.bytes().len()
+            image.byte_len()
         ),
         ValueData::Transform(id) => format!("<transform {}>", id.0),
         ValueData::Lineage(lineage) => lineage.render(),

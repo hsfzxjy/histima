@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
-use crate::backend::native::{AbiImage, AbiImageView, AbiRuntime, AbiValue, NativeModule};
+use crate::backend::wasm_runtime::{
+    InvocationBridge, WasmBuffer, WasmImage, WasmInvokeError, WasmSession, WasmValue,
+};
 use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{
     ASSET_CAPABILITY, CapabilitySession, RuntimeCapabilities, observe_dependency,
@@ -71,23 +73,52 @@ pub struct AssetValue {
     pub locator: Arc<str>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ImageStorage {
-    bytes: Vec<u8>,
+#[derive(Clone, Debug)]
+enum ImageStorage {
+    Host(Arc<[u8]>),
+    Wasm(WasmBuffer),
 }
 
 impl ImageStorage {
-    fn new(mut bytes: Vec<u8>) -> Self {
-        // Empty Vec pointers are shared dangling sentinels, which cannot serve
-        // as invocation-local storage identities. Reserve one byte without
-        // changing the logical image length so even empty images have a live,
-        // unique allocation while crossing the native boundary.
-        if bytes.is_empty() {
-            bytes.reserve_exact(1);
+    fn new(bytes: Vec<u8>) -> Self {
+        Self::Host(bytes.into())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Host(bytes) => bytes.len(),
+            Self::Wasm(bytes) => bytes.len() as usize,
         }
-        Self { bytes }
+    }
+
+    fn with_bytes<R>(&self, operation: impl FnOnce(&[u8]) -> R) -> R {
+        match self {
+            Self::Host(bytes) => operation(bytes),
+            Self::Wasm(bytes) => bytes.with_bytes(operation),
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u8> {
+        self.with_bytes(<[u8]>::to_vec)
     }
 }
+
+impl PartialEq for ImageStorage {
+    fn eq(&self, other: &Self) -> bool {
+        if let (Self::Wasm(left), Self::Wasm(right)) = (self, other)
+            && left.same_allocation(right)
+        {
+            return true;
+        }
+        if self.len() != other.len() {
+            return false;
+        }
+        let left = self.to_vec();
+        other.with_bytes(|right| left == right)
+    }
+}
+
+impl Eq for ImageStorage {}
 
 /// The semantic layout of an image's byte storage.
 ///
@@ -156,6 +187,32 @@ impl ImageValue {
         Self::with_format(ImageFormat::Rgba8, width, height, stride, bytes)
     }
 
+    pub(crate) fn new_rgba8_in(
+        session: Option<&WasmSession>,
+        width: usize,
+        height: usize,
+        stride: usize,
+        bytes: Vec<u8>,
+    ) -> Result<Self, ImageLayoutError> {
+        validate_image_layout(ImageFormat::Rgba8, width, height, stride, bytes.len())?;
+        let storage = match session {
+            Some(session) => session
+                .allocate_copy(&bytes)
+                .map(ImageStorage::Wasm)
+                .map_err(|error| ImageLayoutError {
+                    message: error.to_string(),
+                })?,
+            None => ImageStorage::new(bytes),
+        };
+        Ok(Self {
+            storage: Arc::new(storage),
+            format: ImageFormat::Rgba8,
+            width,
+            height,
+            stride,
+        })
+    }
+
     fn with_format(
         format: ImageFormat,
         width: usize,
@@ -189,12 +246,30 @@ impl ImageValue {
         self.stride
     }
 
-    pub fn bytes(&self) -> &[u8] {
-        &self.storage.bytes
+    pub fn byte_len(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn with_bytes<R>(&self, operation: impl FnOnce(&[u8]) -> R) -> R {
+        self.storage.with_bytes(operation)
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.storage.to_vec()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        self.to_vec()
     }
 
     pub fn shares_storage_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.storage, &other.storage)
+            || matches!(
+                (&*self.storage, &*other.storage),
+                (ImageStorage::Wasm(left), ImageStorage::Wasm(right))
+                    if left.same_allocation(right)
+            )
     }
 }
 
@@ -291,56 +366,55 @@ pub fn execute_cached_with_capabilities(
     execute_with(program, &engine, BTreeMap::new(), Some(cache))
 }
 
-/// Executes outer code while dispatching transform calls to a loaded native
-/// artifact. Outer expressions remain interpreted; only checked inner
-/// transforms cross this boundary.
-pub fn execute_native(
+/// Executes outer code while dispatching checked inner transforms to the
+/// program's WebAssembly session.
+pub fn execute_wasm(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
 ) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: None,
     };
     execute_with(program, &engine, BTreeMap::new(), None)
 }
 
-pub fn execute_native_cached(
+pub fn execute_wasm_cached(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     cache: &mut dyn ResultCache,
 ) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: None,
     };
     execute_with(program, &engine, BTreeMap::new(), Some(cache))
 }
 
-pub fn execute_native_with_capabilities(
+pub fn execute_wasm_with_capabilities(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     capabilities: &dyn RuntimeCapabilities,
 ) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: Some(capabilities),
     };
     execute_with(program, &engine, BTreeMap::new(), None)
 }
 
-pub fn execute_native_cached_with_capabilities(
+pub fn execute_wasm_cached_with_capabilities(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     cache: &mut dyn ResultCache,
     capabilities: &dyn RuntimeCapabilities,
 ) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: Some(capabilities),
     };
     execute_with(program, &engine, BTreeMap::new(), Some(cache))
@@ -349,28 +423,28 @@ pub fn execute_native_cached_with_capabilities(
 /// Runs a program with immutable values supplied by the Histima host runtime.
 /// This is the initial integration point for materialized asset-native values;
 /// it avoids inventing source-language image literal semantics.
-pub fn execute_native_with_bindings(
+pub fn execute_wasm_with_bindings(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     bindings: BTreeMap<String, OuterValue>,
 ) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: None,
     };
     execute_with(program, &engine, bindings, None)
 }
 
-pub fn execute_native_with_bindings_cached(
+pub fn execute_wasm_with_bindings_cached(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     bindings: BTreeMap<String, OuterValue>,
     cache: &mut dyn ResultCache,
 ) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: None,
     };
     execute_with(program, &engine, bindings, Some(cache))
@@ -379,9 +453,9 @@ pub fn execute_native_with_bindings_cached(
 /// Invokes one checked transform with owned outer arguments. This makes the
 /// ownership transition directly usable by Histima and testable independently
 /// of outer binding liveness.
-pub fn invoke_native_transform(
+pub fn invoke_wasm_transform(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     transform: TransformId,
     arguments: Vec<OuterValue>,
 ) -> Result<OuterValue, Diagnostic> {
@@ -401,17 +475,17 @@ pub fn invoke_native_transform(
         .into_iter()
         .map(|value| (value, definition.span))
         .collect();
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: None,
     };
     invoke_transform_with_lineage(program, &engine, transform, arguments, None)
 }
 
-pub fn invoke_native_transform_cached(
+pub fn invoke_wasm_transform_cached(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     transform: TransformId,
     arguments: Vec<OuterValue>,
     cache: &mut dyn ResultCache,
@@ -432,9 +506,9 @@ pub fn invoke_native_transform_cached(
         .into_iter()
         .map(|value| (value, definition.span))
         .collect();
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: None,
     };
     invoke_transform_with_lineage(program, &engine, transform, arguments, Some(cache))
@@ -503,25 +577,25 @@ pub fn replay_with_capabilities(
     )
 }
 
-pub fn replay_native(
+pub fn replay_wasm(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     target: &OuterValue,
     cache: &mut dyn ResultCache,
 ) -> Result<OuterValue, Diagnostic> {
-    replay_native_with_dependencies(program, native, target, cache, None)
+    replay_wasm_with_dependencies(program, wasm, target, cache, None)
 }
 
-pub fn replay_native_with_dependencies(
+pub fn replay_wasm_with_dependencies(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     target: &OuterValue,
     cache: &mut dyn ResultCache,
     dependencies: Option<&dyn ReplayDependencyResolver>,
 ) -> Result<OuterValue, Diagnostic> {
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: None,
     };
     replay_with(
@@ -534,16 +608,16 @@ pub fn replay_native_with_dependencies(
     )
 }
 
-pub fn replay_native_with_capabilities(
+pub fn replay_wasm_with_capabilities(
     program: &CompiledProgram,
-    native: &NativeModule,
+    wasm: &WasmSession,
     target: &OuterValue,
     cache: &mut dyn ResultCache,
     capabilities: &dyn RuntimeCapabilities,
 ) -> Result<OuterValue, Diagnostic> {
-    let engine = NativeEngine {
+    let engine = WasmEngine {
         module: &program.transforms,
-        native,
+        wasm,
         capabilities: Some(capabilities),
     };
     let resolver = CapabilityReplayResolver(capabilities);
@@ -588,6 +662,10 @@ trait TransformEngine {
     }
 
     fn capabilities(&self) -> Option<&dyn RuntimeCapabilities> {
+        None
+    }
+
+    fn wasm_session(&self) -> Option<&WasmSession> {
         None
     }
 }
@@ -688,6 +766,7 @@ fn invoke_registered_transform_with_lineage<'cache>(
     transform: &'static RegisteredTransform,
     arguments: Vec<(OuterValue, Span)>,
     mut cache: Option<&mut (dyn ResultCache + 'cache)>,
+    wasm: Option<&WasmSession>,
     span: Span,
 ) -> Result<OuterValue, Diagnostic> {
     let prepared = prepare_registered_invocation(transform, arguments, span)?;
@@ -735,7 +814,7 @@ fn invoke_registered_transform_with_lineage<'cache>(
         value.lineage = Some(lineage);
         return Ok(value);
     }
-    let mut value = prepared.execute()?;
+    let mut value = prepared.execute(wasm)?;
     if let Some(cache) = cache {
         cache
             .store(recipe, &value)
@@ -907,7 +986,7 @@ fn replay_lineage(
             let lineage =
                 Lineage::invocation(registered.name(), registered.identity(), arguments, vec![])
                     .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-            (prepared.execute()?, lineage)
+            (prepared.execute(engine.wasm_session())?, lineage)
         }
     };
     let observed_recipe = observed_lineage
@@ -1366,6 +1445,7 @@ impl Interpreter<'_, '_, '_> {
                     Some(cache) => Some(&mut **cache),
                     None => None,
                 },
+                self.engine.wasm_session(),
                 span,
             );
         }
@@ -1801,7 +1881,7 @@ impl InterpretedValue {
 }
 
 struct InterpretedImage {
-    storage: ImageStorage,
+    storage: Vec<u8>,
     format: ImageFormat,
     width: usize,
     height: usize,
@@ -1926,7 +2006,7 @@ impl IrInterpreter<'_> {
                 else {
                     unreachable!("typed image_zero input is an available owned image")
                 };
-                image.storage.bytes.fill(0);
+                image.storage.fill(0);
                 InterpretedValue::Image(image)
             }
             ValueKind::ImageFill { image, value: fill } => {
@@ -1938,7 +2018,7 @@ impl IrInterpreter<'_> {
                 else {
                     unreachable!("typed image_fill input is an available owned image")
                 };
-                image.storage.bytes.fill(fill);
+                image.storage.fill(fill);
                 InterpretedValue::Image(image)
             }
             ValueKind::ImageByteMap {
@@ -1951,9 +2031,9 @@ impl IrInterpreter<'_> {
                 else {
                     unreachable!("typed image byte map input is an available owned image")
                 };
-                for index in 0..image.storage.bytes.len() {
+                for index in 0..image.storage.len() {
                     values[element.0 as usize] = Some(InterpretedValue::Scalar(NativeScalar::U8(
-                        image.storage.bytes[index],
+                        image.storage[index],
                     )));
                     for instruction in instructions {
                         let evaluated = self.evaluate_instruction(
@@ -1970,7 +2050,7 @@ impl IrInterpreter<'_> {
                     else {
                         unreachable!("typed image byte map result is u8")
                     };
-                    image.storage.bytes[index] = mapped;
+                    image.storage[index] = mapped;
                 }
                 InterpretedValue::Image(image)
             }
@@ -1996,8 +2076,8 @@ impl IrInterpreter<'_> {
                                 unreachable!("typed RGBA8 scale factor is f32")
                             };
                             let offset = pixel + channel.offset();
-                            image.storage.bytes[offset] =
-                                scale_rgba8_channel(image.storage.bytes[offset], factor);
+                            image.storage[offset] =
+                                scale_rgba8_channel(image.storage[offset], factor);
                         }
                     }
                 }
@@ -2035,13 +2115,13 @@ impl TransformEngine for IrInterpreter<'_> {
     }
 }
 
-struct NativeEngine<'a> {
+struct WasmEngine<'a> {
     module: &'a crate::ir::TypedModule,
-    native: &'a NativeModule,
+    wasm: &'a WasmSession,
     capabilities: Option<&'a dyn RuntimeCapabilities>,
 }
 
-impl TransformEngine for NativeEngine<'_> {
+impl TransformEngine for WasmEngine<'_> {
     fn invoke(
         &self,
         id: TransformId,
@@ -2051,56 +2131,56 @@ impl TransformEngine for NativeEngine<'_> {
         let transform = self.module.get(id);
         let mut lowered = Vec::with_capacity(arguments.len());
         for (parameter, (argument, span)) in transform.parameters.iter().zip(arguments) {
-            lowered.push(lower_native_argument(argument, parameter.ty, span)?);
+            lowered.push(lower_wasm_argument(
+                self.wasm,
+                argument,
+                parameter.ty,
+                span,
+            )?);
         }
-        let abi_arguments = lowered
+        let wasm_arguments = lowered
             .iter()
-            .map(|argument| argument.abi)
+            .map(|argument| argument.value)
             .collect::<Vec<_>>();
-        let mut capability_context = NativeCapabilityContext {
+        let mut capability_context = WasmCapabilityContext {
             session: CapabilitySession::new(self.capabilities),
             module: self.module,
-            error: None,
         };
-        let mut abi_runtime = AbiRuntime {
-            context: (&mut capability_context as *mut NativeCapabilityContext<'_>).cast(),
-            environment_i64: native_environment_i64,
-            status: 0,
-            error_transform: u32::MAX,
-            error_value: u32::MAX,
+        let bridge = InvocationBridge {
+            context: (&mut capability_context as *mut WasmCapabilityContext<'_>).cast(),
+            environment_i64: wasm_environment_i64,
         };
-        let result = match self.native.invoke(id, &mut abi_runtime, &abi_arguments) {
+        let result = match self.wasm.invoke(id, &wasm_arguments, Some(bridge)) {
             Ok(result) => result,
-            Err(error) => {
-                if abi_runtime.status == -7 {
-                    let span = self
-                        .module
-                        .transforms
-                        .get(abi_runtime.error_transform as usize)
-                        .and_then(|transform| {
-                            transform.values.get(abi_runtime.error_value as usize)
-                        })
-                        .map_or(transform.span, |value| value.span);
-                    return Err(Diagnostic::error(
-                        "image pixel iteration requires RGBA8 format",
-                        span,
-                    )
-                    .with_note("opaque byte images have no pixel channel interpretation"));
-                }
-                return Err(capability_context
-                    .error
-                    .take()
-                    .unwrap_or_else(|| Diagnostic::error(error.to_string(), transform.span)));
+            Err(WasmInvokeError::Diagnostic(error)) => return Err(error),
+            Err(WasmInvokeError::Fault((1, fault_transform, fault_value))) => {
+                let span = self
+                    .module
+                    .transforms
+                    .get(fault_transform as usize)
+                    .and_then(|transform| transform.values.get(fault_value as usize))
+                    .map_or(transform.span, |value| value.span);
+                return Err(
+                    Diagnostic::error("image pixel iteration requires RGBA8 format", span)
+                        .with_note("opaque byte images have no pixel channel interpretation"),
+                );
+            }
+            Err(WasmInvokeError::Fault((code, _, _))) => {
+                return Err(Diagnostic::error(
+                    format!("Wasm transform reported runtime fault {code}"),
+                    transform.span,
+                ));
+            }
+            Err(WasmInvokeError::Runtime(error)) => {
+                return Err(Diagnostic::error(
+                    format!("Wasm transform failed: {error}"),
+                    transform.span,
+                ));
             }
         };
         let observations = capability_context.session.finish();
         Ok(TransformOutcome {
-            value: freeze_native_result(
-                result,
-                transform.return_type,
-                &mut lowered,
-                transform.span,
-            )?,
+            value: freeze_wasm_result(result, transform.return_type, &mut lowered, transform.span)?,
             observations,
         })
     }
@@ -2112,66 +2192,55 @@ impl TransformEngine for NativeEngine<'_> {
     fn capabilities(&self) -> Option<&dyn RuntimeCapabilities> {
         self.capabilities
     }
+
+    fn wasm_session(&self) -> Option<&WasmSession> {
+        Some(self.wasm)
+    }
 }
 
-struct NativeCapabilityContext<'a> {
+struct WasmCapabilityContext<'a> {
     session: CapabilitySession<'a>,
     module: &'a crate::ir::TypedModule,
-    error: Option<Diagnostic>,
 }
 
-unsafe extern "C" fn native_environment_i64(
+unsafe fn wasm_environment_i64(
     context: *mut c_void,
     transform: u32,
     callsite: u32,
-    name: *const u8,
-    name_len: usize,
-    result: *mut i64,
-) -> i32 {
-    if context.is_null() || name.is_null() || result.is_null() {
-        return -3;
+    name: &[u8],
+) -> Result<i64, Diagnostic> {
+    if context.is_null() {
+        return Err(Diagnostic::error(
+            "Wasm capability bridge is unavailable",
+            Span::default(),
+        ));
     }
-    // SAFETY: generated C passes back the invocation-local context pointer and
-    // a name byte slice that remains live for the synchronous callback.
-    let context = unsafe { &mut *context.cast::<NativeCapabilityContext<'_>>() };
+    // SAFETY: WasmSession uses the bridge only for this synchronous invocation.
+    let context = unsafe { &mut *context.cast::<WasmCapabilityContext<'_>>() };
     let span = context
         .module
         .transforms
         .get(transform as usize)
         .and_then(|transform| transform.values.get(callsite as usize))
         .map_or(Span::default(), |value| value.span);
-    let name = unsafe { std::slice::from_raw_parts(name, name_len) };
     let name = match std::str::from_utf8(name) {
         Ok(name) => name,
         Err(_) => {
-            context.error = Some(Diagnostic::error(
-                "native transform requested an invalid UTF-8 environment name",
+            return Err(Diagnostic::error(
+                "Wasm transform requested an invalid UTF-8 environment name",
                 span,
             ));
-            return -4;
         }
     };
     match catch_unwind(AssertUnwindSafe(|| {
         context.session.environment_i64(name, span)
     })) {
-        Ok(Ok(value)) => {
-            unsafe { *result = value };
-            0
-        }
-        Ok(Err(error)) => {
-            context.error = Some(error);
-            -5
-        }
-        Err(_) => {
-            context.error = Some(
-                Diagnostic::error(
-                    format!("environment capability panicked while reading `{name}`"),
-                    span,
-                )
-                .with_note("runtime capability providers must not unwind across the native ABI"),
-            );
-            -6
-        }
+        Ok(result) => result,
+        Err(_) => Err(Diagnostic::error(
+            format!("environment capability panicked while reading `{name}`"),
+            span,
+        )
+        .with_note("runtime capability providers must not unwind across the Wasm host boundary")),
     }
 }
 
@@ -2196,7 +2265,7 @@ fn transform_may_observe_dependencies(module: &crate::ir::TypedModule, root: Tra
     visit(module, root, &mut BTreeSet::new())
 }
 
-impl NativeEngine<'_> {
+impl WasmEngine<'_> {
     fn validate_path(
         &self,
         id: TransformId,
@@ -2209,7 +2278,7 @@ impl NativeEngine<'_> {
         let transform = self.module.get(id);
         if !visiting.insert(id.0) {
             return Err(Diagnostic::error(
-                "recursive transform calls are not executable in the initial native runtime",
+                "recursive transform calls are not executable in the initial Wasm runtime",
                 transform.span,
             )
             .with_note("the reference interpreter retains a bounded recursion guard"));
@@ -2219,11 +2288,11 @@ impl NativeEngine<'_> {
                 ValueKind::Binary { .. } if value.ty == Type::I64 => {
                     return Err(
                         Diagnostic::error(
-                            "i64 arithmetic is not executable in the initial native runtime",
+                            "i64 arithmetic is not executable in the initial Wasm runtime",
                             value.span,
                         )
                         .with_note(
-                            "Tima integer overflow and division-error semantics must be chosen before mapping them to C",
+                            "Tima integer overflow and division-error semantics must be chosen before mapping them to WebAssembly",
                         ),
                     );
                 }
@@ -2240,44 +2309,37 @@ impl NativeEngine<'_> {
 }
 
 struct LoweredArgument {
-    abi: AbiValue,
+    value: WasmValue,
     keep_alive: BoundaryStorage,
 }
 
 enum BoundaryStorage {
     Scalar,
-    Owned(Option<OwnedImage>),
-    View(Arc<ImageValue>),
+    Owned(Option<WasmBuffer>),
+    View(WasmBuffer),
 }
 
-struct OwnedImage {
-    storage: ImageStorage,
-}
-
-fn lower_native_argument(
+fn lower_wasm_argument(
+    session: &WasmSession,
     value: OuterValue,
     expected: Type,
     span: Span,
 ) -> Result<LoweredArgument, Diagnostic> {
     match (expected, value.data) {
         (Type::Bool, ValueData::Bool(value)) => Ok(LoweredArgument {
-            abi: AbiValue {
-                boolean: u8::from(value),
-            },
+            value: WasmValue::Bool(value),
             keep_alive: BoundaryStorage::Scalar,
         }),
         (Type::U8, ValueData::Integer(value)) => Ok(LoweredArgument {
-            abi: AbiValue {
-                u8_value: checked_u8(value, span)?,
-            },
+            value: WasmValue::U8(checked_u8(value, span)?),
             keep_alive: BoundaryStorage::Scalar,
         }),
         (Type::I64, ValueData::Integer(value)) => Ok(LoweredArgument {
-            abi: AbiValue { i64_value: value },
+            value: WasmValue::I64(value),
             keep_alive: BoundaryStorage::Scalar,
         }),
         (Type::F32, ValueData::Float(value)) => Ok(LoweredArgument {
-            abi: AbiValue { f32_value: value },
+            value: WasmValue::F32(value),
             keep_alive: BoundaryStorage::Scalar,
         }),
         (Type::Image, ValueData::Image(image)) => {
@@ -2289,34 +2351,52 @@ fn lower_native_argument(
                 height,
                 stride,
             } = image;
-            let mut storage = Arc::try_unwrap(storage)
-                .unwrap_or_else(|shared| ImageStorage::new(shared.bytes.clone()));
-            let abi = AbiValue {
-                image: AbiImage {
-                    data: storage.bytes.as_mut_ptr(),
-                    width,
-                    height,
-                    stride,
-                    format: format.abi_tag(),
+            let storage = match Arc::try_unwrap(storage) {
+                Ok(ImageStorage::Wasm(buffer))
+                    if buffer.same_session(session) && buffer.is_unique() =>
+                {
+                    Ok(buffer)
+                }
+                Ok(ImageStorage::Wasm(buffer)) if buffer.same_session(session) => {
+                    session.copy_buffer(&buffer)
+                }
+                Ok(storage) => session.allocate_copy(&storage.to_vec()),
+                Err(shared) => match &*shared {
+                    ImageStorage::Wasm(buffer) if buffer.same_session(session) => {
+                        session.copy_buffer(buffer)
+                    }
+                    storage => storage.with_bytes(|bytes| session.allocate_copy(bytes)),
                 },
-            };
+            }
+            .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+            let descriptor = wasm_image(&storage, format, width, height, stride, span)?;
             Ok(LoweredArgument {
-                abi,
-                keep_alive: BoundaryStorage::Owned(Some(OwnedImage { storage })),
+                value: WasmValue::Image(descriptor),
+                keep_alive: BoundaryStorage::Owned(Some(storage)),
             })
         }
-        (Type::ImageView, ValueData::Image(image)) => Ok(LoweredArgument {
-            abi: AbiValue {
-                image_view: AbiImageView {
-                    data: image.storage.bytes.as_ptr(),
-                    width: image.width,
-                    height: image.height,
-                    stride: image.stride,
-                    format: image.format.abi_tag(),
-                },
-            },
-            keep_alive: BoundaryStorage::View(image),
-        }),
+        (Type::ImageView, ValueData::Image(image)) => {
+            let buffer = match &*image.storage {
+                ImageStorage::Wasm(buffer) if buffer.same_session(session) => buffer.clone(),
+                storage => {
+                    let identity = Arc::as_ptr(&image.storage) as usize;
+                    storage
+                        .with_bytes(|bytes| session.mirror_host(identity, bytes))
+                        .map_err(|error| Diagnostic::error(error.to_string(), span))?
+                }
+            };
+            Ok(LoweredArgument {
+                value: WasmValue::Image(wasm_image(
+                    &buffer,
+                    image.format,
+                    image.width,
+                    image.height,
+                    image.stride,
+                    span,
+                )?),
+                keep_alive: BoundaryStorage::View(buffer),
+            })
+        }
         (expected, _) => Err(Diagnostic::error(
             format!(
                 "outer value cannot cross into native parameter type {}",
@@ -2327,28 +2407,49 @@ fn lower_native_argument(
     }
 }
 
-fn freeze_native_result(
-    result: AbiValue,
+fn wasm_image(
+    buffer: &WasmBuffer,
+    format: ImageFormat,
+    width: usize,
+    height: usize,
+    stride: usize,
+    span: Span,
+) -> Result<WasmImage, Diagnostic> {
+    Ok(WasmImage {
+        offset: buffer.offset(),
+        byte_len: buffer.len(),
+        width: u64::try_from(width)
+            .map_err(|_| Diagnostic::error("image width exceeds Wasm ABI range", span))?,
+        height: u64::try_from(height)
+            .map_err(|_| Diagnostic::error("image height exceeds Wasm ABI range", span))?,
+        stride: u64::try_from(stride)
+            .map_err(|_| Diagnostic::error("image stride exceeds Wasm ABI range", span))?,
+        format: format.abi_tag(),
+    })
+}
+
+fn freeze_wasm_result(
+    result: WasmValue,
     ty: Type,
     arguments: &mut [LoweredArgument],
     span: Span,
 ) -> Result<OuterValue, Diagnostic> {
-    // SAFETY: the generated adapter writes the union field selected by the
-    // statically checked transform return type.
-    unsafe {
-        match ty {
-            Type::Bool => Ok(freeze_scalar(NativeScalar::Bool(result.boolean != 0))),
-            Type::U8 => Ok(freeze_scalar(NativeScalar::U8(result.u8_value))),
-            Type::I64 => Ok(freeze_scalar(NativeScalar::I64(result.i64_value))),
-            Type::F32 => Ok(freeze_scalar(NativeScalar::F32(result.f32_value))),
-            Type::Image => freeze_owned_image(result.image, arguments, span),
-            Type::ImageView => freeze_image_view(result.image_view, arguments, span),
-        }
+    match (ty, result) {
+        (Type::Bool, WasmValue::Bool(value)) => Ok(freeze_scalar(NativeScalar::Bool(value))),
+        (Type::U8, WasmValue::U8(value)) => Ok(freeze_scalar(NativeScalar::U8(value))),
+        (Type::I64, WasmValue::I64(value)) => Ok(freeze_scalar(NativeScalar::I64(value))),
+        (Type::F32, WasmValue::F32(value)) => Ok(freeze_scalar(NativeScalar::F32(value))),
+        (Type::Image, WasmValue::Image(image)) => freeze_owned_image(image, arguments, span),
+        (Type::ImageView, WasmValue::Image(image)) => freeze_image_view(image, arguments, span),
+        _ => Err(Diagnostic::error(
+            "Wasm transform returned the wrong ABI type",
+            span,
+        )),
     }
 }
 
 fn freeze_owned_image(
-    returned: AbiImage,
+    returned: WasmImage,
     arguments: &mut [LoweredArgument],
     span: Span,
 ) -> Result<OuterValue, Diagnostic> {
@@ -2359,24 +2460,30 @@ fn freeze_owned_image(
         let Some(candidate) = owned.as_ref() else {
             continue;
         };
-        if candidate.storage.bytes.as_ptr() != returned.data.cast_const() {
+        if candidate.offset() != returned.offset || candidate.len() != returned.byte_len {
             continue;
         }
+        let width = usize::try_from(returned.width)
+            .map_err(|_| Diagnostic::error("returned image width exceeds host range", span))?;
+        let height = usize::try_from(returned.height)
+            .map_err(|_| Diagnostic::error("returned image height exceeds host range", span))?;
+        let stride = usize::try_from(returned.stride)
+            .map_err(|_| Diagnostic::error("returned image stride exceeds host range", span))?;
         let format = validate_returned_layout(
             returned.format,
-            returned.width,
-            returned.height,
-            returned.stride,
-            candidate.storage.bytes.len(),
+            width,
+            height,
+            stride,
+            candidate.len() as usize,
             span,
         )?;
         let owned = owned.take().expect("matched owned image remains available");
         return Ok(OuterValue::image(ImageValue {
-            storage: Arc::new(owned.storage),
+            storage: Arc::new(ImageStorage::Wasm(owned)),
             format,
-            width: returned.width,
-            height: returned.height,
-            stride: returned.stride,
+            width,
+            height,
+            stride,
         }));
     }
     Err(Diagnostic::error(
@@ -2387,31 +2494,37 @@ fn freeze_owned_image(
 }
 
 fn freeze_image_view(
-    returned: AbiImageView,
+    returned: WasmImage,
     arguments: &mut [LoweredArgument],
     span: Span,
 ) -> Result<OuterValue, Diagnostic> {
     for argument in arguments {
-        let BoundaryStorage::View(image) = &argument.keep_alive else {
+        let BoundaryStorage::View(buffer) = &argument.keep_alive else {
             continue;
         };
-        if image.storage.bytes.as_ptr() != returned.data {
+        if buffer.offset() != returned.offset || buffer.len() != returned.byte_len {
             continue;
         }
+        let width = usize::try_from(returned.width)
+            .map_err(|_| Diagnostic::error("returned image width exceeds host range", span))?;
+        let height = usize::try_from(returned.height)
+            .map_err(|_| Diagnostic::error("returned image height exceeds host range", span))?;
+        let stride = usize::try_from(returned.stride)
+            .map_err(|_| Diagnostic::error("returned image stride exceeds host range", span))?;
         let format = validate_returned_layout(
             returned.format,
-            returned.width,
-            returned.height,
-            returned.stride,
-            image.storage.bytes.len(),
+            width,
+            height,
+            stride,
+            buffer.len() as usize,
             span,
         )?;
         return Ok(OuterValue::image(ImageValue {
-            storage: image.storage.clone(),
+            storage: Arc::new(ImageStorage::Wasm(buffer.clone())),
             format,
-            width: returned.width,
-            height: returned.height,
-            stride: returned.stride,
+            width,
+            height,
+            stride,
         }));
     }
     Err(Diagnostic::error(
@@ -2430,13 +2543,13 @@ fn validate_returned_layout(
 ) -> Result<ImageFormat, Diagnostic> {
     let format = ImageFormat::from_abi(format).ok_or_else(|| {
         Diagnostic::error(
-            format!("native transform returned unknown image format tag {format}"),
+            format!("Wasm transform returned unknown image format tag {format}"),
             span,
         )
     })?;
     validate_image_layout(format, width, height, stride, byte_len).map_err(|error| {
         Diagnostic::error(
-            format!("native transform returned an invalid image: {error}"),
+            format!("Wasm transform returned an invalid image: {error}"),
             span,
         )
     })?;
@@ -2470,8 +2583,10 @@ fn lower_interpreted_value(
                 height,
                 stride,
             } = image;
-            let storage = Arc::try_unwrap(storage)
-                .unwrap_or_else(|shared| ImageStorage::new(shared.bytes.clone()));
+            let storage = match Arc::try_unwrap(storage) {
+                Ok(storage) => storage.to_vec(),
+                Err(shared) => shared.to_vec(),
+            };
             Ok(InterpretedValue::Image(InterpretedImage {
                 storage,
                 format,
@@ -2522,7 +2637,7 @@ fn freeze_interpreted_value(value: InterpretedValue) -> OuterValue {
     match value {
         InterpretedValue::Scalar(value) => freeze_scalar(value),
         InterpretedValue::Image(image) => OuterValue::image(ImageValue {
-            storage: Arc::new(image.storage),
+            storage: Arc::new(ImageStorage::new(image.storage)),
             format: image.format,
             width: image.width,
             height: image.height,
@@ -2611,27 +2726,47 @@ fn checked_u8(value: i64, span: Span) -> Result<u8, Diagnostic> {
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::backend::NativeBackend;
-    use crate::backend::c::CBackend;
-    use crate::backend::native::{ClangCompiler, NativeModule};
+    use crate::backend::ArtifactBackend;
+    use crate::backend::wasm::WasmBackend;
+    use crate::backend::wasm_runtime::{DEFAULT_MEMORY_LIMIT, WasmArtifactCache, WasmSession};
     use crate::cache::TransformResultCache;
     use crate::capability::RuntimeCapabilities;
     use crate::identity::{ContentIdentity, byte_content_identity, content_identity};
     use crate::ir::{TransformId, Type};
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
-        ImageFormat, ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver,
-        TransformEngine, ValueData, execute, execute_cached, execute_cached_with_capabilities,
-        execute_native, execute_native_cached_with_capabilities,
-        execute_native_with_bindings_cached, execute_with, invoke_native_transform,
-        lower_native_argument, replay, replay_native, replay_native_with_capabilities,
+        ImageFormat, ImageStorage, ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver,
+        TransformEngine, ValueData, WasmValue, execute, execute_cached,
+        execute_cached_with_capabilities, execute_wasm, execute_wasm_cached_with_capabilities,
+        execute_wasm_with_bindings_cached, execute_with, invoke_wasm_transform,
+        lower_wasm_argument, replay, replay_wasm, replay_wasm_with_capabilities,
         replay_with_capabilities, replay_with_dependencies, scale_rgba8_channel,
         validate_returned_layout,
     };
     use crate::source::Span;
+
+    static NEXT_WASM_TEST: AtomicU64 = AtomicU64::new(0);
+
+    fn compile_wasm(program: &crate::CompiledProgram) -> WasmSession {
+        let generated = WasmBackend.emit(&program.transforms).unwrap();
+        let sequence = NEXT_WASM_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join(format!(
+                "wasm-runtime-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let identities = program.identities.iter().collect::<Vec<_>>();
+        let cached = WasmArtifactCache
+            .store(&generated, &identities, root)
+            .unwrap();
+        WasmSession::instantiate(&cached.artifact, &program.transforms, DEFAULT_MEMORY_LIMIT)
+            .unwrap()
+    }
 
     struct FixedEnvironment(BTreeMap<String, Vec<u8>>);
 
@@ -3065,7 +3200,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_ppm_pipeline_runs_native_transform_with_lineage_cache_and_replay() {
+    fn registered_ppm_pipeline_runs_wasm_transform_with_lineage_cache_and_replay() {
         let compiled = crate::compile(
             "pipeline.tima",
             "source = asset(\"cat.ppm\")\n\
@@ -3085,19 +3220,11 @@ mod tests {
              derivation = trace(saved)\n",
         )
         .unwrap();
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let wasm = compile_wasm(&compiled);
         let assets = FixedAssets::one("cat.ppm", b"P3\n2 1\n255\n100 50 20 200 100 50\n");
         let mut cache = TransformResultCache::default();
         let execution =
-            execute_native_cached_with_capabilities(&compiled, &native, &mut cache, &assets)
-                .unwrap();
+            execute_wasm_cached_with_capabilities(&compiled, &wasm, &mut cache, &assets).unwrap();
 
         let ValueData::Bytes(encoded) = &execution.bindings["out"].data else {
             panic!("expected encoded bytes")
@@ -3121,9 +3248,9 @@ mod tests {
         assert!(rendered.contains("invoke darken"));
         assert!(rendered.contains("invoke ppm.encode"));
 
-        let replayed = replay_native_with_capabilities(
+        let replayed = replay_wasm_with_capabilities(
             &compiled,
-            &native,
+            &wasm,
             &execution.bindings["saved"],
             &mut TransformResultCache::default(),
             &assets,
@@ -3133,9 +3260,9 @@ mod tests {
         assert_eq!(assets.outputs.borrow().len(), 1);
 
         let changed_assets = FixedAssets::one("cat.ppm", b"P3\n2 1\n255\n101 50 20 200 100 50\n");
-        let diagnostic = replay_native_with_capabilities(
+        let diagnostic = replay_wasm_with_capabilities(
             &compiled,
-            &native,
+            &wasm,
             &execution.bindings["saved"],
             &mut cache,
             &changed_assets,
@@ -3145,7 +3272,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_png_pipeline_runs_native_transform_with_lineage_and_replay() {
+    fn registered_png_pipeline_runs_wasm_transform_with_lineage_and_replay() {
         let compiled = crate::compile(
             "pipeline.tima",
             "source = asset(\"cat.png\")\n\
@@ -3172,21 +3299,13 @@ mod tests {
              webp_derivation = trace(webp_default)\n",
         )
         .unwrap();
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let wasm = compile_wasm(&compiled);
         let input = encode_test_png(2, 1, &[100, 50, 20, 255, 200, 100, 50, 128]);
         let assets = FixedAssets::one("cat.png", &input);
         let mut cache = TransformResultCache::default();
 
         let execution =
-            execute_native_cached_with_capabilities(&compiled, &native, &mut cache, &assets)
-                .unwrap();
+            execute_wasm_cached_with_capabilities(&compiled, &wasm, &mut cache, &assets).unwrap();
 
         let ValueData::Bytes(encoded) = &execution.bindings["out"].data else {
             panic!("expected encoded bytes")
@@ -3293,9 +3412,9 @@ mod tests {
         assert!(rendered.contains("invoke darken"));
         assert!(rendered.contains("invoke png.encode"));
 
-        let replayed = replay_native_with_capabilities(
+        let replayed = replay_wasm_with_capabilities(
             &compiled,
-            &native,
+            &wasm,
             &execution.bindings["out"],
             &mut TransformResultCache::default(),
             &assets,
@@ -3329,7 +3448,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_loads_and_runs_nested_transforms_as_native_code() {
+    fn compiles_loads_and_runs_nested_transforms_as_wasm() {
         let compiled = crate::compile(
             "test.tima",
             "transform double(x: f32) -> f32 {\n doubled = x * 2.0\n return doubled\n}\n\
@@ -3359,21 +3478,8 @@ mod tests {
         else {
             unreachable!()
         };
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        assert!(artifact.compiler_version.contains("clang"));
-        assert!(!artifact.target.is_empty());
-        assert_ne!(
-            artifact.identity(compiled.identities.get(TransformId(0))),
-            artifact.identity(compiled.identities.get(TransformId(1)))
-        );
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
-        let execution = execute_native(&compiled, &native).unwrap();
+        let wasm = compile_wasm(&compiled);
+        let execution = execute_wasm(&compiled, &wasm).unwrap();
         assert_eq!(execution.bindings["out"].data, ValueData::Float(4.0));
         assert_eq!(execution.bindings["count"].data, ValueData::Integer(7));
         assert_eq!(execution.bindings["flag"].data, ValueData::Bool(true));
@@ -3394,7 +3500,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_c_reads_environment_through_the_host_capability() {
+    fn wasm_reads_environment_through_the_host_capability() {
         let compiled = crate::compile(
             "test.tima",
             "transform read_mode() -> i64 { return environment_i64(\"MODE\") }\n\
@@ -3402,16 +3508,9 @@ mod tests {
              result = configured()\n",
         )
         .unwrap();
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let wasm = compile_wasm(&compiled);
 
-        let diagnostic = execute_native(&compiled, &native).unwrap_err();
+        let diagnostic = execute_wasm(&compiled, &wasm).unwrap_err();
         assert!(
             diagnostic[0]
                 .message
@@ -3427,14 +3526,10 @@ mod tests {
         let reference =
             execute_cached_with_capabilities(&compiled, &mut reference_cache, &environment)
                 .unwrap();
-        let mut native_cache = TransformResultCache::default();
-        let execution = execute_native_cached_with_capabilities(
-            &compiled,
-            &native,
-            &mut native_cache,
-            &environment,
-        )
-        .unwrap();
+        let mut wasm_cache = TransformResultCache::default();
+        let execution =
+            execute_wasm_cached_with_capabilities(&compiled, &wasm, &mut wasm_cache, &environment)
+                .unwrap();
         assert_eq!(execution.bindings["result"].data, ValueData::Integer(73));
         assert_eq!(
             execution.bindings["result"]
@@ -3466,87 +3561,91 @@ mod tests {
         let reference = execute(&compiled).unwrap();
         assert_eq!(reference.bindings["result"].data, ValueData::Integer(7));
 
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
-        let execution = execute_native(&compiled, &native).unwrap();
+        let wasm = compile_wasm(&compiled);
+        let execution = execute_wasm(&compiled, &wasm).unwrap();
         assert_eq!(execution.bindings["result"].data, ValueData::Integer(7));
     }
 
     #[test]
-    fn native_runtime_defers_unspecified_i64_arithmetic_semantics() {
+    fn wasm_runtime_defers_unspecified_i64_arithmetic_semantics() {
         let compiled = crate::compile(
             "test.tima",
             "transform add(x: i64, y: i64) -> i64 { return x + y }\n\
              out = add(1, 2)\n",
         )
         .unwrap();
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
-        let diagnostics = execute_native(&compiled, &native).unwrap_err();
+        let wasm = compile_wasm(&compiled);
+        let diagnostics = execute_wasm(&compiled, &wasm).unwrap_err();
         assert!(diagnostics[0].message.contains("i64 arithmetic"));
     }
 
     #[test]
     fn owned_image_arguments_detach_when_storage_is_shared() {
+        let compiled = crate::compile(
+            "boundary.tima",
+            "transform keep(img: Image) -> Image { return img }\n",
+        )
+        .unwrap();
+        let wasm = compile_wasm(&compiled);
         let image = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
-        let original_pointer = match &image.data {
-            ValueData::Image(image) => image.storage.bytes.as_ptr(),
-            _ => unreachable!(),
-        };
         let retained_outer_alias = image.clone();
-        let first = lower_native_argument(image.clone(), Type::Image, Span::default()).unwrap();
-        let second = lower_native_argument(image, Type::Image, Span::default()).unwrap();
-        // SAFETY: each union was initialized with its `image` field.
-        let first_pointer = unsafe { first.abi.image.data.cast_const() };
-        // SAFETY: each union was initialized with its `image` field.
-        let second_pointer = unsafe { second.abi.image.data.cast_const() };
-        assert_ne!(first_pointer, original_pointer);
-        assert_ne!(second_pointer, original_pointer);
-        assert_ne!(first_pointer, second_pointer);
+        let first =
+            lower_wasm_argument(&wasm, image.clone(), Type::Image, Span::default()).unwrap();
+        let second = lower_wasm_argument(&wasm, image, Type::Image, Span::default()).unwrap();
+        let WasmValue::Image(first) = first.value else {
+            unreachable!()
+        };
+        let WasmValue::Image(second) = second.value else {
+            unreachable!()
+        };
+        assert_ne!(first.offset, second.offset);
         drop(retained_outer_alias);
     }
 
     #[test]
     fn image_views_alias_shared_storage_without_copying() {
+        let compiled = crate::compile(
+            "boundary.tima",
+            "transform keep(img: ImageView) -> ImageView { return img }\n",
+        )
+        .unwrap();
+        let wasm = compile_wasm(&compiled);
         let image = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
-        let original_pointer = match &image.data {
-            ValueData::Image(image) => image.storage.bytes.as_ptr(),
-            _ => unreachable!(),
+        let first =
+            lower_wasm_argument(&wasm, image.clone(), Type::ImageView, Span::default()).unwrap();
+        let second = lower_wasm_argument(&wasm, image, Type::ImageView, Span::default()).unwrap();
+        let WasmValue::Image(first) = first.value else {
+            unreachable!()
         };
-        let first = lower_native_argument(image.clone(), Type::ImageView, Span::default()).unwrap();
-        let second = lower_native_argument(image, Type::ImageView, Span::default()).unwrap();
-        // SAFETY: each union was initialized with its `image_view` field.
-        assert_eq!(unsafe { first.abi.image_view.data }, original_pointer);
-        // SAFETY: each union was initialized with its `image_view` field.
-        assert_eq!(unsafe { second.abi.image_view.data }, original_pointer);
+        let WasmValue::Image(second) = second.value else {
+            unreachable!()
+        };
+        assert_eq!(first.offset, second.offset);
     }
 
     #[test]
     fn owned_image_detaches_from_a_simultaneous_view() {
+        let compiled = crate::compile(
+            "boundary.tima",
+            "transform keep(img: Image) -> Image { return img }\n",
+        )
+        .unwrap();
+        let wasm = compile_wasm(&compiled);
         let image = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
-        let view = lower_native_argument(image.clone(), Type::ImageView, Span::default()).unwrap();
-        let owned = lower_native_argument(image, Type::Image, Span::default()).unwrap();
-        // SAFETY: the unions were initialized with the fields read here.
-        let view_pointer = unsafe { view.abi.image_view.data };
-        // SAFETY: the unions were initialized with the fields read here.
-        let owned_pointer = unsafe { owned.abi.image.data.cast_const() };
-        assert_ne!(owned_pointer, view_pointer);
+        let view =
+            lower_wasm_argument(&wasm, image.clone(), Type::ImageView, Span::default()).unwrap();
+        let owned = lower_wasm_argument(&wasm, image, Type::Image, Span::default()).unwrap();
+        let WasmValue::Image(view) = view.value else {
+            unreachable!()
+        };
+        let WasmValue::Image(owned) = owned.value else {
+            unreachable!()
+        };
+        assert_ne!(owned.offset, view.offset);
     }
 
     #[test]
-    fn native_image_boundary_detaches_owned_values_and_freezes_returns() {
+    fn wasm_image_boundary_detaches_owned_values_and_freezes_returns() {
         let compiled = crate::compile(
             "test.tima",
             "transform own(img: Image) -> Image { return img }\n\
@@ -3555,21 +3654,14 @@ mod tests {
              viewed = img | view\n",
         )
         .unwrap();
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let wasm = compile_wasm(&compiled);
         let input = OuterValue::image(ImageValue::new_rgba8(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
         let input_content = content_identity(&input).unwrap();
         let input = input.with_lineage(Lineage::observed_source("cat.raw", input_content));
         let mut cache = TransformResultCache::default();
-        let execution = execute_native_with_bindings_cached(
+        let execution = execute_wasm_with_bindings_cached(
             &compiled,
-            &native,
+            &wasm,
             BTreeMap::from([("img".to_owned(), input)]),
             &mut cache,
         )
@@ -3584,7 +3676,9 @@ mod tests {
             panic!("expected viewed result image")
         };
         assert!(!original.shares_storage_with(owned));
-        assert!(original.shares_storage_with(viewed));
+        // Entering the Wasm arena from host storage is the one required copy.
+        // Subsequent views of the same outer value share its session mirror.
+        assert!(!original.shares_storage_with(viewed));
         assert_eq!(original.format(), ImageFormat::Rgba8);
         assert_eq!(owned.format(), ImageFormat::Rgba8);
         assert_eq!(viewed.format(), ImageFormat::Rgba8);
@@ -3601,7 +3695,7 @@ mod tests {
         let owned_value = execution.bindings["owned"].clone();
         let recipe = owned_value.lineage.as_ref().unwrap().recipe_id().unwrap();
         cache.invalidate_recipe(recipe);
-        let replayed = replay_native(&compiled, &native, &owned_value, &mut cache).unwrap();
+        let replayed = replay_wasm(&compiled, &wasm, &owned_value, &mut cache).unwrap();
         let ValueData::Image(replayed) = replayed.data else {
             panic!("expected replayed image")
         };
@@ -3636,18 +3730,11 @@ mod tests {
         };
         assert_eq!(reference_result.bytes(), &[0, 0, 0, 0]);
 
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let wasm = compile_wasm(&compiled);
         let mut cache = TransformResultCache::default();
-        let execution = execute_native_with_bindings_cached(
+        let execution = execute_wasm_with_bindings_cached(
             &compiled,
-            &native,
+            &wasm,
             BTreeMap::from([("img".to_owned(), input.clone())]),
             &mut cache,
         )
@@ -3656,7 +3743,7 @@ mod tests {
             panic!("expected original image")
         };
         let ValueData::Image(native_result) = &execution.bindings["cleared"].data else {
-            panic!("expected native image")
+            panic!("expected Wasm image")
         };
         assert_eq!(original.bytes(), &[1, 2, 3, 4]);
         assert_eq!(native_result.bytes(), &[0, 0, 0, 0]);
@@ -3677,7 +3764,7 @@ mod tests {
         let recorded = execution.bindings["cleared"].clone();
         let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
         cache.invalidate_recipe(recipe);
-        let replayed = replay_native(&compiled, &native, &recorded, &mut cache).unwrap();
+        let replayed = replay_wasm(&compiled, &wasm, &recorded, &mut cache).unwrap();
         let ValueData::Image(replayed) = replayed.data else {
             panic!("expected replayed image")
         };
@@ -3731,18 +3818,11 @@ mod tests {
         assert_eq!(reference.bindings["kept"].data, ValueData::Integer(173));
         assert_eq!(reference.bindings["ordered"].data, ValueData::Bool(true));
 
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let wasm = compile_wasm(&compiled);
         let mut cache = TransformResultCache::default();
-        let execution = execute_native_with_bindings_cached(
+        let execution = execute_wasm_with_bindings_cached(
             &compiled,
-            &native,
+            &wasm,
             BTreeMap::from([
                 ("img".to_owned(), input.clone()),
                 ("amount".to_owned(), amount),
@@ -3758,7 +3838,7 @@ mod tests {
             panic!("expected original image")
         };
         let ValueData::Image(native_result) = &execution.bindings["filled"].data else {
-            panic!("expected native image")
+            panic!("expected Wasm image")
         };
         assert_eq!(original.bytes(), &[1, 2, 3, 4]);
         assert_eq!(native_result.bytes(), &[173, 173, 173, 173]);
@@ -3781,7 +3861,7 @@ mod tests {
         let recorded = execution.bindings["filled"].clone();
         let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
         cache.invalidate_recipe(recipe);
-        let replayed = replay_native(&compiled, &native, &recorded, &mut cache).unwrap();
+        let replayed = replay_wasm(&compiled, &wasm, &recorded, &mut cache).unwrap();
         let ValueData::Image(replayed) = replayed.data else {
             panic!("expected replayed image")
         };
@@ -3801,9 +3881,9 @@ mod tests {
         let diagnostics =
             execute_with(&compiled, &reference_engine, invalid_bindings.clone(), None).unwrap_err();
         assert!(diagnostics[0].message.contains("parameter type u8"));
-        let diagnostics = execute_native_with_bindings_cached(
+        let diagnostics = execute_wasm_with_bindings_cached(
             &compiled,
-            &native,
+            &wasm,
             invalid_bindings,
             &mut TransformResultCache::default(),
         )
@@ -3812,7 +3892,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_dependent_image_loop_matches_reference_and_native_execution() {
+    fn byte_dependent_image_loop_matches_reference_and_wasm_execution() {
         let compiled = crate::compile(
             "test.tima",
             "transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
@@ -3850,19 +3930,12 @@ mod tests {
         };
         assert_eq!(reference_image.bytes(), &[9, 2, 9, 3]);
 
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let wasm = compile_wasm(&compiled);
         let mut cache = TransformResultCache::default();
         let execution =
-            execute_native_with_bindings_cached(&compiled, &native, bindings, &mut cache).unwrap();
+            execute_wasm_with_bindings_cached(&compiled, &wasm, bindings, &mut cache).unwrap();
         let ValueData::Image(native_image) = &execution.bindings["mapped"].data else {
-            panic!("expected native image")
+            panic!("expected Wasm image")
         };
         assert_eq!(native_image.bytes(), reference_image.bytes());
         let ValueData::Image(original) = &execution.bindings["img"].data else {
@@ -3885,7 +3958,7 @@ mod tests {
         let recorded = execution.bindings["mapped"].clone();
         let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
         cache.invalidate_recipe(recipe);
-        let replayed = replay_native(&compiled, &native, &recorded, &mut cache).unwrap();
+        let replayed = replay_wasm(&compiled, &wasm, &recorded, &mut cache).unwrap();
         let ValueData::Image(replayed) = replayed.data else {
             panic!("expected replayed image")
         };
@@ -3893,7 +3966,7 @@ mod tests {
     }
 
     #[test]
-    fn rgba8_pixel_scaling_matches_reference_and_native_execution() {
+    fn rgba8_pixel_scaling_matches_reference_and_wasm_execution() {
         let compiled = crate::compile(
             "test.tima",
             "transform darken(img: Image, factor: f32) -> Image {\n\
@@ -3934,19 +4007,12 @@ mod tests {
         );
         assert_eq!(reference_image.format(), ImageFormat::Rgba8);
 
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
+        let wasm = compile_wasm(&compiled);
         let mut cache = TransformResultCache::default();
         let execution =
-            execute_native_with_bindings_cached(&compiled, &native, bindings, &mut cache).unwrap();
+            execute_wasm_with_bindings_cached(&compiled, &wasm, bindings, &mut cache).unwrap();
         let ValueData::Image(native_image) = &execution.bindings["darkened"].data else {
-            panic!("expected native image")
+            panic!("expected Wasm image")
         };
         assert_eq!(native_image.bytes(), reference_image.bytes());
         let ValueData::Image(original) = &execution.bindings["img"].data else {
@@ -3969,7 +4035,7 @@ mod tests {
         let recorded = execution.bindings["darkened"].clone();
         let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
         cache.invalidate_recipe(recipe);
-        let replayed = replay_native(&compiled, &native, &recorded, &mut cache).unwrap();
+        let replayed = replay_wasm(&compiled, &wasm, &recorded, &mut cache).unwrap();
         let ValueData::Image(replayed) = replayed.data else {
             panic!("expected replayed image")
         };
@@ -3986,9 +4052,9 @@ mod tests {
         let diagnostics =
             execute_with(&compiled, &reference_engine, opaque_bindings.clone(), None).unwrap_err();
         assert!(diagnostics[0].message.contains("requires RGBA8"));
-        let diagnostics = execute_native_with_bindings_cached(
+        let diagnostics = execute_wasm_with_bindings_cached(
             &compiled,
-            &native,
+            &wasm,
             opaque_bindings,
             &mut TransformResultCache::default(),
         )
@@ -4018,7 +4084,6 @@ mod tests {
             capabilities: None,
         };
         let image = ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap();
-        let original_pointer = image.storage.bytes.as_ptr();
         let result = reference
             .invoke(
                 crate::ir::TransformId(1),
@@ -4029,22 +4094,17 @@ mod tests {
         let ValueData::Image(result) = result.data else {
             panic!("expected image result")
         };
-        assert_eq!(result.storage.bytes.as_ptr(), original_pointer);
         assert_eq!(result.bytes(), &[1, 2, 3, 4]);
 
-        let generated = CBackend.emit(&compiled.transforms).unwrap();
-        let build_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build");
-        let artifact = ClangCompiler::default()
-            .compile(&generated, build_root)
-            .unwrap();
-        let native = NativeModule::load(&artifact, &compiled.transforms).unwrap();
-        let image = ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap();
-        let original_pointer = image.storage.bytes.as_ptr();
-        let result = invoke_native_transform(
+        let wasm = compile_wasm(&compiled);
+        let image = ImageValue::new_rgba8_in(Some(&wasm), 1, 1, 4, vec![1, 2, 3, 4]).unwrap();
+        let original_offset = match &*image.storage {
+            ImageStorage::Wasm(buffer) => buffer.offset(),
+            ImageStorage::Host(_) => unreachable!(),
+        };
+        let result = invoke_wasm_transform(
             &compiled,
-            &native,
+            &wasm,
             crate::ir::TransformId(1),
             vec![OuterValue::image(image)],
         )
@@ -4052,7 +4112,11 @@ mod tests {
         let ValueData::Image(result) = result.data else {
             panic!("expected image result")
         };
-        assert_eq!(result.storage.bytes.as_ptr(), original_pointer);
+        let result_offset = match &*result.storage {
+            ImageStorage::Wasm(buffer) => buffer.offset(),
+            ImageStorage::Host(_) => unreachable!(),
+        };
+        assert_eq!(result_offset, original_offset);
         assert_eq!(result.bytes(), &[1, 2, 3, 4]);
     }
 

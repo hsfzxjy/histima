@@ -15,6 +15,7 @@ mod stored_lineage;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use tima::backend::wasm_runtime::{DEFAULT_MEMORY_LIMIT, parse_memory_limit};
 use tima::capability::RuntimeCapabilities;
 use tima::identity::{
     ArtifactIdentity, ContentIdentity, RecipeIdentity, SourceIdentity, byte_content_identity,
@@ -30,8 +31,8 @@ const CATALOG_FILE_NAME: &str = ".histima.sql3";
 const LEGACY_CATALOG_FILE_NAME: &str = "catalog.sqlite3";
 
 pub use catalog::{
-    ArtifactBundleMember, ArtifactSummary, AssetSummary, CATALOG_LIST_LIMIT, CatalogInfo,
-    CatalogPage, CatalogStats, NativeArtifactInfo, RecipeSummary,
+    ArtifactBundleMember, ArtifactInfo, ArtifactSummary, AssetSummary, CATALOG_LIST_LIMIT,
+    CatalogInfo, CatalogPage, CatalogStats, RecipeSummary,
 };
 pub use error::{Error, Result};
 pub use runner::{PipelineExecution, ProgramExecution, RecipeReplay, RunError};
@@ -89,12 +90,12 @@ pub struct ArtifactBundleInspection {
     pub cpu_features: String,
     pub optimization: String,
     pub abi_version: u32,
-    pub library_content_id: ContentIdentity,
-    pub library_byte_len: u64,
-    pub library_relative_path: String,
+    pub artifact_content_id: ContentIdentity,
+    pub artifact_byte_len: u64,
+    pub artifact_relative_path: String,
     pub members: Vec<ArtifactBundleMember>,
     pub identity_valid: bool,
-    pub library_valid: bool,
+    pub artifact_valid: bool,
     pub valid: bool,
     pub validation_errors: Vec<String>,
 }
@@ -110,6 +111,7 @@ pub struct Workspace {
     root: PathBuf,
     content: ContentStore,
     catalog: Catalog,
+    wasm_memory_limit: u64,
 }
 
 impl Workspace {
@@ -129,16 +131,25 @@ impl Workspace {
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_wasm_memory_limit(root, None)
+    }
+
+    pub fn open_with_wasm_memory_limit(
+        root: impl AsRef<Path>,
+        cli_memory_limit: Option<u64>,
+    ) -> Result<Self> {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root)
             .map_err(|error| Error::io("create Histima workspace", &root, error))?;
         migrate_legacy_catalog(&root)?;
         let content = ContentStore::open(&root)?;
         let catalog = Catalog::open(&root.join(CATALOG_FILE_NAME))?;
+        let wasm_memory_limit = resolve_wasm_memory_limit(&root, cli_memory_limit)?;
         Ok(Self {
             root,
             content,
             catalog,
+            wasm_memory_limit,
         })
     }
 
@@ -147,8 +158,12 @@ impl Workspace {
     }
 
     /// Root for compiled artifacts and future non-semantic execution caches.
-    pub fn native_cache_root(&self) -> PathBuf {
+    pub fn artifact_cache_root(&self) -> PathBuf {
         self.root.join("cache")
+    }
+
+    pub fn wasm_memory_limit(&self) -> u64 {
+        self.wasm_memory_limit
     }
 
     pub fn import_file(&mut self, path: impl AsRef<Path>) -> Result<ImportedAsset> {
@@ -281,42 +296,45 @@ impl Workspace {
             .into_iter()
             .map(|bundle| {
                 let mut identity_errors = validate_artifact_identities(&bundle);
-                let expected_relative_path =
-                    format!("cache/native/{}/module.dll", bundle.bundle_id);
-                let mut library_errors = Vec::new();
-                if bundle.library_relative_path != expected_relative_path {
-                    library_errors.push(format!(
-                        "library path is {:?}, expected {expected_relative_path:?}",
-                        bundle.library_relative_path
+                let expected_relative_path = match bundle.backend.as_str() {
+                    "wasm" => format!("cache/artifacts/wasm/{}/module.wasm", bundle.bundle_id),
+                    "c" => format!("cache/native/{}/module.dll", bundle.bundle_id),
+                    backend => format!("cache/artifacts/{backend}/{}/module", bundle.bundle_id),
+                };
+                let mut artifact_errors = Vec::new();
+                if bundle.artifact_relative_path != expected_relative_path {
+                    artifact_errors.push(format!(
+                        "artifact path is {:?}, expected {expected_relative_path:?}",
+                        bundle.artifact_relative_path
                     ));
                 } else {
-                    let library_path = self.root.join(Path::new(&bundle.library_relative_path));
-                    match fs::read(&library_path) {
+                    let artifact_path = self.root.join(Path::new(&bundle.artifact_relative_path));
+                    match fs::read(&artifact_path) {
                         Ok(bytes) => {
                             let observed_content = byte_content_identity(&bytes);
-                            if observed_content != bundle.library_content_id {
-                                library_errors.push(format!(
-                                    "library Content ID is {observed_content}, expected {}",
-                                    bundle.library_content_id
+                            if observed_content != bundle.artifact_content_id {
+                                artifact_errors.push(format!(
+                                    "artifact Content ID is {observed_content}, expected {}",
+                                    bundle.artifact_content_id
                                 ));
                             }
-                            if bytes.len() as u64 != bundle.library_byte_len {
-                                library_errors.push(format!(
-                                    "library byte length is {}, expected {}",
+                            if bytes.len() as u64 != bundle.artifact_byte_len {
+                                artifact_errors.push(format!(
+                                    "artifact byte length is {}, expected {}",
                                     bytes.len(),
-                                    bundle.library_byte_len
+                                    bundle.artifact_byte_len
                                 ));
                             }
                         }
-                        Err(error) => library_errors.push(format!(
+                        Err(error) => artifact_errors.push(format!(
                             "could not read {}: {error}",
-                            library_path.display()
+                            artifact_path.display()
                         )),
                     }
                 }
                 let identity_valid = identity_errors.is_empty();
-                let library_valid = library_errors.is_empty();
-                identity_errors.append(&mut library_errors);
+                let artifact_valid = artifact_errors.is_empty();
+                identity_errors.append(&mut artifact_errors);
                 Ok(ArtifactBundleInspection {
                     bundle_id: bundle.bundle_id,
                     backend: bundle.backend,
@@ -326,13 +344,13 @@ impl Workspace {
                     cpu_features: bundle.cpu_features,
                     optimization: bundle.optimization,
                     abi_version: bundle.abi_version,
-                    library_content_id: bundle.library_content_id,
-                    library_byte_len: bundle.library_byte_len,
-                    library_relative_path: bundle.library_relative_path,
+                    artifact_content_id: bundle.artifact_content_id,
+                    artifact_byte_len: bundle.artifact_byte_len,
+                    artifact_relative_path: bundle.artifact_relative_path,
                     members: bundle.members,
                     identity_valid,
-                    library_valid,
-                    valid: identity_valid && library_valid,
+                    artifact_valid,
+                    valid: identity_valid && artifact_valid,
                     validation_errors: identity_errors,
                 })
             })
@@ -484,6 +502,44 @@ fn migrate_legacy_catalog(root: &Path) -> Result<()> {
         .map_err(|error| Error::io("rename legacy Histima catalog", &legacy, error))
 }
 
+fn resolve_wasm_memory_limit(root: &Path, cli: Option<u64>) -> Result<u64> {
+    let environment = std::env::var_os("HISTIMA_WASM_MEMORY_LIMIT");
+    resolve_wasm_memory_limit_with(root, cli, environment.as_deref())
+}
+
+fn resolve_wasm_memory_limit_with(
+    root: &Path,
+    cli: Option<u64>,
+    environment: Option<&std::ffi::OsStr>,
+) -> Result<u64> {
+    if let Some(limit) = cli {
+        tima::backend::wasm_runtime::validate_memory_limit(limit)
+            .map_err(|error| Error::catalog(error.to_string()))?;
+        return Ok(limit);
+    }
+    if let Some(value) = environment {
+        let value = value
+            .to_str()
+            .ok_or_else(|| Error::catalog("HISTIMA_WASM_MEMORY_LIMIT is not valid UTF-8"))?;
+        return parse_memory_limit(value).map_err(|error| Error::catalog(error.to_string()));
+    }
+    let config_path = root.join(".histima.toml");
+    if config_path.is_file() {
+        let text = fs::read_to_string(&config_path)
+            .map_err(|error| Error::io("read workspace configuration", &config_path, error))?;
+        let config = toml::from_str::<toml::Value>(&text).map_err(|error| {
+            Error::catalog(format!("invalid {}: {error}", config_path.display()))
+        })?;
+        if let Some(value) = config.get("wasm").and_then(|wasm| wasm.get("memory_limit")) {
+            let value = value.as_str().ok_or_else(|| {
+                Error::catalog("[wasm].memory_limit must be a quoted size string")
+            })?;
+            return parse_memory_limit(value).map_err(|error| Error::catalog(error.to_string()));
+        }
+    }
+    Ok(DEFAULT_MEMORY_LIMIT)
+}
+
 impl RuntimeCapabilities for Workspace {
     fn environment(&self, name: &str) -> std::result::Result<Vec<u8>, String> {
         Err(format!(
@@ -517,12 +573,49 @@ mod tests {
         assert_eq!(
             workspace.catalog_info().unwrap(),
             CatalogInfo {
-                schema_version: 3,
+                schema_version: 4,
                 foreign_keys_enabled: true,
                 journal_mode: "wal".to_owned(),
             }
         );
         assert_eq!(workspace.catalog_stats().unwrap(), CatalogStats::default());
+    }
+
+    #[test]
+    fn wasm_memory_limit_uses_cli_environment_config_then_default_precedence() {
+        let test = TestDirectory::new("wasm-memory-limit");
+        let root = test.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(".histima.toml"),
+            "[wasm]\nmemory_limit = \"128MiB\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_wasm_memory_limit_with(&root, None, None).unwrap(),
+            128 * 1024 * 1024
+        );
+        assert_eq!(
+            resolve_wasm_memory_limit_with(&root, None, Some(std::ffi::OsStr::new("256MiB")),)
+                .unwrap(),
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            resolve_wasm_memory_limit_with(
+                &root,
+                Some(64 * 1024 * 1024),
+                Some(std::ffi::OsStr::new("invalid")),
+            )
+            .unwrap(),
+            64 * 1024 * 1024
+        );
+
+        fs::remove_file(root.join(".histima.toml")).unwrap();
+        assert_eq!(
+            resolve_wasm_memory_limit_with(&root, None, None).unwrap(),
+            DEFAULT_MEMORY_LIMIT
+        );
     }
 
     #[test]
@@ -595,8 +688,8 @@ mod tests {
                 source_heads: 2,
                 lineage_invocations: 0,
                 recipe_results: 0,
-                native_artifact_bundles: 0,
-                native_artifacts: 0,
+                artifact_bundles: 0,
+                artifacts: 0,
             }
         );
 
@@ -616,8 +709,8 @@ mod tests {
                 source_heads: 2,
                 lineage_invocations: 0,
                 recipe_results: 0,
-                native_artifact_bundles: 0,
-                native_artifacts: 0,
+                artifact_bundles: 0,
+                artifacts: 0,
             }
         );
         assert!(

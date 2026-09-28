@@ -10,7 +10,7 @@ pub struct ValueId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u32);
 
-/// Types admitted by the native transform boundary in the first milestone.
+/// Types admitted by the inner transform boundary in the first milestone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Bool,

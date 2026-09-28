@@ -3,27 +3,25 @@ use std::fmt;
 
 use tima::CompiledProgram;
 use tima::ast::Item;
-use tima::backend::NativeBackend;
-use tima::backend::c::CBackend;
-use tima::backend::native::{
-    ClangCompiler, NativeBuildError, NativeCacheStatus, NativeLoadError, NativeModule,
-};
+use tima::backend::ArtifactBackend;
+use tima::backend::wasm::WasmBackend;
+use tima::backend::wasm_runtime::{ArtifactCacheStatus, WasmArtifactCache, WasmError, WasmSession};
 use tima::cache::{CacheError, CacheStats, ResultCache, TransformResultCache};
 use tima::diagnostic::Diagnostic;
 use tima::identity::{ContentIdentity, RecipeIdentity};
 use tima::runtime::{Execution, OuterValue};
 
-use crate::{NativeArtifactInfo, Workspace};
+use crate::{ArtifactInfo, Workspace};
 
 /// The observable result of one Tima program execution in a Histima workspace.
 ///
 /// Result-cache statistics include both process-local and validated durable
-/// workspace lookups. The native artifact status reports its separate cache.
+/// workspace lookups. The portable artifact status reports its separate cache.
 #[derive(Debug)]
 pub struct ProgramExecution {
     pub execution: Execution,
-    pub native_cache: NativeCacheStatus,
-    pub native_artifact: NativeArtifactInfo,
+    pub artifact_cache: ArtifactCacheStatus,
+    pub artifact: ArtifactInfo,
     pub result_cache: CacheStats,
 }
 
@@ -31,14 +29,14 @@ pub struct ProgramExecution {
 #[derive(Debug)]
 pub struct RecipeReplay {
     pub value: OuterValue,
-    pub native_cache: NativeCacheStatus,
-    pub native_artifact: NativeArtifactInfo,
+    pub artifact_cache: ArtifactCacheStatus,
+    pub artifact: ArtifactInfo,
     pub result_cache: CacheStats,
 }
 
 /// Result of evaluating one command-line outer pipeline expression.
 ///
-/// This path deliberately has no native artifact: declarations are rejected,
+/// This path deliberately has no compiled artifact: declarations are rejected,
 /// so only the outer interpreter and versioned registered transforms are involved.
 #[derive(Debug)]
 pub struct PipelineExecution {
@@ -50,8 +48,7 @@ pub struct PipelineExecution {
 pub enum RunError {
     Storage(crate::Error),
     CodeGeneration(Vec<Diagnostic>),
-    NativeBuild(NativeBuildError),
-    NativeLoad(NativeLoadError),
+    Artifact(WasmError),
     Runtime(Vec<Diagnostic>),
     InvalidPipeline(String),
 }
@@ -82,22 +79,22 @@ impl Workspace {
         })
     }
 
-    /// Executes checked Tima through the generated-C backend with this
+    /// Executes checked Tima through the WebAssembly backend with this
     /// workspace as the only host capability provider.
     pub fn execute(&self, program: &CompiledProgram) -> Result<ProgramExecution, RunError> {
-        let (native_cache, native_artifact, native) = self.load_native(program)?;
+        let (artifact_cache, artifact, wasm) = self.load_wasm(program)?;
         let mut result_cache = WorkspaceResultCache::new(self);
-        let execution = tima::runtime::execute_native_cached_with_capabilities(
+        let execution = tima::runtime::execute_wasm_cached_with_capabilities(
             program,
-            &native,
+            &wasm,
             &mut result_cache,
             self,
         )
         .map_err(RunError::Runtime)?;
         Ok(ProgramExecution {
             execution,
-            native_cache,
-            native_artifact,
+            artifact_cache,
+            artifact,
             result_cache: result_cache.stats,
         })
     }
@@ -111,11 +108,11 @@ impl Workspace {
         recipe: RecipeIdentity,
     ) -> Result<RecipeReplay, RunError> {
         let target = self.replay_target(recipe).map_err(RunError::Storage)?;
-        let (native_cache, native_artifact, native) = self.load_native(program)?;
+        let (artifact_cache, artifact, wasm) = self.load_wasm(program)?;
         let mut result_cache = WorkspaceResultCache::new(self);
-        let value = tima::runtime::replay_native_with_capabilities(
+        let value = tima::runtime::replay_wasm_with_capabilities(
             program,
-            &native,
+            &wasm,
             &target,
             &mut result_cache,
             self,
@@ -123,30 +120,34 @@ impl Workspace {
         .map_err(|diagnostic| RunError::Runtime(vec![diagnostic]))?;
         Ok(RecipeReplay {
             value,
-            native_cache,
-            native_artifact,
+            artifact_cache,
+            artifact,
             result_cache: result_cache.stats,
         })
     }
 
-    fn load_native(
+    fn load_wasm(
         &self,
         program: &CompiledProgram,
-    ) -> Result<(NativeCacheStatus, NativeArtifactInfo, NativeModule), RunError> {
-        let generated = CBackend
+    ) -> Result<(ArtifactCacheStatus, ArtifactInfo, WasmSession), RunError> {
+        let generated = WasmBackend
             .emit(&program.transforms)
             .map_err(RunError::CodeGeneration)?;
         let transform_ids = program.identities.iter().collect::<Vec<_>>();
-        let cached_artifact = ClangCompiler::default()
-            .compile_cached(&generated, &transform_ids, self.native_cache_root())
-            .map_err(RunError::NativeBuild)?;
+        let cached_artifact = WasmArtifactCache
+            .store(&generated, &transform_ids, self.artifact_cache_root())
+            .map_err(RunError::Artifact)?;
         let artifact_info = self
             .catalog
-            .record_native_artifact(&cached_artifact, &transform_ids, self.root())
+            .record_artifact(&cached_artifact, &transform_ids, self.root())
             .map_err(RunError::Storage)?;
-        let native = NativeModule::load(&cached_artifact.artifact, &program.transforms)
-            .map_err(RunError::NativeLoad)?;
-        Ok((cached_artifact.status, artifact_info, native))
+        let wasm = WasmSession::instantiate(
+            &cached_artifact.artifact,
+            &program.transforms,
+            self.wasm_memory_limit(),
+        )
+        .map_err(RunError::Artifact)?;
+        Ok((cached_artifact.status, artifact_info, wasm))
     }
 }
 
@@ -239,16 +240,10 @@ impl fmt::Display for RunError {
             Self::Storage(error) => error.fmt(formatter),
             Self::CodeGeneration(diagnostics) => write!(
                 formatter,
-                "generated-C code generation failed with {} diagnostic(s)",
+                "WebAssembly code generation failed with {} diagnostic(s)",
                 diagnostics.len()
             ),
-            Self::NativeBuild(error) => error.fmt(formatter),
-            Self::NativeLoad(error) => {
-                write!(
-                    formatter,
-                    "could not load native transform artifact: {error}"
-                )
-            }
+            Self::Artifact(error) => error.fmt(formatter),
             Self::Runtime(diagnostics) => write!(
                 formatter,
                 "Tima execution failed with {} diagnostic(s)",
@@ -263,8 +258,7 @@ impl StdError for RunError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Storage(error) => Some(error),
-            Self::NativeBuild(error) => Some(error),
-            Self::NativeLoad(error) => Some(error),
+            Self::Artifact(error) => Some(error),
             Self::CodeGeneration(_) | Self::Runtime(_) | Self::InvalidPipeline(_) => None,
         }
     }

@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use histima::{
-    ArtifactInspection, AssetSummary, CatalogInfo, CatalogPage, CatalogStats, ContentInspection,
-    DurableTrace, ImportedAsset, NativeArtifactInfo, PipelineExecution, ProgramExecution,
+    ArtifactInfo, ArtifactInspection, AssetSummary, CatalogInfo, CatalogPage, CatalogStats,
+    ContentInspection, DurableTrace, ImportedAsset, PipelineExecution, ProgramExecution,
     RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult,
 };
 use serde_json::{Map, Value, json};
@@ -36,8 +36,8 @@ pub fn stats(info: &CatalogInfo, stats: &CatalogStats) -> Value {
         "source_heads": stats.source_heads,
         "lineage_invocations": stats.lineage_invocations,
         "recipe_results": stats.recipe_results,
-        "native_artifact_bundles": stats.native_artifact_bundles,
-        "native_artifacts": stats.native_artifacts,
+        "artifact_bundles": stats.artifact_bundles,
+        "artifacts": stats.artifacts,
     })
 }
 
@@ -149,11 +149,11 @@ pub fn artifact(inspection: &ArtifactInspection) -> Value {
             "cpu_features": bundle.cpu_features,
             "optimization": bundle.optimization,
             "abi_version": bundle.abi_version,
-            "library_content_id": bundle.library_content_id.to_string(),
-            "library_byte_length": bundle.library_byte_len,
-            "library_relative_path": bundle.library_relative_path,
+            "artifact_content_id": bundle.artifact_content_id.to_string(),
+            "artifact_byte_length": bundle.artifact_byte_len,
+            "artifact_relative_path": bundle.artifact_relative_path,
             "identity_valid": bundle.identity_valid,
-            "library_valid": bundle.library_valid,
+            "artifact_valid": bundle.artifact_valid,
             "valid": bundle.valid,
             "members": bundle.members.iter().map(|member| json!({
                 "index": member.index,
@@ -191,9 +191,9 @@ pub fn run(result: &ProgramExecution, recorded: Option<(&str, &RecordedResult)>)
         .then(|| lineage.render())
     });
     json!({
-        "native_cache": native_cache(result.native_cache),
+        "artifact_cache": artifact_cache(result.artifact_cache),
         "result_cache": cache_stats(result.result_cache),
-        "native_artifact": native_artifact(&result.native_artifact),
+        "artifact": artifact_info(&result.artifact),
         "bindings": bindings,
         "trace": trace,
         "recorded": recorded.map(|(binding, recorded)| json!({
@@ -220,9 +220,9 @@ pub fn pipeline(result: &PipelineExecution, stocked: Option<&RecordedResult>) ->
 
 pub fn replay(recipe_id: impl ToString, content_id: impl ToString, result: &RecipeReplay) -> Value {
     json!({
-        "native_cache": native_cache(result.native_cache),
+        "artifact_cache": artifact_cache(result.artifact_cache),
         "result_cache": cache_stats(result.result_cache),
-        "native_artifact": native_artifact(&result.native_artifact),
+        "artifact": artifact_info(&result.artifact),
         "recipe_id": recipe_id.to_string(),
         "content_id": content_id.to_string(),
         "replayed": outer_value(&result.value),
@@ -238,10 +238,10 @@ pub fn trace(trace: &DurableTrace) -> Value {
     })
 }
 
-fn native_cache(status: tima::backend::native::NativeCacheStatus) -> &'static str {
+fn artifact_cache(status: tima::backend::wasm_runtime::ArtifactCacheStatus) -> &'static str {
     match status {
-        tima::backend::native::NativeCacheStatus::Hit => "hit",
-        tima::backend::native::NativeCacheStatus::Miss => "miss",
+        tima::backend::wasm_runtime::ArtifactCacheStatus::Hit => "hit",
+        tima::backend::wasm_runtime::ArtifactCacheStatus::Miss => "miss",
     }
 }
 
@@ -254,11 +254,11 @@ fn cache_stats(stats: CacheStats) -> Value {
     })
 }
 
-fn native_artifact(artifact: &NativeArtifactInfo) -> Value {
+fn artifact_info(artifact: &ArtifactInfo) -> Value {
     json!({
         "bundle_id": artifact.bundle_id.to_string(),
         "artifact_ids": artifact.artifact_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "library_content_id": artifact.library_content_id.to_string(),
+        "artifact_content_id": artifact.artifact_content_id.to_string(),
     })
 }
 
@@ -354,7 +354,7 @@ fn outer_value(value: &OuterValue) -> Value {
             "width": image.width(),
             "height": image.height(),
             "stride": image.stride(),
-            "byte_length": image.bytes().len(),
+            "byte_length": image.byte_len(),
         }),
         ValueData::Transform(id) => json!({"type": "transform", "index": id.0}),
         ValueData::Lineage(lineage) => json!({"type": "lineage", "trace": lineage.render()}),
