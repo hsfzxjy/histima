@@ -39,7 +39,7 @@ pub struct RecipeReplay {
 /// Result of evaluating one command-line outer pipeline expression.
 ///
 /// This path deliberately has no native artifact: declarations are rejected,
-/// so only the outer interpreter and versioned host transforms are involved.
+/// so only the outer interpreter and versioned registered transforms are involved.
 #[derive(Debug)]
 pub struct PipelineExecution {
     pub value: OuterValue,

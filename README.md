@@ -40,7 +40,7 @@ cargo run -p histima -- init build/my-workspace
 cargo run -p histima -- import build/my-workspace examples/tiny.ppm
 cargo run -p histima -- stats build/my-workspace
 cargo run -p histima -- materialize build/my-workspace <content-id> output.ppm
-cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | decode.ppm | encode.webp(quality=85)'
+cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | read | ppm.decode | webp.encode(quality=85)'
 cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
 cargo run -p histima -- trace build/my-workspace <recipe-id>
 cargo run -p histima -- replay build/my-workspace examples/image_pipeline.tima <recipe-id>
@@ -70,7 +70,7 @@ normalized semantic lineage in SQLite, and prints the durable identities.
 
 For one-off outer pipelines, `histima pipeline <workspace> <expression>` runs
 exactly one quoted Tima expression without requiring a source file or compiling
-an empty native module. It still uses catalog-only assets, host-transform
+an empty native module. It still uses catalog-only assets, registered-transform
 lineage, and the durable Recipe cache. Invocation-derived byte results are
 automatically added to workspace stock, so a later process can reuse the same
 Recipe-to-Content result; scalar and image results remain ephemeral. Bindings,
@@ -161,16 +161,18 @@ channel expressions, replacement assignment, and a general pixel value type
 remain intentionally deferred.
 
 The first Histima-facing codec path is deliberately small but complete:
-`asset(...) | decode.ppm | darken(0.5) | encode.ppm`. `decode.ppm` accepts
-ASCII P3 data supplied through an explicit host asset capability and produces
-an RGBA8 image; `encode.ppm` produces deterministic immutable P3 bytes. These
-versioned host transforms participate in semantic lineage, result caching, and
-replay, but remain outside typed inner IR and the generated-C artifact cache.
-The CLI explicitly supplies local-file access; the library has no ambient
+`asset(...) | read | ppm.decode | darken(0.5) | ppm.encode`. `ppm.decode` accepts
+immutable P3 bytes and produces an RGBA8 image; `ppm.encode` produces
+deterministic immutable P3 bytes. `asset(...)` remains a lazy locator and the
+explicit `read` builtin is the capability-mediated source observation that
+produces those bytes and fixes source lineage. The versioned registered
+transforms participate in semantic lineage, result caching, and replay, but
+remain outside typed inner IR and the generated-C artifact cache. The CLI
+explicitly supplies catalog-backed asset access; the library has no ambient
 filesystem fallback.
 
-The same boundary now provides `decode.png` and
-`encode.png(compression=6)`. PNG decoding
+The same boundary now provides `png.decode` and
+`png.encode(compression=6)`. PNG decoding
 accepts still images, normalizes supported grayscale, RGB, palette, and alpha
 forms to validated RGBA8, and deliberately rejects APNG. Encoding preserves
 RGBA bytes while removing row padding and ancillary metadata, with a pinned
@@ -178,10 +180,10 @@ codec, fixed Paeth filter, and an integer compression level from 1 through 9.
 The default is 6; omitting it and spelling `compression=6` produce identical
 lineage arguments and Recipe IDs, while another level produces a distinct
 recipe that replay restores exactly. Fixed-setting or codec changes must bump
-the encoder host-transform implementation version so existing Recipe IDs cannot
+the registered encoder's semantic version so existing Recipe IDs cannot
 silently acquire different output semantics.
 
-Lossy still-image WebP output is available as `encode.webp(quality=85)`.
+Lossy still-image WebP output is available as `webp.encode(quality=85)`.
 Quality is an integer from 0 through 100 with a canonical default of 85.
 Encoding preserves alpha losslessly, removes row padding, emits no inherited
 metadata, and uses an exactly pinned pure-Rust codec with fixed configuration
@@ -198,6 +200,11 @@ repeating the write. The CLI maps this capability to a local-file write.
 Every checked transform also receives a stable semantic identity derived from
 canonical typed IR and referenced transform identities. Source formatting,
 comments, local names, declaration order, backend, and target do not affect it.
+Calls and pipeline stages may assert that identity with `name#hash`, where
+`hash` is the full 64-character Transform ID or any lowercase hexadecimal
+prefix. A mismatch fails compilation; the assertion does not itself change
+semantic identity. The same syntax works for namespaced registered transforms,
+for example `png.decode#4f26a3`.
 Content, invocation recipe, observed dependency, and native artifact identities
 use separate hash domains; artifact identity additionally includes the actual
 backend, Clang version, target, optimization mode, and native ABI version.
@@ -231,7 +238,7 @@ Tima-computed identities and the bytes currently on disk before loading native
 code. These records have no identity relationship to Recipe IDs: changing a
 compiler or backend affects artifact reuse, never semantic lineage.
 
-`replay(value)` now resolves recorded inner and host transforms by semantic
+`replay(value)` now resolves recorded inner and registered transforms by semantic
 identity, recursively validates source assets and recorded external
 observations before consulting descendant result caches, restores exact scalar
 arguments and CAS-backed materialized arguments, and either reuses the recorded

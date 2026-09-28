@@ -901,7 +901,7 @@ impl<'a> Lowerer<'a> {
                 ))
             }
             ExprKind::Call { callee, arguments } => {
-                let ExprKind::Name(name) = &self.program.expr(*callee).kind else {
+                let Some((name, qualified)) = inner_callable_name(self.program, *callee) else {
                     self.diagnostics.push(Diagnostic::error(
                         "inner calls require a directly named transform",
                         self.program.expr(*callee).span,
@@ -909,12 +909,33 @@ impl<'a> Lowerer<'a> {
                     return None;
                 };
                 if name == "environment_i64" {
+                    if qualified {
+                        self.diagnostics.push(Diagnostic::error(
+                            "inner runtime operations cannot use semantic identity qualifiers",
+                            self.program.expr(*callee).span,
+                        ));
+                        return None;
+                    }
                     return self.environment_i64(arguments, expression.span);
                 }
                 if name == "image_zero" {
+                    if qualified {
+                        self.diagnostics.push(Diagnostic::error(
+                            "inner runtime operations cannot use semantic identity qualifiers",
+                            self.program.expr(*callee).span,
+                        ));
+                        return None;
+                    }
                     return self.image_zero(arguments, expression.span);
                 }
                 if name == "image_fill" {
+                    if qualified {
+                        self.diagnostics.push(Diagnostic::error(
+                            "inner runtime operations cannot use semantic identity qualifiers",
+                            self.program.expr(*callee).span,
+                        ));
+                        return None;
+                    }
                     return self.image_fill(arguments, expression.span);
                 }
                 let Some(signature) = self.signatures.get(name) else {
@@ -977,6 +998,7 @@ impl<'a> Lowerer<'a> {
             | ExprKind::List(_)
             | ExprKind::Record(_)
             | ExprKind::Member { .. }
+            | ExprKind::IdentityQualified { .. }
             | ExprKind::Pipeline { .. } => {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -1138,6 +1160,19 @@ fn inner_statement_span(statement: &InnerStmt) -> crate::source::Span {
     }
 }
 
+fn inner_callable_name(program: &ast::Program, expression: ExprId) -> Option<(&str, bool)> {
+    match &program.expr(expression).kind {
+        ExprKind::Name(name) => Some((name, false)),
+        ExprKind::IdentityQualified { callable, .. } => {
+            let ExprKind::Name(name) = &program.expr(*callable).kind else {
+                return None;
+            };
+            Some((name, true))
+        }
+        _ => None,
+    }
+}
+
 fn expression_mentions_name(program: &ast::Program, expression: ExprId, name: &str) -> bool {
     match &program.expr(expression).kind {
         ExprKind::Name(candidate) => candidate == name,
@@ -1151,6 +1186,9 @@ fn expression_mentions_name(program: &ast::Program, expression: ExprId, name: &s
             .iter()
             .any(|argument| expression_mentions_name(program, argument.value, name)),
         ExprKind::Member { receiver, .. } => expression_mentions_name(program, *receiver, name),
+        ExprKind::IdentityQualified { callable, .. } => {
+            expression_mentions_name(program, *callable, name)
+        }
         ExprKind::Binary { left, right, .. } => {
             expression_mentions_name(program, *left, name)
                 || expression_mentions_name(program, *right, name)

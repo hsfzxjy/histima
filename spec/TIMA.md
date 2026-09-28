@@ -136,6 +136,27 @@ Newlines are accepted:
 - before and after a pipeline `|`;
 - inside parameter, argument, list, and record delimiters.
 
+### 3.5 Semantic identity qualifiers
+
+A callable transform name may be followed by `#` and 1 through 64
+lowercase hexadecimal characters:
+
+```tima
+darken#4f26a3(img, 0.8)
+bytes | png.decode#0123456789abcdef
+```
+
+The hexadecimal text is a full Transform ID or a prefix of one. It is checked
+against the named transform during compilation. A mismatch is an error at the
+qualifier, which makes this syntax a reproducibility assertion rather than a
+second name-resolution mechanism. The qualifier does not contribute to typed
+IR or change the Transform ID, Recipe ID, or runtime call semantics.
+
+Qualifiers are supported on user-defined transforms and registered standard
+transforms. They are not supported on ordinary values, outer builtins, or
+reserved inner runtime operations. The name still selects the transform, so a
+short prefix need not be globally unique.
+
 ## 4. Program structure
 
 A source file is a sequence of:
@@ -175,13 +196,14 @@ list literal
 record literal
 callee(arguments)
 receiver.member
+transform-name#identity-prefix
 left binary-op right
 input | stage
 ```
 
 From highest to lowest precedence:
 
-1. calls and member access;
+1. calls, member access, and semantic identity qualification;
 2. `*`, `/` (left-associative);
 3. `+`, `-` (left-associative);
 4. one of `==`, `!=`, `<`, `<=`, `>`, `>=`;
@@ -196,7 +218,8 @@ Outer calls may use positional arguments, named arguments, or both:
 ```tima
 darken(img, 0.8)
 darken(img=img, factor=0.8)
-encode.webp(image, quality=85)
+webp.encode(image, quality=85)
+darken#4f26a3(img, 0.8)
 ```
 
 Arguments are evaluated in source order, then associated with parameters.
@@ -204,9 +227,11 @@ Positional arguments fill the next unfilled parameter. Unknown, duplicate,
 missing, and excess arguments are errors.
 
 An outer callee must be either a direct name or a one-level callable namespace
-such as `encode.webp`. Member access is not otherwise executable in outer code.
+such as `webp.encode`, optionally followed by a semantic identity qualifier.
+Member access is not otherwise executable in outer code.
 
-Inner calls must use a directly named transform and positional arguments only.
+Inner calls must use a directly named transform, optionally identity-qualified,
+and positional arguments only.
 
 ### 5.2 Pipeline expressions
 
@@ -218,8 +243,9 @@ x | f              // f(x)
 x | f(a, flag=true) // f(x, a, flag=true)
 ```
 
-A stage must be a transform/builtin name, a one-level namespaced host
-transform, or a call to one of those. Pipelines associate left-to-right, so:
+A stage must be a transform/builtin name, a one-level namespaced registered
+transform, an identity-qualified transform name, or a call to one of those.
+Pipelines associate left-to-right, so:
 
 ```tima
 x | f | g(2)
@@ -276,11 +302,22 @@ Lineage is recorded at source and transform boundaries.
 
 `asset` accepts exactly one string, optionally named `path` or `locator`, and
 returns a lazy logical asset reference. It does not read bytes immediately.
-The value begins with unresolved source lineage. A decoder observes the source
-through the host's asset capability and fixes its content and Source ID.
+The value begins with unresolved source lineage.
 
 Tima has no ambient filesystem fallback. A host must explicitly provide asset
 reading.
+
+#### `read(asset)`
+
+`read` accepts exactly one asset value and observes its locator through the
+host's asset-reading capability. It returns immutable `Bytes` with observed
+source lineage, including the Content ID and Source ID. If replay supplied an
+expected source content identity, changed bytes are rejected before downstream
+cache reuse.
+
+Separating source observation from decoding keeps codecs pure over values and
+allows the same bytes to be inspected, hashed, cached, or passed to any
+compatible registered decoder.
 
 #### `trace(value)`
 
@@ -506,26 +543,28 @@ requires valid UTF-8 decimal `i64` text. The raw bytes are content-hashed as an
 external observation. Missing capabilities, invalid UTF-8, and invalid integer
 text are errors.
 
-Asset decoders similarly observe an asset locator through the explicit asset
-capability. Arbitrary native OS access is not part of v0.
+The outer `read(asset)` builtin observes an asset locator through the explicit
+asset capability. Arbitrary native OS access is not part of v0.
 
-## 11. Standard host transforms
+## 11. Registered standard transforms
 
-Host transforms use normal outer call and pipeline syntax. They participate in
-semantic lineage, result caching, and replay, but are not emitted into the
-user-transform native artifact.
+Registered transforms use normal outer call and pipeline syntax. They have
+versioned semantic identities and use the same normalized arguments, lineage,
+result cache, and replay machinery as user transforms, but are not emitted into
+the user-transform native artifact. The registry is a deliberately small Tima
+runtime interface; it is not general native-library FFI.
 
 | Transform | Parameters | Result | Contract |
 | --- | --- | --- | --- |
-| `decode.ppm` | `asset` | RGBA8 image | ASCII P3 only; non-zero dimensions; max value 255 |
-| `encode.ppm` | `image` | bytes | Deterministic ASCII P3; RGBA8 input |
-| `decode.png` | `asset` | RGBA8 image | Still PNG; supported grayscale/RGB/palette/alpha forms; APNG rejected |
-| `encode.png` | `image`, `compression=6` | bytes | RGBA8; compression integer 1 through 9; fixed deterministic settings |
-| `encode.webp` | `image`, `quality=85` | bytes | Lossy still WebP; RGBA8; quality integer 0 through 100; alpha preserved losslessly |
+| `ppm.decode` | `bytes` | RGBA8 image | ASCII P3 only; non-zero dimensions; max value 255 |
+| `ppm.encode` | `image` | bytes | Deterministic ASCII P3; RGBA8 input |
+| `png.decode` | `bytes` | RGBA8 image | Still PNG; supported grayscale/RGB/palette/alpha forms; APNG rejected |
+| `png.encode` | `image`, `compression=6` | bytes | RGBA8; compression integer 1 through 9; fixed deterministic settings |
+| `webp.encode` | `image`, `quality=85` | bytes | Lossy still WebP; RGBA8; quality integer 0 through 100; alpha preserved losslessly |
 
 Omitting a default and spelling its canonical value produce identical lineage
-arguments and Recipe IDs. A host-transform implementation change that can
-alter output must bump that transform's semantic version. WebP decoding is
+arguments and Recipe IDs. A registered-transform implementation change that
+can alter output must bump that transform's semantic version. WebP decoding is
 not implemented.
 
 ## 12. Lineage, identity, caching, and replay
@@ -596,7 +635,7 @@ Replay must:
 
 1. require invocation lineage;
 2. resolve the recorded Transform ID against the current checked program or a
-   versioned host transform;
+   versioned registered transform;
 3. restore exact scalar arguments and materialized arguments by identity;
 4. validate recorded sources and external observations before cache reuse;
 5. reuse a valid recorded Recipe result or execute the transform;
@@ -683,15 +722,16 @@ transform darken(img: Image, factor: f32) -> Image {
 
 out =
     source
-    | decode.png
+    | read
+    | png.decode
     | darken(0.8)
-    | encode.webp(quality=85)
+    | webp.encode(quality=85)
 
 derivation = trace(out)
 replayed = replay(out)
 ```
 
 The source asset remains immutable. `darken` receives unique mutable image
-storage, the returned image is frozen before `encode.webp` sees it, each
+storage, the returned image is frozen before `webp.encode` sees it, each
 transform result carries semantic lineage, and valid compiled artifacts and
 Recipe results may be reused without changing that lineage.

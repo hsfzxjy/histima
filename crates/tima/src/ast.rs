@@ -113,6 +113,11 @@ pub enum ExprKind {
         name: String,
         name_span: Span,
     },
+    IdentityQualified {
+        callable: ExprId,
+        prefix: String,
+        prefix_span: Span,
+    },
     Binary {
         op: BinaryOp,
         left: ExprId,

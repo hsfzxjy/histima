@@ -14,10 +14,10 @@ use crate::capability::{
     ASSET_CAPABILITY, CapabilitySession, RuntimeCapabilities, observe_dependency,
 };
 use crate::diagnostic::Diagnostic;
-use crate::host::{HostTransform, prepare_host_invocation};
 use crate::identity::{ContentIdentity, content_identity};
 use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueId, ValueKind};
 use crate::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
+use crate::registered::{RegisteredTransform, prepare_registered_invocation};
 use crate::source::Span;
 
 /// An immutable outer value. Composite payloads use immutable `Arc` storage;
@@ -684,14 +684,13 @@ fn invoke_transform_with_lineage<'cache>(
     Ok(value)
 }
 
-fn invoke_host_transform_with_lineage<'cache>(
-    transform: HostTransform,
-    engine: &dyn TransformEngine,
+fn invoke_registered_transform_with_lineage<'cache>(
+    transform: &'static RegisteredTransform,
     arguments: Vec<(OuterValue, Span)>,
     mut cache: Option<&mut (dyn ResultCache + 'cache)>,
     span: Span,
 ) -> Result<OuterValue, Diagnostic> {
-    let prepared = prepare_host_invocation(transform, arguments, engine.capabilities(), span)?;
+    let prepared = prepare_registered_invocation(transform, arguments, span)?;
     let recorded = transform
         .parameters()
         .iter()
@@ -699,7 +698,9 @@ fn invoke_host_transform_with_lineage<'cache>(
         .map(|(name, (argument, argument_span))| {
             LineageArgument::record(*name, argument).map_err(|error| {
                 Diagnostic::error(
-                    format!("cannot record argument `{name}` for host transform lineage: {error}"),
+                    format!(
+                        "cannot record argument `{name}` for registered transform lineage: {error}"
+                    ),
                     *argument_span,
                 )
             })
@@ -715,7 +716,7 @@ fn invoke_host_transform_with_lineage<'cache>(
                 .map_err(|error| Diagnostic::error(error.to_string(), *argument_span))?;
             if remembered != content_id {
                 return Err(Diagnostic::error(
-                    "recorded host-transform argument does not match stored content",
+                    "recorded registered-transform argument does not match stored content",
                     *argument_span,
                 ));
             }
@@ -725,7 +726,7 @@ fn invoke_host_transform_with_lineage<'cache>(
         .map_err(|error| Diagnostic::error(error.to_string(), span))?;
     let recipe = lineage
         .recipe_id()
-        .expect("host invocation lineage has a recipe identity");
+        .expect("registered invocation lineage has a recipe identity");
     if let Some(cache) = cache.as_deref_mut()
         && let Some(mut value) = cache
             .lookup(recipe)
@@ -734,7 +735,7 @@ fn invoke_host_transform_with_lineage<'cache>(
         value.lineage = Some(lineage);
         return Ok(value);
     }
-    let mut value = prepared.execute(transform)?;
+    let mut value = prepared.execute()?;
     if let Some(cache) = cache {
         cache
             .store(recipe, &value)
@@ -779,7 +780,7 @@ fn replay_with(
 #[derive(Clone, Copy)]
 enum ReplayTransform {
     Inner(TransformId),
-    Host(HostTransform),
+    Registered(&'static RegisteredTransform),
 }
 
 fn resolve_replay_transform(
@@ -787,26 +788,29 @@ fn resolve_replay_transform(
     invocation: &crate::lineage::InvocationLineage,
     span: Span,
 ) -> Result<ReplayTransform, Diagnostic> {
-    let replay_transform =
-        if let Some(transform_id) = program.identities.find_id(invocation.transform_id) {
-            ReplayTransform::Inner(transform_id)
-        } else if let Some(host) = HostTransform::from_identity(invocation.transform_id) {
-            ReplayTransform::Host(host)
-        } else {
-            return Err(Diagnostic::error(
-                format!(
-                    "recorded transform definition {} is unavailable or has changed",
-                    invocation.transform_id
-                ),
-                span,
-            ));
-        };
+    let replay_transform = if let Some(transform_id) =
+        program.identities.find_id(invocation.transform_id)
+    {
+        ReplayTransform::Inner(transform_id)
+    } else if let Some(registered) = RegisteredTransform::from_identity(invocation.transform_id) {
+        ReplayTransform::Registered(registered)
+    } else {
+        return Err(Diagnostic::error(
+            format!(
+                "recorded transform definition {} is unavailable or has changed",
+                invocation.transform_id
+            ),
+            span,
+        ));
+    };
     let (transform_name, parameter_count) = match replay_transform {
         ReplayTransform::Inner(id) => {
             let transform = program.transforms.get(id);
             (transform.name.as_str(), transform.parameters.len())
         }
-        ReplayTransform::Host(host) => (host.name(), host.parameters().len()),
+        ReplayTransform::Registered(registered) => {
+            (registered.name(), registered.parameters().len())
+        }
     };
     if parameter_count != invocation.arguments.len() {
         return Err(Diagnostic::error(
@@ -889,10 +893,9 @@ fn replay_lineage(
             .map_err(|error| Diagnostic::error(error.to_string(), span))?;
             (value, lineage)
         }
-        ReplayTransform::Host(host) => {
-            let prepared =
-                prepare_host_invocation(host, runtime_arguments, engine.capabilities(), span)?;
-            let arguments = host
+        ReplayTransform::Registered(registered) => {
+            let prepared = prepare_registered_invocation(registered, runtime_arguments, span)?;
+            let arguments = registered
                 .parameters()
                 .iter()
                 .zip(&prepared.arguments)
@@ -901,9 +904,10 @@ fn replay_lineage(
                         .map_err(|error| Diagnostic::error(error.to_string(), *argument_span))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let lineage = Lineage::invocation(host.name(), host.identity(), arguments, vec![])
-                .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-            (prepared.execute(host)?, lineage)
+            let lineage =
+                Lineage::invocation(registered.name(), registered.identity(), arguments, vec![])
+                    .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+            (prepared.execute()?, lineage)
         }
     };
     let observed_recipe = observed_lineage
@@ -949,6 +953,25 @@ fn replay_argument(
                 .map_err(|error| Diagnostic::error(error.to_string(), span))?
             {
                 value
+            } else if let Some(lineage) = &argument.lineage
+                && let LineageNode::Source(source) = lineage.node()
+            {
+                let Some(capabilities) = engine.capabilities() else {
+                    return Err(Diagnostic::error(
+                        format!(
+                            "replay requires an asset reader to restore source {:?}",
+                            source.locator
+                        ),
+                        span,
+                    ));
+                };
+                let bytes = capabilities.read_asset(&source.locator).map_err(|error| {
+                    Diagnostic::error(
+                        format!("could not restore source {:?}: {error}", source.locator),
+                        span,
+                    )
+                })?;
+                OuterValue::plain(ValueData::Bytes(Arc::from(bytes)))
             } else if let Some(parent) = &argument.lineage {
                 replay_lineage(
                     program,
@@ -1058,7 +1081,10 @@ fn validate_replay_dependencies(
             continue;
         };
         match (&argument.value, lineage.node()) {
-            (RecordedValue::Source { .. }, LineageNode::Source(source)) => {
+            (
+                RecordedValue::Source { .. } | RecordedValue::Materialized { kind: "bytes", .. },
+                LineageNode::Source(source),
+            ) => {
                 let Some(expected) = source.observed_content else {
                     return Err(Diagnostic::error(
                         format!("replay source {:?} was never observed", source.locator),
@@ -1213,13 +1239,25 @@ impl Interpreter<'_, '_, '_> {
                     expression.span,
                 ));
             }
+            ExprKind::IdentityQualified { callable, .. } => {
+                let name = self.callable_name(*callable)?;
+                let Some((id, _)) = self.program.transforms.find(&name) else {
+                    return Err(Diagnostic::error(
+                        "identity-qualified callable values currently require a user transform",
+                        expression.span,
+                    ));
+                };
+                OuterValue::plain(ValueData::Transform(id))
+            }
             ExprKind::Pipeline { input, stage } => {
                 let input = self.expression(*input)?;
                 match &self.program.syntax.expr(*stage).kind {
                     ExprKind::Call { callee, arguments } => {
                         self.call(*callee, arguments, Some(input), expression.span)?
                     }
-                    ExprKind::Name(_) | ExprKind::Member { .. } => {
+                    ExprKind::Name(_)
+                    | ExprKind::Member { .. }
+                    | ExprKind::IdentityQualified { .. } => {
                         self.call(*stage, &[], Some(input), expression.span)?
                     }
                     _ => {
@@ -1256,6 +1294,7 @@ impl Interpreter<'_, '_, '_> {
     ) -> Result<OuterValue, Diagnostic> {
         let callee_expression = self.program.syntax.expr(callee);
         let name = self.callable_name(callee)?;
+        let qualified = matches!(callee_expression.kind, ExprKind::IdentityQualified { .. });
         let mut evaluated = Vec::new();
         if let Some(input) = pipeline_input {
             evaluated.push((None, input, callee_expression.span));
@@ -1268,28 +1307,60 @@ impl Interpreter<'_, '_, '_> {
             ));
         }
         if name == "asset" {
+            if qualified {
+                return Err(Diagnostic::error(
+                    "outer builtins cannot use semantic identity qualifiers",
+                    callee_expression.span,
+                ));
+            }
             return self.asset(evaluated, span);
         }
+        if name == "read" {
+            if qualified {
+                return Err(Diagnostic::error(
+                    "outer builtins cannot use semantic identity qualifiers",
+                    callee_expression.span,
+                ));
+            }
+            return self.read(evaluated, span);
+        }
         if name == "trace" {
+            if qualified {
+                return Err(Diagnostic::error(
+                    "outer builtins cannot use semantic identity qualifiers",
+                    callee_expression.span,
+                ));
+            }
             return self.trace(evaluated, span);
         }
         if name == "replay" {
+            if qualified {
+                return Err(Diagnostic::error(
+                    "outer builtins cannot use semantic identity qualifiers",
+                    callee_expression.span,
+                ));
+            }
             return self.replay_call(evaluated, span);
         }
         if name == "save" {
+            if qualified {
+                return Err(Diagnostic::error(
+                    "outer builtins cannot use semantic identity qualifiers",
+                    callee_expression.span,
+                ));
+            }
             return self.save(evaluated, span);
         }
-        if let Some(host_transform) = HostTransform::find(&name) {
+        if let Some(registered) = RegisteredTransform::find(&name) {
             let arguments = order_outer_arguments_with_defaults(
-                host_transform.name(),
-                host_transform.parameters(),
+                registered.name(),
+                registered.parameters(),
                 evaluated,
                 span,
-                |index| host_transform.default_argument(index),
+                |index| registered.default_argument(index),
             )?;
-            return invoke_host_transform_with_lineage(
-                host_transform,
-                self.engine,
+            return invoke_registered_transform_with_lineage(
+                registered,
                 arguments,
                 match &mut self.cache {
                     Some(cache) => Some(&mut **cache),
@@ -1335,6 +1406,7 @@ impl Interpreter<'_, '_, '_> {
                 };
                 Ok(format!("{namespace}.{name}"))
             }
+            ExprKind::IdentityQualified { callable, .. } => self.callable_name(*callable),
             _ => Err(Diagnostic::error(
                 "outer calls require a named builtin or transform",
                 expression.span,
@@ -1368,6 +1440,64 @@ impl Interpreter<'_, '_, '_> {
             locator: locator.clone(),
         })))
         .with_lineage(Lineage::source(locator.clone(), None)))
+    }
+
+    fn read(
+        &self,
+        arguments: Vec<(Option<String>, OuterValue, Span)>,
+        span: Span,
+    ) -> Result<OuterValue, Diagnostic> {
+        let mut arguments = order_outer_arguments("read", &["asset"], arguments, span)?;
+        let (asset, asset_span) = arguments.pop().expect("read has one asset argument");
+        let ValueData::Asset(value) = &asset.data else {
+            return Err(Diagnostic::error("read expects an asset value", asset_span));
+        };
+        let Some(capabilities) = self.engine.capabilities() else {
+            return Err(Diagnostic::error(
+                "asset materialization is unavailable in this runtime",
+                asset_span,
+            )
+            .with_note("the Histima host must provide an asset-reading capability"));
+        };
+        let bytes = capabilities.read_asset(&value.locator).map_err(|error| {
+            Diagnostic::error(
+                format!("could not read asset {:?}: {error}", value.locator),
+                asset_span,
+            )
+        })?;
+        let observed = crate::identity::byte_content_identity(&bytes);
+        if let Some(lineage) = &asset.lineage {
+            match lineage.node() {
+                LineageNode::Source(source) => {
+                    if source.locator != value.locator {
+                        return Err(Diagnostic::error(
+                            "asset locator does not match its source lineage",
+                            asset_span,
+                        ));
+                    }
+                    if let Some(expected) = source.observed_content
+                        && expected != observed
+                    {
+                        return Err(Diagnostic::error(
+                            format!(
+                                "asset {:?} changed: expected content {expected}, observed {observed}",
+                                value.locator
+                            ),
+                            asset_span,
+                        )
+                        .with_note("replay requires the recorded source content"));
+                    }
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        "asset value carries non-source lineage",
+                        asset_span,
+                    ));
+                }
+            }
+        }
+        Ok(OuterValue::plain(ValueData::Bytes(Arc::from(bytes)))
+            .with_lineage(Lineage::observed_source(value.locator.clone(), observed)))
     }
 
     fn trace(
@@ -2566,6 +2696,24 @@ mod tests {
     }
 
     #[test]
+    fn executes_an_identity_qualified_transform_reference() {
+        let definition = "transform scale(x: f32, factor: f32) -> f32 { return x * factor }\n";
+        let base = crate::compile("base.tima", definition).unwrap();
+        let identity = base.identities.get(TransformId(0)).to_string();
+        let compiled = crate::compile(
+            "qualified.tima",
+            format!(
+                "{definition}out = 8.0 | scale#{}(factor=0.25)\n",
+                &identity[..12]
+            ),
+        )
+        .unwrap();
+
+        let execution = execute(&compiled).unwrap();
+        assert_eq!(execution.bindings["out"].data, ValueData::Float(2.0));
+    }
+
+    #[test]
     fn environment_capability_is_explicit_and_part_of_the_recipe() {
         let compiled = crate::compile(
             "test.tima",
@@ -2917,7 +3065,7 @@ mod tests {
     }
 
     #[test]
-    fn host_ppm_pipeline_runs_native_transform_with_lineage_cache_and_replay() {
+    fn registered_ppm_pipeline_runs_native_transform_with_lineage_cache_and_replay() {
         let compiled = crate::compile(
             "pipeline.tima",
             "source = asset(\"cat.ppm\")\n\
@@ -2929,9 +3077,9 @@ mod tests {
                  }\n\
                  return img\n\
              }\n\
-             decoded = source | decode.ppm\n\
+             decoded = source | read | ppm.decode\n\
              darkened = decoded | darken(0.5)\n\
-             out = darkened | encode.ppm\n\
+             out = darkened | ppm.encode\n\
              saved = out | save(\"cat-dark.ppm\")\n\
              replayed = replay(saved)\n\
              derivation = trace(saved)\n",
@@ -2969,9 +3117,9 @@ mod tests {
         };
         let rendered = lineage.render();
         assert!(rendered.contains("source \"cat.ppm\" content="));
-        assert!(rendered.contains("invoke decode.ppm"));
+        assert!(rendered.contains("invoke ppm.decode"));
         assert!(rendered.contains("invoke darken"));
-        assert!(rendered.contains("invoke encode.ppm"));
+        assert!(rendered.contains("invoke ppm.encode"));
 
         let replayed = replay_native_with_capabilities(
             &compiled,
@@ -2997,7 +3145,7 @@ mod tests {
     }
 
     #[test]
-    fn host_png_pipeline_runs_native_transform_with_lineage_and_replay() {
+    fn registered_png_pipeline_runs_native_transform_with_lineage_and_replay() {
         let compiled = crate::compile(
             "pipeline.tima",
             "source = asset(\"cat.png\")\n\
@@ -3009,14 +3157,14 @@ mod tests {
                  }\n\
                  return img\n\
              }\n\
-             decoded = source | decode.png\n\
+             decoded = source | read | png.decode\n\
              darkened = decoded | darken(0.5)\n\
-             out = darkened | encode.png\n\
-             explicit_default = darkened | encode.png(compression=6)\n\
-             fast = darkened | encode.png(compression=1)\n\
-             webp_default = darkened | encode.webp\n\
-             webp_explicit = darkened | encode.webp(quality=85)\n\
-             webp_low = darkened | encode.webp(quality=25)\n\
+             out = darkened | png.encode\n\
+             explicit_default = darkened | png.encode(compression=6)\n\
+             fast = darkened | png.encode(compression=1)\n\
+             webp_default = darkened | webp.encode\n\
+             webp_explicit = darkened | webp.encode(quality=85)\n\
+             webp_low = darkened | webp.encode(quality=25)\n\
              replayed = replay(out)\n\
              replayed_fast = replay(fast)\n\
              replayed_webp = replay(webp_low)\n\
@@ -3135,15 +3283,15 @@ mod tests {
         let ValueData::Lineage(webp_lineage) = &execution.bindings["webp_derivation"].data else {
             panic!("expected lineage")
         };
-        assert!(webp_lineage.render().contains("invoke encode.webp"));
+        assert!(webp_lineage.render().contains("invoke webp.encode"));
         let ValueData::Lineage(lineage) = &execution.bindings["derivation"].data else {
             panic!("expected lineage")
         };
         let rendered = lineage.render();
         assert!(rendered.contains("source \"cat.png\" content="));
-        assert!(rendered.contains("invoke decode.png"));
+        assert!(rendered.contains("invoke png.decode"));
         assert!(rendered.contains("invoke darken"));
-        assert!(rendered.contains("invoke encode.png"));
+        assert!(rendered.contains("invoke png.encode"));
 
         let replayed = replay_native_with_capabilities(
             &compiled,

@@ -347,6 +347,20 @@ impl Parser {
                     },
                     span,
                 );
+            } else if matches!(self.current().kind, TokenKind::IdentityHash(_)) {
+                let token = self.bump();
+                let TokenKind::IdentityHash(prefix) = token.kind else {
+                    unreachable!("identity hash token was matched")
+                };
+                let span = self.expr(expression).span.join(token.span);
+                expression = self.alloc(
+                    ExprKind::IdentityQualified {
+                        callable: expression,
+                        prefix,
+                        prefix_span: token.span,
+                    },
+                    span,
+                );
             } else {
                 break;
             }
@@ -678,6 +692,31 @@ mod tests {
                 op: BinaryOp::Multiply,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn parses_identity_qualified_namespaced_pipeline_stages() {
+        let source = SourceFile::new("test.tima", "out = bytes | png.decode#0123abcd\n");
+        let program = parse(&source).unwrap();
+        let Item::Binding(binding) = &program.items[0] else {
+            panic!("expected binding")
+        };
+        let ExprKind::Pipeline { stage, .. } = program.expr(binding.value).kind else {
+            panic!("expected pipeline")
+        };
+        let ExprKind::IdentityQualified {
+            callable, prefix, ..
+        } = &program.expr(stage).kind
+        else {
+            panic!("expected identity-qualified stage")
+        };
+        assert_eq!(prefix, "0123abcd");
+        assert!(matches!(
+            &program.expr(*callable).kind,
+            ExprKind::Member { receiver, name, .. }
+                if name == "decode"
+                    && matches!(&program.expr(*receiver).kind, ExprKind::Name(name) if name == "png")
         ));
     }
 }

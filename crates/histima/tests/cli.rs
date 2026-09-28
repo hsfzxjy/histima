@@ -133,7 +133,7 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
                  }}\n\
                  return img\n\
              }}\n\
-             out = source | decode.ppm | darken(0.5) | encode.ppm\n\
+             out = source | read | ppm.decode | darken(0.5) | ppm.encode\n\
              saved = out | save({output_locator:?})\n\
              trace(out)\n"
         ),
@@ -257,21 +257,21 @@ fn cli_runs_a_native_tima_pipeline_against_imported_assets() {
     let trace = histima(["trace", text(&workspace), &recipe_id]);
     assert_success(&trace);
     assert!(stdout(&trace).contains("source "));
-    assert!(stdout(&trace).contains("invoke decode.ppm"));
+    assert!(stdout(&trace).contains("invoke ppm.decode"));
     assert!(stdout(&trace).contains("invoke darken"));
-    assert!(stdout(&trace).contains("invoke encode.ppm"));
+    assert!(stdout(&trace).contains("invoke ppm.encode"));
 
     let recipes = histima(["recipes", text(&workspace)]);
     assert_success(&recipes);
     assert_eq!(field(&recipes, "count"), "1");
     assert_eq!(field(&recipes, "truncated"), "false");
     assert_eq!(field(&recipes, "recipe[0].recipe_id"), recipe_id);
-    assert_eq!(field(&recipes, "recipe[0].transform_name"), "encode.ppm");
+    assert_eq!(field(&recipes, "recipe[0].transform_name"), "ppm.encode");
     assert_eq!(field(&recipes, "recipe[0].content_id"), content_id);
 
     let inspected_recipe = histima(["inspect", "recipe", text(&workspace), &recipe_id]);
     assert_success(&inspected_recipe);
-    assert_eq!(field(&inspected_recipe, "transform_name"), "encode.ppm");
+    assert_eq!(field(&inspected_recipe, "transform_name"), "ppm.encode");
     assert_eq!(field(&inspected_recipe, "content_valid"), "true");
     assert_eq!(field(&inspected_recipe, "argument_count"), "1");
     assert!(field(&inspected_recipe, "argument[0].semantic_identity").starts_with("recipe:"));
@@ -441,7 +441,7 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
                  }}\n\
                  return img\n\
              }}\n\
-             out = source | decode.png | darken(0.5) | encode.webp\n\
+             out = source | read | png.decode | darken(0.5) | webp.encode\n\
              saved = out | save({output_locator:?})\n"
         ),
     )
@@ -460,7 +460,7 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
     let source_text = fs::read_to_string(&script).unwrap();
     fs::write(
         &script,
-        source_text.replace("| encode.webp\n", "| encode.webp(quality=85)\n"),
+        source_text.replace("| webp.encode\n", "| webp.encode(quality=85)\n"),
     )
     .unwrap();
     fs::remove_file(&output).unwrap();
@@ -471,9 +471,9 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
 
     let trace = histima(["trace", text(&workspace), &recipe_id]);
     assert_success(&trace);
-    assert!(stdout(&trace).contains("invoke decode.png"));
+    assert!(stdout(&trace).contains("invoke png.decode"));
     assert!(stdout(&trace).contains("invoke darken"));
-    assert!(stdout(&trace).contains("invoke encode.webp"));
+    assert!(stdout(&trace).contains("invoke webp.encode"));
 
     let replay = histima(["replay", text(&workspace), text(&script), &recipe_id]);
     assert_success(&replay);
@@ -502,7 +502,7 @@ fn cli_json_covers_the_workspace_lifecycle() {
                  }}\n\
                  return img\n\
              }}\n\
-             out = source | decode.ppm | darken(0.5) | encode.ppm\n"
+             out = source | read | ppm.decode | darken(0.5) | ppm.encode\n"
         ),
     )
     .unwrap();
@@ -559,7 +559,7 @@ fn cli_json_covers_the_workspace_lifecycle() {
     let recipes = json_output(&recipes);
     assert_eq!(recipes["count"], 1);
     assert_eq!(recipes["recipes"][0]["recipe_id"], recipe_id);
-    assert_eq!(recipes["recipes"][0]["transform_name"], "encode.ppm");
+    assert_eq!(recipes["recipes"][0]["transform_name"], "ppm.encode");
 
     let content = histima([
         "inspect",
@@ -577,7 +577,7 @@ fn cli_json_covers_the_workspace_lifecycle() {
     let recipe = histima(["--json", "inspect", "recipe", text(&workspace), &recipe_id]);
     assert_success(&recipe);
     let recipe = json_output(&recipe);
-    assert_eq!(recipe["transform_name"], "encode.ppm");
+    assert_eq!(recipe["transform_name"], "ppm.encode");
     assert_eq!(
         recipe["arguments"][0]["semantic_identity"]["kind"],
         "recipe"
@@ -609,7 +609,7 @@ fn cli_json_covers_the_workspace_lifecycle() {
         trace["trace"]
             .as_str()
             .unwrap()
-            .contains("invoke encode.ppm")
+            .contains("invoke ppm.encode")
     );
 
     let replay = histima([
@@ -666,7 +666,7 @@ fn cli_pipeline_evaluates_one_expression_and_stocks_byte_results() {
     let source = test.path().join("source.ppm");
     fs::write(&source, b"P3\n1 1\n255\n24 48 96\n").unwrap();
     let source_locator = portable(&source);
-    let expression = format!("asset({source_locator:?}) | decode.ppm | encode.ppm");
+    let expression = format!("asset({source_locator:?}) | read | ppm.decode | ppm.encode");
 
     assert_success(&histima(["init", text(&workspace)]));
     assert_success(&histima(["import", text(&workspace), &source_locator]));
@@ -679,8 +679,8 @@ fn cli_pipeline_evaluates_one_expression_and_stocks_byte_results() {
     let content_id = field(&first, "content_id");
     assert_canonical_identity(&recipe_id);
     assert_canonical_identity(&content_id);
-    assert!(stdout(&first).contains("invoke decode.ppm"));
-    assert!(stdout(&first).contains("invoke encode.ppm"));
+    assert!(stdout(&first).contains("invoke ppm.decode"));
+    assert!(stdout(&first).contains("invoke ppm.encode"));
 
     let stats = histima(["stats", text(&workspace), "--json"]);
     assert_success(&stats);

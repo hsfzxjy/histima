@@ -10,9 +10,9 @@ transform darken(img: Image, factor: f32) -> Image {
     return img
 }
 
-decoded = source | decode.ppm
+decoded = source | read | ppm.decode
 darkened = decoded | darken(0.5)
-out = darkened | encode.ppm
+out = darkened | ppm.encode
 saved = out | save("build/image_pipeline.ppm")
 replayed = replay(saved)
 

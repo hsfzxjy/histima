@@ -32,6 +32,7 @@ pub enum TokenKind {
     Colon,
     Semicolon,
     Dot,
+    IdentityHash(String),
     Equal,
     EqualEqual,
     BangEqual,
@@ -96,6 +97,7 @@ impl Lexer<'_> {
                 b':' => self.single(TokenKind::Colon, start),
                 b';' => self.single(TokenKind::Semicolon, start),
                 b'.' => self.single(TokenKind::Dot, start),
+                b'#' => self.identity_hash(start),
                 b'=' if self.peek() == Some(b'=') => self.double(TokenKind::EqualEqual, start),
                 b'=' => self.single(TokenKind::Equal, start),
                 b'!' if self.peek() == Some(b'=') => self.double(TokenKind::BangEqual, start),
@@ -256,6 +258,35 @@ impl Lexer<'_> {
             ));
         }
     }
+
+    fn identity_hash(&mut self, start: usize) {
+        self.position += 1;
+        let value_start = self.position;
+        while self
+            .current()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        {
+            self.position += 1;
+        }
+        let value = &self.text[value_start..self.position];
+        if value.is_empty() {
+            self.diagnostics.push(Diagnostic::error(
+                "semantic identity qualifier requires a hexadecimal hash or prefix",
+                Span::new(start, self.position),
+            ));
+        } else if value.len() > 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "semantic identity qualifier must be 1 to 64 lowercase hexadecimal characters",
+                Span::new(start, self.position),
+            ));
+        } else {
+            self.push(TokenKind::IdentityHash(value.to_owned()), start);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +342,35 @@ mod tests {
                 .iter()
                 .any(|token| token.kind == TokenKind::GreaterEqual)
         );
+    }
+
+    #[test]
+    fn recognizes_semantic_identity_hashes_and_prefixes() {
+        let source = SourceFile::new("test.tima", "darken#0123abcdef ppm.decode#f\n");
+        let tokens = lex(&source).unwrap();
+        assert!(
+            tokens
+                .iter()
+                .any(|token| { token.kind == TokenKind::IdentityHash("0123abcdef".to_owned()) })
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::IdentityHash("f".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_semantic_identity_qualifiers() {
+        let inputs = [
+            "darken#".to_owned(),
+            "darken#ABCD".to_owned(),
+            "darken#xyz".to_owned(),
+            format!("darken#{}", "a".repeat(65)),
+        ];
+        for text in inputs {
+            let source = SourceFile::new("test.tima", text.clone());
+            assert!(lex(&source).is_err(), "expected `{text}` to be rejected");
+        }
     }
 }
