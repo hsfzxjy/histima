@@ -1,5 +1,6 @@
 mod cli_json;
 
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -65,15 +66,16 @@ fn report_error(output: OutputMode, message: String) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<(), String> {
-    let command = arguments.next().unwrap_or_else(|| "help".to_owned());
+fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<(), String> {
+    let mut arguments = arguments.collect::<VecDeque<_>>();
+    let command = arguments.pop_front().unwrap_or_else(|| "help".to_owned());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         print_usage();
         return Ok(());
     }
     match command.as_str() {
         "init" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let info = workspace
@@ -86,7 +88,7 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             })?;
         }
         "import" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let workspace_path = workspace_path(&mut arguments, 1)?;
             let source_path = required(&mut arguments, "source asset path")?;
             finished(&mut arguments)?;
             let mut workspace =
@@ -102,7 +104,7 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             })?;
         }
         "stats" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let info = workspace
@@ -126,7 +128,7 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             })?;
         }
         "assets" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let page = workspace.assets().map_err(|error| error.to_string())?;
@@ -142,7 +144,7 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             })?;
         }
         "recipes" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let page = workspace.recipes().map_err(|error| error.to_string())?;
@@ -159,8 +161,11 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             })?;
         }
         "inspect" => {
-            let kind = required(&mut arguments, "inspection kind (content or recipe)")?;
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let kind = required(
+                &mut arguments,
+                "inspection kind (content, recipe, or artifact)",
+            )?;
+            let workspace_path = workspace_path(&mut arguments, 1)?;
             let identity_text = required(&mut arguments, "identity")?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
@@ -305,7 +310,7 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             }
         }
         "materialize" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let workspace_path = workspace_path(&mut arguments, 2)?;
             let identity_text = required(&mut arguments, "Content ID")?;
             let destination = required(&mut arguments, "destination path")?;
             finished(&mut arguments)?;
@@ -323,7 +328,7 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             })?;
         }
         "pipeline" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let workspace_path = workspace_path(&mut arguments, 1)?;
             let expression = required(&mut arguments, "Tima pipeline expression")?;
             finished(&mut arguments)?;
             let source_name = "<command-line-pipeline>";
@@ -369,21 +374,10 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             })?;
         }
         "run" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let record_binding = take_record_option(&mut arguments)?;
+            let workspace_path = workspace_path(&mut arguments, 1)?;
             let script_path = required(&mut arguments, "Tima source path")?;
-            let record_binding = match arguments.next() {
-                None => None,
-                Some(option) if option == "--record" => {
-                    let binding = required(&mut arguments, "binding name after --record")?;
-                    finished(&mut arguments)?;
-                    Some(binding)
-                }
-                Some(argument) => {
-                    return Err(format!(
-                        "unexpected additional argument {argument:?}; expected --record <binding>"
-                    ));
-                }
-            };
+            finished(&mut arguments)?;
             let text = fs::read_to_string(&script_path)
                 .map_err(|error| format!("could not read {script_path}: {error}"))?;
             let diagnostic_source = SourceFile::new(script_path.clone(), text.clone());
@@ -463,7 +457,7 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             })?;
         }
         "replay" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let workspace_path = workspace_path(&mut arguments, 2)?;
             let script_path = required(&mut arguments, "Tima source path")?;
             let recipe_text = required(&mut arguments, "Recipe ID")?;
             finished(&mut arguments)?;
@@ -520,7 +514,7 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
             })?;
         }
         "trace" => {
-            let workspace_path = required(&mut arguments, "workspace path")?;
+            let workspace_path = workspace_path(&mut arguments, 1)?;
             let recipe_text = required(&mut arguments, "Recipe ID")?;
             finished(&mut arguments)?;
             let recipe = recipe_text
@@ -545,12 +539,57 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
     Ok(())
 }
 
-fn required(arguments: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
-    arguments.next().ok_or_else(|| format!("missing {name}"))
+fn workspace_path(
+    arguments: &mut VecDeque<String>,
+    required_arguments: usize,
+) -> Result<PathBuf, String> {
+    if arguments.len() > required_arguments {
+        return Ok(PathBuf::from(
+            arguments.pop_front().expect("argument length was checked"),
+        ));
+    }
+    let current = env::current_dir()
+        .map_err(|error| format!("could not determine the current directory: {error}"))?;
+    Workspace::find_nearest(&current).ok_or_else(|| {
+        format!(
+            "no Histima workspace found at {} or any ancestor; pass an explicit workspace path",
+            current.display()
+        )
+    })
 }
 
-fn finished(arguments: &mut impl Iterator<Item = String>) -> Result<(), String> {
-    if let Some(argument) = arguments.next() {
+fn take_record_option(arguments: &mut VecDeque<String>) -> Result<Option<String>, String> {
+    let Some(position) = arguments.iter().position(|argument| argument == "--record") else {
+        return Ok(None);
+    };
+    if arguments
+        .iter()
+        .skip(position + 1)
+        .any(|argument| argument == "--record")
+    {
+        return Err("--record may be supplied only once".to_owned());
+    }
+    if position + 2 != arguments.len() {
+        return Err("--record must follow the Tima source path and name one binding".to_owned());
+    }
+    let binding = arguments
+        .pop_back()
+        .expect("record option has a binding position");
+    let option = arguments
+        .pop_back()
+        .expect("record option position was found");
+    debug_assert_eq!(option, "--record");
+    Ok(Some(binding))
+}
+
+fn required(arguments: &mut VecDeque<String>, name: &str) -> Result<String, String> {
+    arguments
+        .pop_front()
+        .ok_or_else(|| format!("missing {name}"))
+}
+
+fn finished(arguments: &mut VecDeque<String>) -> Result<(), String> {
+    if let Some(argument) = arguments.pop_front() {
         return Err(format!("unexpected additional argument {argument:?}"));
     }
     Ok(())
@@ -559,19 +598,22 @@ fn finished(arguments: &mut impl Iterator<Item = String>) -> Result<(), String> 
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  histima [--json] <command> ...");
-    eprintln!("  histima init <workspace>");
-    eprintln!("  histima import <workspace> <source-file>");
-    eprintln!("  histima stats <workspace>");
-    eprintln!("  histima assets <workspace>");
-    eprintln!("  histima recipes <workspace>");
-    eprintln!("  histima inspect content <workspace> <content-id>");
-    eprintln!("  histima inspect recipe <workspace> <recipe-id>");
-    eprintln!("  histima inspect artifact <workspace> <artifact-or-bundle-id>");
-    eprintln!("  histima materialize <workspace> <content-id> <destination>");
-    eprintln!("  histima pipeline <workspace> <tima-expression>");
-    eprintln!("  histima run <workspace> <file.tima> [--record <binding>]");
-    eprintln!("  histima replay <workspace> <file.tima> <recipe-id>");
-    eprintln!("  histima trace <workspace> <recipe-id>");
+    eprintln!("  histima init [workspace]");
+    eprintln!("  histima import [workspace] <source-file>");
+    eprintln!("  histima stats [workspace]");
+    eprintln!("  histima assets [workspace]");
+    eprintln!("  histima recipes [workspace]");
+    eprintln!("  histima inspect content [workspace] <content-id>");
+    eprintln!("  histima inspect recipe [workspace] <recipe-id>");
+    eprintln!("  histima inspect artifact [workspace] <artifact-or-bundle-id>");
+    eprintln!("  histima materialize [workspace] <content-id> <destination>");
+    eprintln!("  histima pipeline [workspace] <tima-expression>");
+    eprintln!("  histima run [workspace] <file.tima> [--record <binding>]");
+    eprintln!("  histima replay [workspace] <file.tima> <recipe-id>");
+    eprintln!("  histima trace [workspace] <recipe-id>");
+    eprintln!(
+        "  omitted workspaces resolve to the nearest initialized workspace at or above the current directory"
+    );
     eprintln!("  --json may appear anywhere in the command");
 }
 

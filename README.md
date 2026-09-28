@@ -46,6 +46,14 @@ cargo run -p histima -- trace build/my-workspace <recipe-id>
 cargo run -p histima -- replay build/my-workspace examples/image_pipeline.tima <recipe-id>
 ```
 
+Every `[workspace]` argument is optional. When it is omitted, the CLI searches
+from the current directory toward the filesystem root and uses the nearest
+directory containing an initialized Histima catalog. An explicit workspace
+path always takes precedence. `histima init` still accepts an explicit path;
+when omitted inside an existing workspace, it resolves that workspace by the
+same rule. For example, after building the CLI, running
+`target/debug/histima stats` anywhere below `build/my-workspace` needs no path.
+
 Materialization verifies the stored Content ID, publishes through a temporary
 file, and refuses to replace an existing destination. Tima identities use one
 canonical durable text form: 64 lowercase hexadecimal characters.

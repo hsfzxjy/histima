@@ -26,6 +26,8 @@ use tima::runtime::{OuterValue, ValueData};
 use cas::{ContentKind, ContentStore};
 use catalog::{Catalog, validate_artifact_identities};
 
+const CATALOG_FILE_NAME: &str = "catalog.sqlite3";
+
 pub use catalog::{
     ArtifactBundleMember, ArtifactSummary, AssetSummary, CATALOG_LIST_LIMIT, CatalogInfo,
     CatalogPage, CatalogStats, NativeArtifactInfo, RecipeSummary,
@@ -110,12 +112,24 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Finds the nearest initialized Histima workspace at or above `start`.
+    ///
+    /// Discovery is read-only. A directory is an initialized workspace when
+    /// it contains the catalog created by [`Workspace::open`].
+    pub fn find_nearest(start: impl AsRef<Path>) -> Option<PathBuf> {
+        start
+            .as_ref()
+            .ancestors()
+            .find(|directory| directory.join(CATALOG_FILE_NAME).is_file())
+            .map(Path::to_owned)
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root)
             .map_err(|error| Error::io("create Histima workspace", &root, error))?;
         let content = ContentStore::open(&root)?;
-        let catalog = Catalog::open(&root.join("catalog.sqlite3"))?;
+        let catalog = Catalog::open(&root.join(CATALOG_FILE_NAME))?;
         Ok(Self {
             root,
             content,
@@ -488,6 +502,21 @@ mod tests {
             }
         );
         assert_eq!(workspace.catalog_stats().unwrap(), CatalogStats::default());
+    }
+
+    #[test]
+    fn finds_the_nearest_initialized_workspace_without_creating_one() {
+        let test = TestDirectory::new("workspace-discovery");
+        let outer = test.path().join("outer");
+        let inner = outer.join("projects/inner");
+        let nested = inner.join("assets/generated");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(Workspace::find_nearest(&nested), None);
+        drop(Workspace::open(&outer).unwrap());
+        assert_eq!(Workspace::find_nearest(&nested), Some(outer.clone()));
+        drop(Workspace::open(&inner).unwrap());
+        assert_eq!(Workspace::find_nearest(&nested), Some(inner));
     }
 
     #[test]

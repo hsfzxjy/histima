@@ -10,6 +10,44 @@ use tima::identity::byte_content_identity;
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn cli_defaults_to_the_nearest_ancestor_workspace() {
+    let test = TestDirectory::new();
+    let outer = test.path().join("outer");
+    let inner = outer.join("projects/inner");
+    let nested = inner.join("assets/generated");
+    let source = test.path().join("source.bin");
+    fs::write(&source, b"nearest workspace").unwrap();
+
+    let missing = histima_in(test.path(), ["stats"]);
+    assert!(!missing.status.success());
+    assert!(stderr(&missing).contains("no Histima workspace found"));
+
+    assert_success(&histima(["init", text(&outer)]));
+    assert_success(&histima(["init", text(&inner)]));
+    fs::create_dir_all(&nested).unwrap();
+
+    let initialized = histima_in(&nested, ["init"]);
+    assert_success(&initialized);
+    assert_eq!(
+        fs::canonicalize(field(&initialized, "workspace")).unwrap(),
+        fs::canonicalize(&inner).unwrap()
+    );
+
+    assert_success(&histima_in(&nested, ["import", text(&source)]));
+    let nearest_stats = histima_in(&nested, ["stats", "--json"]);
+    assert_success(&nearest_stats);
+    assert_eq!(json_output(&nearest_stats)["contents"], 1);
+
+    let outer_stats = histima(["stats", text(&outer), "--json"]);
+    assert_success(&outer_stats);
+    assert_eq!(json_output(&outer_stats)["contents"], 0);
+
+    let pipeline = histima_in(&nested, ["pipeline", "1 + 2", "--json"]);
+    assert_success(&pipeline);
+    assert_eq!(json_output(&pipeline)["result"]["value"], 3);
+}
+
+#[test]
 fn cli_imports_inspects_and_materializes_across_processes() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");
@@ -683,6 +721,14 @@ fn cli_pipeline_evaluates_one_expression_and_stocks_byte_results() {
 
 fn histima<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_histima"))
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
+fn histima_in<const N: usize>(directory: &Path, arguments: [&str; N]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_histima"))
+        .current_dir(directory)
         .args(arguments)
         .output()
         .unwrap()
