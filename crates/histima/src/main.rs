@@ -322,6 +322,52 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
                 println!("materialized = {}", destination.display());
             })?;
         }
+        "pipeline" => {
+            let workspace_path = required(&mut arguments, "workspace path")?;
+            let expression = required(&mut arguments, "Tima pipeline expression")?;
+            finished(&mut arguments)?;
+            let source_name = "<command-line-pipeline>";
+            let diagnostic_source = SourceFile::new(source_name, expression.clone());
+            let compiled = tima::compile(source_name, expression).map_err(|diagnostics| {
+                format!(
+                    "Tima pipeline expression was rejected:\n{}",
+                    render_diagnostics(&diagnostic_source, &diagnostics)
+                )
+            })?;
+            let mut workspace =
+                Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let result = workspace
+                .evaluate_pipeline(&compiled)
+                .map_err(|error| render_run_error(&compiled.source, error))?;
+            let stockable =
+                matches!(&result.value.data, ValueData::Bytes(_))
+                    && result.value.lineage.as_ref().is_some_and(|lineage| {
+                        matches!(lineage.node(), LineageNode::Invocation(_))
+                    });
+            let stocked = stockable
+                .then(|| workspace.record_value(&result.value))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            output.emit(cli_json::pipeline(&result, stocked.as_ref()), || {
+                println!("result_cache_hits = {}", result.result_cache.hits);
+                println!("result_cache_misses = {}", result.result_cache.misses);
+                println!("result_cache_stores = {}", result.result_cache.stores);
+                println!(
+                    "result_cache_invalidations = {}",
+                    result.result_cache.invalidations
+                );
+                println!("result = {}", display(&result.value));
+                println!("stocked = {}", stocked.is_some());
+                if let Some(stocked) = &stocked {
+                    println!("recipe_id = {}", stocked.recipe_id);
+                    println!("content_id = {}", stocked.content_id);
+                    println!("byte_length = {}", stocked.byte_len);
+                }
+                if let Some(lineage) = &result.value.lineage {
+                    println!("{}", lineage.render());
+                }
+            })?;
+        }
         "run" => {
             let workspace_path = required(&mut arguments, "workspace path")?;
             let script_path = required(&mut arguments, "Tima source path")?;
@@ -492,7 +538,7 @@ fn run(mut arguments: impl Iterator<Item = String>, output: OutputMode) -> Resul
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, assets, recipes, inspect, materialize, run, replay, or trace"
+                "unknown command `{command}`; expected init, import, stats, assets, recipes, inspect, materialize, pipeline, run, replay, or trace"
             ));
         }
     }
@@ -522,6 +568,7 @@ fn print_usage() {
     eprintln!("  histima inspect recipe <workspace> <recipe-id>");
     eprintln!("  histima inspect artifact <workspace> <artifact-or-bundle-id>");
     eprintln!("  histima materialize <workspace> <content-id> <destination>");
+    eprintln!("  histima pipeline <workspace> <tima-expression>");
     eprintln!("  histima run <workspace> <file.tima> [--record <binding>]");
     eprintln!("  histima replay <workspace> <file.tima> <recipe-id>");
     eprintln!("  histima trace <workspace> <recipe-id>");

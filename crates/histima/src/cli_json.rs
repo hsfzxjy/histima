@@ -2,8 +2,8 @@ use std::path::Path;
 
 use histima::{
     ArtifactInspection, AssetSummary, CatalogInfo, CatalogPage, CatalogStats, ContentInspection,
-    DurableTrace, ImportedAsset, NativeArtifactInfo, ProgramExecution, RecipeInspection,
-    RecipeReplay, RecipeSummary, RecordedResult,
+    DurableTrace, ImportedAsset, NativeArtifactInfo, PipelineExecution, ProgramExecution,
+    RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult,
 };
 use serde_json::{Map, Value, json};
 use tima::cache::CacheStats;
@@ -205,6 +205,19 @@ pub fn run(result: &ProgramExecution, recorded: Option<(&str, &RecordedResult)>)
     })
 }
 
+pub fn pipeline(result: &PipelineExecution, stocked: Option<&RecordedResult>) -> Value {
+    json!({
+        "result_cache": cache_stats(result.result_cache),
+        "result": outer_value(&result.value),
+        "stocked": stocked.map(|recorded| json!({
+            "recipe_id": recorded.recipe_id.to_string(),
+            "content_id": recorded.content_id.to_string(),
+            "byte_length": recorded.byte_len,
+        })),
+        "trace": result.value.lineage.as_ref().map(|lineage| lineage.render()),
+    })
+}
+
 pub fn replay(recipe_id: impl ToString, content_id: impl ToString, result: &RecipeReplay) -> Value {
     json!({
         "native_cache": native_cache(result.native_cache),
@@ -237,6 +250,7 @@ fn cache_stats(stats: CacheStats) -> Value {
         "hits": stats.hits,
         "misses": stats.misses,
         "stores": stats.stores,
+        "invalidations": stats.invalidations,
     })
 }
 

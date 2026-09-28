@@ -2,6 +2,7 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use tima::CompiledProgram;
+use tima::ast::Item;
 use tima::backend::NativeBackend;
 use tima::backend::c::CBackend;
 use tima::backend::native::{
@@ -35,6 +36,16 @@ pub struct RecipeReplay {
     pub result_cache: CacheStats,
 }
 
+/// Result of evaluating one command-line outer pipeline expression.
+///
+/// This path deliberately has no native artifact: declarations are rejected,
+/// so only the outer interpreter and versioned host transforms are involved.
+#[derive(Debug)]
+pub struct PipelineExecution {
+    pub value: OuterValue,
+    pub result_cache: CacheStats,
+}
+
 #[derive(Debug)]
 pub enum RunError {
     Storage(crate::Error),
@@ -42,9 +53,35 @@ pub enum RunError {
     NativeBuild(NativeBuildError),
     NativeLoad(NativeLoadError),
     Runtime(Vec<Diagnostic>),
+    InvalidPipeline(String),
 }
 
 impl Workspace {
+    /// Evaluates exactly one outer expression using workspace capabilities and
+    /// the durable Recipe cache, without compiling an empty native module.
+    pub fn evaluate_pipeline(
+        &self,
+        program: &CompiledProgram,
+    ) -> Result<PipelineExecution, RunError> {
+        if !matches!(program.syntax.items.as_slice(), [Item::Expression(_)]) {
+            return Err(RunError::InvalidPipeline(
+                "the pipeline command accepts exactly one expression; bindings, transform declarations, and multiple statements require a Tima source file"
+                    .to_owned(),
+            ));
+        }
+        let mut result_cache = WorkspaceResultCache::new(self);
+        let execution =
+            tima::runtime::execute_cached_with_capabilities(program, &mut result_cache, self)
+                .map_err(RunError::Runtime)?;
+        let value = execution.last_value.ok_or_else(|| {
+            RunError::InvalidPipeline("the pipeline expression produced no value".to_owned())
+        })?;
+        Ok(PipelineExecution {
+            value,
+            result_cache: result_cache.stats,
+        })
+    }
+
     /// Executes checked Tima through the generated-C backend with this
     /// workspace as the only host capability provider.
     pub fn execute(&self, program: &CompiledProgram) -> Result<ProgramExecution, RunError> {
@@ -217,6 +254,7 @@ impl fmt::Display for RunError {
                 "Tima execution failed with {} diagnostic(s)",
                 diagnostics.len()
             ),
+            Self::InvalidPipeline(message) => formatter.write_str(message),
         }
     }
 }
@@ -227,7 +265,7 @@ impl StdError for RunError {
             Self::Storage(error) => Some(error),
             Self::NativeBuild(error) => Some(error),
             Self::NativeLoad(error) => Some(error),
-            Self::CodeGeneration(_) | Self::Runtime(_) => None,
+            Self::CodeGeneration(_) | Self::Runtime(_) | Self::InvalidPipeline(_) => None,
         }
     }
 }

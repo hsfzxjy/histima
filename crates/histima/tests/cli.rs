@@ -621,6 +621,66 @@ fn cli_json_covers_the_workspace_lifecycle() {
     );
 }
 
+#[test]
+fn cli_pipeline_evaluates_one_expression_and_stocks_byte_results() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let source = test.path().join("source.ppm");
+    fs::write(&source, b"P3\n1 1\n255\n24 48 96\n").unwrap();
+    let source_locator = portable(&source);
+    let expression = format!("asset({source_locator:?}) | decode.ppm | encode.ppm");
+
+    assert_success(&histima(["init", text(&workspace)]));
+    assert_success(&histima(["import", text(&workspace), &source_locator]));
+
+    let first = histima(["pipeline", text(&workspace), &expression]);
+    assert_success(&first);
+    assert_eq!(field(&first, "result_cache_hits"), "0");
+    assert_eq!(field(&first, "stocked"), "true");
+    let recipe_id = field(&first, "recipe_id");
+    let content_id = field(&first, "content_id");
+    assert_canonical_identity(&recipe_id);
+    assert_canonical_identity(&content_id);
+    assert!(stdout(&first).contains("invoke decode.ppm"));
+    assert!(stdout(&first).contains("invoke encode.ppm"));
+
+    let stats = histima(["stats", text(&workspace), "--json"]);
+    assert_success(&stats);
+    let stats = json_output(&stats);
+    assert_eq!(stats["recipe_results"], 1);
+    assert_eq!(stats["native_artifact_bundles"], 0);
+    assert_eq!(stats["native_artifacts"], 0);
+
+    let second = histima(["--json", "pipeline", text(&workspace), &expression]);
+    assert_success(&second);
+    let second = json_output(&second);
+    assert_eq!(second["result"]["type"], "bytes");
+    assert_eq!(second["result_cache"]["hits"], 1);
+    assert_eq!(second["stocked"]["recipe_id"], recipe_id);
+    assert_eq!(second["stocked"]["content_id"], content_id);
+
+    let recipes = histima(["recipes", text(&workspace), "--json"]);
+    assert_success(&recipes);
+    let recipes = json_output(&recipes);
+    assert_eq!(recipes["count"], 1);
+    assert_eq!(recipes["recipes"][0]["recipe_id"], recipe_id);
+
+    let scalar = histima(["pipeline", text(&workspace), "1 + 2", "--json"]);
+    assert_success(&scalar);
+    let scalar = json_output(&scalar);
+    assert_eq!(scalar["result"]["type"], "i64");
+    assert_eq!(scalar["result"]["value"], 3);
+    assert_eq!(scalar["stocked"], Value::Null);
+
+    let binding = histima(["pipeline", text(&workspace), "value = 1"]);
+    assert!(!binding.status.success());
+    assert!(stderr(&binding).contains("accepts exactly one expression"));
+
+    let malformed = histima(["pipeline", text(&workspace), "asset("]);
+    assert!(!malformed.status.success());
+    assert!(stderr(&malformed).contains("<command-line-pipeline>:1"));
+}
+
 fn histima<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_histima"))
         .args(arguments)

@@ -40,6 +40,7 @@ cargo run -p histima -- init build/my-workspace
 cargo run -p histima -- import build/my-workspace examples/tiny.ppm
 cargo run -p histima -- stats build/my-workspace
 cargo run -p histima -- materialize build/my-workspace <content-id> output.ppm
+cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | decode.ppm | encode.webp(quality=85)'
 cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
 cargo run -p histima -- trace build/my-workspace <recipe-id>
 cargo run -p histima -- replay build/my-workspace examples/image_pipeline.tima <recipe-id>
@@ -56,6 +57,15 @@ existing output. `--record <binding>` persists an invocation-derived immutable
 byte value in the filesystem CAS, stores its Recipe-to-Content mapping and
 normalized semantic lineage in SQLite, and prints the durable identities.
 `histima trace` inspects the derivation after reopening the workspace.
+
+For one-off outer pipelines, `histima pipeline <workspace> <expression>` runs
+exactly one quoted Tima expression without requiring a source file or compiling
+an empty native module. It still uses catalog-only assets, host-transform
+lineage, and the durable Recipe cache. Invocation-derived byte results are
+automatically added to workspace stock, so a later process can reuse the same
+Recipe-to-Content result; scalar and image results remain ephemeral. Bindings,
+transform declarations, and multiple statements remain file-based through
+`histima run`. Add `--json` anywhere in either command for structured output.
 
 Raw imported blobs and typed Tima byte values intentionally use distinct
 Content ID domains even when their payload bytes match. The catalog records the

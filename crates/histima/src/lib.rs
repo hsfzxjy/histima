@@ -31,7 +31,7 @@ pub use catalog::{
     CatalogPage, CatalogStats, NativeArtifactInfo, RecipeSummary,
 };
 pub use error::{Error, Result};
-pub use runner::{ProgramExecution, RecipeReplay, RunError};
+pub use runner::{PipelineExecution, ProgramExecution, RecipeReplay, RunError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedAsset {
