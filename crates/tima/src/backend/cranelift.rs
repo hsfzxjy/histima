@@ -9,19 +9,22 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use object::write::{Object, StandardSection, Symbol, SymbolSection};
 use object::{Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope};
 
-use crate::abi::{ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_VALUE_BYTES, TIMA_ABI_VERSION};
+use crate::abi::{
+    ABI_IMAGE_HEIGHT_WORD, ABI_IMAGE_STRIDE_WORD, ABI_IMAGE_WIDTH_WORD, ABI_LENGTH_WORD,
+    ABI_POINTER_WORD, ABI_VALUE_BYTES, TIMA_ABI_VERSION,
+};
 use crate::ast::BinaryOp;
 use crate::backend::{ArtifactBackend, BackendArtifact};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Constant, Terminator, Transform, Type, TypedModule, ValueId, ValueKind};
 
-pub const CRANELIFT_BACKEND_VERSION: &str = "3";
+pub const CRANELIFT_BACKEND_VERSION: &str = "4";
 pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 
 /// Ahead-of-time native object generation from backend-neutral Tima IR.
 ///
 /// The initial slice accepts leaf transforms over scalars plus owned/view
-/// image identity, zero, and fill operations. Other typed IR is interpreted.
+/// image identity, zero, fill, and RGBA8 scaling. Other typed IR is interpreted.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CraneliftBackend;
 
@@ -179,11 +182,12 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
                 )
                 .with_note("the first native artifact slice accepts leaf transforms only"),
             ),
-            ValueKind::ImageZero { .. } | ValueKind::ImageFill { .. } => {}
+            ValueKind::ImageZero { .. }
+            | ValueKind::ImageFill { .. }
+            | ValueKind::ImageRgba8Scale { .. } => {}
             ValueKind::Constant(Constant::String(_))
             | ValueKind::ImageByteElement
             | ValueKind::ImageByteMap { .. }
-            | ValueKind::ImageRgba8Scale { .. }
             | ValueKind::RuntimeCall(_) => diagnostics.push(Diagnostic::error(
                 "operation is outside the initial Cranelift AOT subset",
                 value.span,
@@ -269,6 +273,17 @@ fn lower_transform(
                             image,
                             Some(required_scalar(&values, *value)),
                         );
+                        LoweredValue::Image(image)
+                    }
+                    ValueKind::ImageRgba8Scale { image, channels } => {
+                        let image = required_image(&values, *image);
+                        let channels = channels
+                            .iter()
+                            .map(|(channel, factor)| {
+                                (channel.offset(), required_scalar(&values, *factor))
+                            })
+                            .collect::<Vec<_>>();
+                        emit_image_rgba8_scale(&mut builder, image, &channels);
                         LoweredValue::Image(image)
                     }
                     _ => unreachable!("validation rejects unsupported operations"),
@@ -388,6 +403,93 @@ fn emit_image_fill(
     let one = builder.ins().iconst(types::I64, 1);
     let next = builder.ins().iadd(index, one);
     builder.ins().jump(header, &[next.into()]);
+
+    builder.switch_to_block(done);
+}
+
+fn emit_image_rgba8_scale(
+    builder: &mut FunctionBuilder<'_>,
+    image: [cranelift_codegen::ir::Value; 7],
+    channels: &[(usize, cranelift_codegen::ir::Value)],
+) {
+    let row_header = builder.create_block();
+    let pixel_header = builder.create_block();
+    let pixel_body = builder.create_block();
+    let next_row = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(row_header, types::I64);
+    builder.append_block_param(pixel_header, types::I64);
+    builder.append_block_param(pixel_header, types::I64);
+
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(row_header, &[zero.into()]);
+
+    builder.switch_to_block(row_header);
+    let row = builder.block_params(row_header)[0];
+    let rows_finished = builder.ins().icmp(
+        IntCC::UnsignedGreaterThanOrEqual,
+        row,
+        image[ABI_IMAGE_HEIGHT_WORD],
+    );
+    builder.ins().brif(
+        rows_finished,
+        done,
+        &[],
+        pixel_header,
+        &[row.into(), zero.into()],
+    );
+
+    builder.switch_to_block(pixel_header);
+    let row = builder.block_params(pixel_header)[0];
+    let column = builder.block_params(pixel_header)[1];
+    let pixels_finished = builder.ins().icmp(
+        IntCC::UnsignedGreaterThanOrEqual,
+        column,
+        image[ABI_IMAGE_WIDTH_WORD],
+    );
+    builder
+        .ins()
+        .brif(pixels_finished, next_row, &[], pixel_body, &[]);
+
+    builder.switch_to_block(pixel_body);
+    let row_offset = builder.ins().imul(row, image[ABI_IMAGE_STRIDE_WORD]);
+    let pixel_offset = builder.ins().imul_imm_u(column, 4);
+    let offset = builder.ins().iadd(row_offset, pixel_offset);
+    let pixel = builder.ins().iadd(image[ABI_POINTER_WORD], offset);
+    for (channel, factor) in channels {
+        let address = builder
+            .ins()
+            .iadd_imm_u(pixel, i64::try_from(*channel).unwrap());
+        let byte = builder
+            .ins()
+            .load(types::I8, MemFlagsData::new(), address, 0);
+        let byte = builder.ins().uextend(types::I32, byte);
+        let byte = builder.ins().fcvt_from_uint(types::F32, byte);
+        let scaled = builder.ins().fmul(byte, *factor);
+        let converted = builder.ins().fcvt_to_uint_sat(types::I32, scaled);
+        let converted = builder.ins().ireduce(types::I8, converted);
+        let float_zero = builder.ins().f32const(Ieee32::with_bits(0.0f32.to_bits()));
+        let positive = builder.ins().fcmp(FloatCC::GreaterThan, scaled, float_zero);
+        let maximum_float = builder
+            .ins()
+            .f32const(Ieee32::with_bits(255.0f32.to_bits()));
+        let saturated = builder
+            .ins()
+            .fcmp(FloatCC::GreaterThanOrEqual, scaled, maximum_float);
+        let maximum = builder.ins().iconst(types::I8, 255);
+        let zero = builder.ins().iconst(types::I8, 0);
+        let upper_bounded = builder.ins().select(saturated, maximum, converted);
+        let result = builder.ins().select(positive, upper_bounded, zero);
+        builder.ins().store(MemFlagsData::new(), result, address, 0);
+    }
+    let next_column = builder.ins().iadd_imm_u(column, 1);
+    builder
+        .ins()
+        .jump(pixel_header, &[row.into(), next_column.into()]);
+
+    builder.switch_to_block(next_row);
+    let next_row = builder.ins().iadd_imm_u(row, 1);
+    builder.ins().jump(row_header, &[next_row.into()]);
 
     builder.switch_to_block(done);
 }

@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::CompiledProgram;
+use crate::abi::{ABI_IMAGE_FORMAT_OPAQUE_BYTES, ABI_IMAGE_FORMAT_RGBA8};
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::cache::CachedArtifact;
 use crate::backend::native::{
@@ -113,8 +114,8 @@ impl Eq for ImageStorage {}
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ImageFormat {
-    OpaqueBytes = 0,
-    Rgba8 = 1,
+    OpaqueBytes = ABI_IMAGE_FORMAT_OPAQUE_BYTES,
+    Rgba8 = ABI_IMAGE_FORMAT_RGBA8,
 }
 
 impl ImageFormat {
@@ -1821,8 +1822,8 @@ fn prepare_native_argument(
 
 fn freeze_native_image(image: NativeImage) -> OuterValue {
     let format = match image.format {
-        0 => ImageFormat::OpaqueBytes,
-        1 => ImageFormat::Rgba8,
+        ABI_IMAGE_FORMAT_OPAQUE_BYTES => ImageFormat::OpaqueBytes,
+        ABI_IMAGE_FORMAT_RGBA8 => ImageFormat::Rgba8,
         _ => unreachable!("native image descriptors preserve validated input metadata"),
     };
     OuterValue::image(ImageValue {
@@ -2996,6 +2997,90 @@ mod tests {
         assert_eq!(filled.bytes(), &[7, 7, 7, 7]);
         assert!(!original.shares_storage_with(filled));
         assert!(original.shares_storage_with(viewed));
+    }
+
+    #[test]
+    fn native_rgba8_scaling_matches_interpreted_semantics() {
+        let compiled = crate::compile(
+            "native-rgba.tima",
+            "transform adjust(img: Image, r: f32, g: f32, b: f32, a: f32) -> Image {\n\
+                 for p in img.pixels {\n\
+                     p.r *= r\n\
+                     p.g *= g\n\
+                     p.b *= b\n\
+                     p.a *= a\n\
+                 }\n\
+                 return img\n\
+             }\n\
+             out = adjust(img, r, g, b, a)\n",
+        )
+        .unwrap();
+        let bindings = BTreeMap::from([
+            (
+                "img".to_owned(),
+                OuterValue::image(
+                    ImageValue::new_rgba8(
+                        2,
+                        2,
+                        10,
+                        vec![
+                            101, 200, 200, 1, 2, 3, 4, 5, 99, 100, 255, 10, 6, 10, 3, 4, 5, 6, 77,
+                            88,
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            ),
+            ("r".to_owned(), OuterValue::plain(ValueData::Float(0.5))),
+            ("g".to_owned(), OuterValue::plain(ValueData::Float(2.0))),
+            ("b".to_owned(), OuterValue::plain(ValueData::Float(-1.0))),
+            (
+                "a".to_owned(),
+                OuterValue::plain(ValueData::Float(f32::INFINITY)),
+            ),
+        ]);
+        let interpreted = execute_with(
+            &compiled,
+            &IrInterpreter {
+                module: &compiled.transforms,
+                capabilities: None,
+            },
+            bindings.clone(),
+            None,
+        )
+        .unwrap();
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join(format!("native-rgba-runtime-{}", std::process::id()));
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, root)
+            .unwrap()
+            .unwrap();
+        let native = execute_with(
+            &compiled,
+            &HybridAotEngine {
+                interpreter: IrInterpreter {
+                    module: &compiled.transforms,
+                    capabilities: None,
+                },
+                native: Some(&native),
+            },
+            bindings,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(native.bindings["out"], interpreted.bindings["out"]);
+        let ValueData::Image(result) = &native.bindings["out"].data else {
+            panic!("expected native RGBA8 image")
+        };
+        assert_eq!(
+            result.bytes(),
+            &[
+                50, 255, 0, 255, 1, 6, 0, 255, 99, 100, 127, 20, 0, 255, 1, 8, 0, 255, 77, 88,
+            ]
+        );
     }
 
     #[test]

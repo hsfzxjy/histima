@@ -22,6 +22,9 @@ pub const ABI_IMAGE_WIDTH_WORD: usize = 4;
 pub const ABI_IMAGE_HEIGHT_WORD: usize = 5;
 pub const ABI_IMAGE_STRIDE_WORD: usize = 6;
 
+pub const ABI_IMAGE_FORMAT_OPAQUE_BYTES: u32 = 0;
+pub const ABI_IMAGE_FORMAT_RGBA8: u32 = 1;
+
 pub const ABI_STATUS_OK: i32 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
