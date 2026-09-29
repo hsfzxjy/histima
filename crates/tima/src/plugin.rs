@@ -23,6 +23,15 @@ pub enum PluginValueType {
 }
 
 impl PluginValueType {
+    /// Stable spelling used by plugin manifests and inspection output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Rgba8Image => "rgba8-image",
+            Self::I64 => "i64",
+        }
+    }
+
     fn identity_tag(self) -> u8 {
         match self {
             Self::Bytes => 1,
@@ -37,6 +46,31 @@ impl PluginValueType {
 pub struct PluginParameter {
     pub name: String,
     pub value_type: PluginValueType,
+}
+
+/// Read-only metadata for one configured plugin transform.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginTransformInfo {
+    pub name: String,
+    pub semantic_version: u32,
+    pub abi_version: u32,
+    pub parameters: Vec<PluginParameter>,
+    pub result: PluginValueType,
+    pub transform_id: TransformIdentity,
+    pub artifact_id: ArtifactIdentity,
+    pub module_content_id: ContentIdentity,
+}
+
+impl PluginTransformInfo {
+    pub fn signature(&self) -> String {
+        let parameters = self
+            .parameters
+            .iter()
+            .map(|parameter| format!("{}: {}", parameter.name, parameter.value_type.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}({parameters}) -> {}", self.name, self.result.as_str())
+    }
 }
 
 /// Host-validated data needed to register one workspace-approved Wasm module.
@@ -148,10 +182,13 @@ impl PluginRegistry {
                     })?;
             transforms.push(PluginTransform {
                 name: definition.name,
+                semantic_version: definition.semantic_version,
+                abi_version: definition.abi_version,
                 parameters: definition.parameters,
                 result: definition.result,
                 identity,
                 artifact_identity,
+                module_content_identity: observed_content,
                 implementation,
             });
         }
@@ -185,14 +222,22 @@ impl PluginRegistry {
             .iter()
             .map(|transform| transform.artifact_identity)
     }
+
+    /// Returns configured transforms in stable name order.
+    pub fn transform_infos(&self) -> impl Iterator<Item = PluginTransformInfo> + '_ {
+        self.transforms.iter().map(PluginTransform::info)
+    }
 }
 
 pub(crate) struct PluginTransform {
     name: String,
+    semantic_version: u32,
+    abi_version: u32,
     parameters: Vec<PluginParameter>,
     result: PluginValueType,
     identity: TransformIdentity,
     artifact_identity: ArtifactIdentity,
+    module_content_identity: ContentIdentity,
     implementation: RegisteredWasmPlugin,
 }
 
@@ -207,6 +252,19 @@ impl PluginTransform {
 
     pub(crate) fn identity(&self) -> TransformIdentity {
         self.identity
+    }
+
+    fn info(&self) -> PluginTransformInfo {
+        PluginTransformInfo {
+            name: self.name.clone(),
+            semantic_version: self.semantic_version,
+            abi_version: self.abi_version,
+            parameters: self.parameters.clone(),
+            result: self.result,
+            transform_id: self.identity,
+            artifact_id: self.artifact_identity,
+            module_content_id: self.module_content_identity,
+        }
     }
 }
 

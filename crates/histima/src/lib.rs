@@ -23,7 +23,9 @@ use tima::identity::{
     byte_content_identity, source_identity,
 };
 use tima::lineage::{Lineage, LineageNode};
-use tima::plugin::{PluginDefinition, PluginParameter, PluginRegistry, PluginValueType};
+use tima::plugin::{
+    PluginDefinition, PluginParameter, PluginRegistry, PluginTransformInfo, PluginValueType,
+};
 use tima::runtime::{OuterValue, ValueData};
 
 use cas::{ContentKind, ContentStore};
@@ -521,6 +523,11 @@ impl Workspace {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Returns the workspace's configured plugin transforms in stable name order.
+    pub fn plugins(&self) -> Vec<PluginTransformInfo> {
+        self.plugins.transform_infos().collect()
     }
 
     pub fn compile_tima(

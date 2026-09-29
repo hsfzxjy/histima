@@ -192,7 +192,9 @@ Content ID accepted by `module_content`.
 Plugin transforms use ordinary call, pipeline, and `name#hash` syntax and
 participate in the same lineage, Recipe cache, trace, and replay behavior as
 built-ins. Histima does not search for, download, update, or grant ambient
-capabilities to plugins.
+capabilities to plugins. `histima plugins [workspace]` lists the configured
+contracts in stable name order, including each signature and its Transform,
+Artifact, and module Content IDs; add `--json` for machine-readable output.
 
 ## Storage, lineage, and identity
 

@@ -636,6 +636,33 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
         "[plugins]\nmanifests = [\"plugins/fixture.toml\"]\n",
     )
     .unwrap();
+    let artifact_id = tima::identity::registered_wasm_artifact_identity(transform_id, &module, 3);
+    let plugins = histima(["plugins", text(&workspace), "--json"]);
+    assert_success(&plugins);
+    let plugins = json_output(&plugins);
+    assert_eq!(plugins["count"], 1);
+    let plugin = &plugins["plugins"][0];
+    assert_eq!(plugin["name"], "fixture.encode");
+    assert_eq!(plugin["semantic_version"], 1);
+    assert_eq!(plugin["abi_version"], 3);
+    assert_eq!(plugin["transform_id"], transform_id.to_string());
+    assert_eq!(plugin["artifact_id"], artifact_id.to_string());
+    assert_eq!(plugin["module_content_id"], module_content.to_string());
+    assert_eq!(
+        plugin["signature"],
+        "fixture.encode(image: rgba8-image) -> bytes"
+    );
+    assert_eq!(plugin["parameters"][0]["name"], "image");
+    assert_eq!(plugin["parameters"][0]["type"], "rgba8-image");
+    assert_eq!(plugin["result"], "bytes");
+
+    let human_plugins = histima(["plugins", text(&workspace)]);
+    assert_success(&human_plugins);
+    assert_eq!(field(&human_plugins, "count"), "1");
+    assert_eq!(
+        field(&human_plugins, "plugin[0].signature"),
+        "fixture.encode(image: rgba8-image) -> bytes"
+    );
     fs::write(
         &script,
         format!(

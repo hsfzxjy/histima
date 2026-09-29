@@ -756,6 +756,14 @@ pipeline and `name#hash` syntax and the standard Recipe cache, lineage, trace,
 and replay rules. Replay requires the same semantic plugin definition to be
 available when the workspace is reopened.
 
+`histima plugins [workspace]` is the read-only inspection surface for the
+configured registry. It reports transforms in stable name order with the
+manifest semantic and ABI versions, ordered parameter/result signature,
+Transform ID, module-sensitive Artifact ID, and exact module Content ID.
+`--json` additionally exposes the parameters and result as structured fields.
+This command lists workspace-configured plugins, not the built-in transform
+registry.
+
 ## 12. Lineage, identity, caching, and replay
 
 ### 12.1 Derivation lineage

@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 use tima::cache::CacheStats;
 use tima::identity::SemanticValueIdentity;
 use tima::lineage::{LineageNode, RecordedValue};
+use tima::plugin::PluginTransformInfo;
 use tima::runtime::{OuterValue, ValueData};
 
 pub fn init(workspace: &Path, info: &CatalogInfo) -> Value {
@@ -64,6 +65,26 @@ pub fn recipes(page: &CatalogPage<RecipeSummary>) -> Value {
             "transform_name": recipe.transform_name,
             "content_id": recipe.content_id.to_string(),
             "byte_length": recipe.byte_len,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+pub fn plugins(plugins: &[PluginTransformInfo]) -> Value {
+    json!({
+        "count": plugins.len(),
+        "plugins": plugins.iter().map(|plugin| json!({
+            "name": plugin.name,
+            "semantic_version": plugin.semantic_version,
+            "abi_version": plugin.abi_version,
+            "transform_id": plugin.transform_id.to_string(),
+            "artifact_id": plugin.artifact_id.to_string(),
+            "module_content_id": plugin.module_content_id.to_string(),
+            "signature": plugin.signature(),
+            "parameters": plugin.parameters.iter().map(|parameter| json!({
+                "name": parameter.name,
+                "type": parameter.value_type.as_str(),
+            })).collect::<Vec<_>>(),
+            "result": plugin.result.as_str(),
         })).collect::<Vec<_>>(),
     })
 }

@@ -156,6 +156,30 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 }
             })?;
         }
+        "plugins" => {
+            let workspace_path = workspace_path(&mut arguments, 0)?;
+            finished(&mut arguments)?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let plugins = workspace.plugins();
+            output.emit(cli_json::plugins(&plugins), || {
+                println!("count = {}", plugins.len());
+                for (index, plugin) in plugins.iter().enumerate() {
+                    println!("plugin[{index}].name = {}", plugin.name);
+                    println!(
+                        "plugin[{index}].semantic_version = {}",
+                        plugin.semantic_version
+                    );
+                    println!("plugin[{index}].abi_version = {}", plugin.abi_version);
+                    println!("plugin[{index}].transform_id = {}", plugin.transform_id);
+                    println!("plugin[{index}].artifact_id = {}", plugin.artifact_id);
+                    println!(
+                        "plugin[{index}].module_content_id = {}",
+                        plugin.module_content_id
+                    );
+                    println!("plugin[{index}].signature = {}", plugin.signature());
+                }
+            })?;
+        }
         "inspect" => {
             let kind = required(
                 &mut arguments,
@@ -504,7 +528,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, assets, recipes, inspect, materialize, pipeline, run, replay, or trace"
+                "unknown command `{command}`; expected init, import, stats, assets, recipes, plugins, inspect, materialize, pipeline, run, replay, or trace"
             ));
         }
     }
@@ -587,6 +611,7 @@ fn print_usage() {
     eprintln!("  histima stats [workspace]");
     eprintln!("  histima assets [workspace]");
     eprintln!("  histima recipes [workspace]");
+    eprintln!("  histima plugins [workspace]");
     eprintln!("  histima inspect content [workspace] <content-id>");
     eprintln!("  histima inspect recipe [workspace] <recipe-id>");
     eprintln!("  histima inspect artifact [workspace] <artifact-or-bundle-id>");
