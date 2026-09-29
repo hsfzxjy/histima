@@ -29,7 +29,9 @@ tima -- emit-object program.tima`, or link and execute supported scalar and
 image transforms with `cargo run -p tima -- run-native program.tima`. The
 latter is a hybrid path: unsupported transforms remain interpreted. Its native
 ABI supports zero-copy immutable image views and ownership transfer for image
-identity, zero, fill, and RGBA8 channel-scaling operations. Histima still uses
+identity, zero, fill, byte-map, and RGBA8 channel-scaling operations. Supported
+inner transform calls are linked in the same artifact; a caller falls back to
+the interpreter when any transitive callee is unsupported. Histima still uses
 the interpreter while the remaining buffer operations and World callbacks are
 implemented.
 

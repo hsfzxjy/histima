@@ -548,7 +548,9 @@ interpreted. `bool`, `u8`, `i64`, and `f32` use word 0 with the scalar encoding
 defined by their type. An `Image` or `ImageView` uses words 0 through 6 for its
 data pointer, byte length, capacity, format, width, height, and row stride;
 views have zero capacity. Format tag 0 denotes opaque bytes and tag 1 denotes
-RGBA8. Word 7 is reserved. Status zero means success.
+RGBA8. Word 7 is reserved. Status zero means success; status 1 reports that an
+RGBA8 operation received another image format. Other nonzero statuses are
+reserved for later runtime failures.
 
 Before a native call, an owned `Image` is uniquely detached from immutable
 outer storage. Native code may mutate that allocation in place. A returned
@@ -768,19 +770,25 @@ load image with Clang, and executes supported transforms through the native ABI.
 `TIMA_CLANG` may select the Clang executable; otherwise the runtime uses the
 standard LLVM installation on Windows or `clang` from `PATH`.
 
-The implemented subset is deliberately limited to leaf transforms. Scalar
-parameters and results may be `bool`, `u8`, `i64`, or `f32`, and their bodies
-may use scalar constants, comparisons, control flow, and `f32` arithmetic.
-`Image` and `ImageView` may cross the descriptor boundary; identity returns and
-the owned `image_zero`, `image_fill`, and RGBA8 channel-scaling operations are
-compiled. Native RGBA8 operations validate the runtime format before generated
-code executes and preserve the scalar conversion and row-padding semantics in
-section 8.5. Checked `i64` arithmetic, transform calls, byte-map loops, String
-and Bytes values, newly allocated native results, and World calls are not
-compiled. The hybrid `run-native` path interprets unsupported transforms
-instead, without changing lineage or Recipe identity. Histima product execution
-remains interpreted while the remaining buffer operations and World callbacks
-are implemented.
+The implemented subset admits scalar parameters and results of `bool`, `u8`,
+`i64`, or `f32`; scalar constants, comparisons, control flow, and `f32`
+arithmetic; and direct calls whose complete callee closure is native-compatible.
+Calls marshal the same fixed descriptors through native stack storage, forward
+the runtime context, and propagate failure status to the outermost invocation.
+
+`Image` and `ImageView` may cross the descriptor boundary. Identity returns,
+owned `image_zero` and `image_fill`, byte-map loops, and RGBA8 channel scaling
+are compiled. Native byte maps evaluate their typed scalar instruction sequence
+once per storage byte, including calls. Native RGBA8 operations validate the
+runtime format before addressing pixels and preserve the scalar conversion and
+row-padding semantics in section 8.5.
+
+Checked `i64` arithmetic, String and Bytes values, newly allocated native
+results, and World calls are not compiled. A transform also remains interpreted
+when any transitive callee uses unsupported behavior. The hybrid `run-native`
+path makes that decision per outer invocation without changing lineage or
+Recipe identity. Histima product execution remains interpreted while the
+remaining buffer operations and World callbacks are implemented.
 
 Native artifacts are cached independently using Artifact IDs derived from the
 Transform ID plus the Cranelift/compiler version, target, inferred CPU feature

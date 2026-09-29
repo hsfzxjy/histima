@@ -3084,6 +3084,77 @@ mod tests {
     }
 
     #[test]
+    fn native_byte_map_calls_match_interpreted_semantics() {
+        let compiled = crate::compile(
+            "native-byte-map.tima",
+            "transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
+                 if current == target { return replacement } else { return current }\n\
+             }\n\
+             transform replace(img: Image, target: u8, replacement: u8) -> Image {\n\
+                 for byte in img.bytes { byte = choose(byte, target, replacement) }\n\
+                 return img\n\
+             }\n\
+             out = replace(img, target, replacement)\n",
+        )
+        .unwrap();
+        let bindings = BTreeMap::from([
+            (
+                "img".to_owned(),
+                OuterValue::image(ImageValue::new(3, 2, 4, vec![1, 2, 1, 8, 3, 1, 4, 1]).unwrap()),
+            ),
+            (
+                "target".to_owned(),
+                OuterValue::plain(ValueData::Integer(1)),
+            ),
+            (
+                "replacement".to_owned(),
+                OuterValue::plain(ValueData::Integer(9)),
+            ),
+        ]);
+        let interpreted = execute_with(
+            &compiled,
+            &IrInterpreter {
+                module: &compiled.transforms,
+                capabilities: None,
+            },
+            bindings.clone(),
+            None,
+        )
+        .unwrap();
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join(format!("native-byte-map-runtime-{}", std::process::id()));
+        let native_module = NativeModule::build(&compiled.transforms, &compiled.identities, root)
+            .unwrap()
+            .unwrap();
+        let native = execute_with(
+            &compiled,
+            &HybridAotEngine {
+                interpreter: IrInterpreter {
+                    module: &compiled.transforms,
+                    capabilities: None,
+                },
+                native: Some(&native_module),
+            },
+            bindings,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(native.bindings["out"], interpreted.bindings["out"]);
+        let ValueData::Image(original) = &native.bindings["img"].data else {
+            panic!("expected original byte image")
+        };
+        let ValueData::Image(result) = &native.bindings["out"].data else {
+            panic!("expected native byte-map image")
+        };
+        assert_eq!(original.bytes(), &[1, 2, 1, 8, 3, 1, 4, 1]);
+        assert_eq!(result.bytes(), &[9, 2, 9, 8, 3, 9, 4, 9]);
+    }
+
+    #[test]
     fn validates_outer_image_layouts() {
         let error = ImageValue::new(2, 2, 2, vec![0; 3]).unwrap_err();
         assert!(error.to_string().contains("require 4"));

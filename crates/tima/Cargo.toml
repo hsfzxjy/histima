@@ -14,7 +14,9 @@ path = "src/main.rs"
 [dependencies]
 cranelift-codegen = "=0.136.1"
 cranelift-frontend = "=0.136.1"
+cranelift-module = "=0.136.1"
 cranelift-native = "=0.136.1"
+cranelift-object = "=0.136.1"
 libloading = "=0.8.9"
 object = { version = "=0.40.0", default-features = false, features = ["read", "write", "std", "coff", "elf", "macho", "pe"] }
 png = "=0.18.1"

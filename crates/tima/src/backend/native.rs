@@ -7,16 +7,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use libloading::Library;
 
 use crate::abi::{
-    ABI_CAPACITY_WORD, ABI_IMAGE_FORMAT_OPAQUE_BYTES, ABI_IMAGE_FORMAT_RGBA8,
-    ABI_IMAGE_FORMAT_WORD, ABI_IMAGE_HEIGHT_WORD, ABI_IMAGE_STRIDE_WORD, ABI_IMAGE_WIDTH_WORD,
-    ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_OK, AbiValue,
+    ABI_CAPACITY_WORD, ABI_IMAGE_FORMAT_WORD, ABI_IMAGE_HEIGHT_WORD, ABI_IMAGE_STRIDE_WORD,
+    ABI_IMAGE_WIDTH_WORD, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_IMAGE_FORMAT,
+    ABI_STATUS_OK, AbiValue,
 };
 use crate::backend::ArtifactBackend;
 use crate::backend::cache::{CachedArtifact, NativeArtifactCache};
 use crate::backend::cranelift::CraneliftBackend;
 use crate::diagnostic::Diagnostic;
 use crate::identity::TransformIdentities;
-use crate::ir::{Transform, TransformId, Type, TypedModule, ValueId, ValueKind};
+use crate::ir::{TransformId, Type, TypedModule, ValueKind};
 use crate::source::Span;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(0);
@@ -153,7 +153,7 @@ fn image_value(
 struct NativeSignature {
     parameters: Vec<Type>,
     result: Type,
-    rgba8_requirements: Vec<(usize, Span)>,
+    rgba8_failure_span: Option<Span>,
     span: Span,
 }
 
@@ -177,20 +177,37 @@ impl NativeModule {
         identities: &TransformIdentities,
         cache_root: impl AsRef<Path>,
     ) -> Result<Option<Self>, Vec<Diagnostic>> {
+        let supported = CraneliftBackend::supported_transforms(module);
         let selected = module
             .transforms
             .iter()
             .enumerate()
-            .filter(|(_, transform)| CraneliftBackend::supports_transform(transform))
+            .filter(|(index, _)| supported[*index])
             .collect::<Vec<_>>();
         if selected.is_empty() {
             return Ok(None);
         }
 
+        let mut native_ids = vec![None; module.transforms.len()];
+        for (native_index, (original_index, _)) in selected.iter().enumerate() {
+            native_ids[*original_index] = Some(TransformId(native_index as u32));
+        }
         let selected_module = TypedModule {
             transforms: selected
                 .iter()
-                .map(|(_, transform)| (*transform).clone())
+                .map(|(_, transform)| {
+                    let mut transform = (*transform).clone();
+                    for value in &mut transform.values {
+                        if let ValueKind::Call {
+                            transform: callee, ..
+                        } = &mut value.kind
+                        {
+                            *callee = native_ids[callee.0 as usize]
+                                .expect("native callers have native callees");
+                        }
+                    }
+                    transform
+                })
                 .collect(),
         };
         let generated = CraneliftBackend.emit(&selected_module)?;
@@ -244,7 +261,11 @@ impl NativeModule {
                     .map(|parameter| parameter.ty)
                     .collect(),
                 result: transform.return_type,
-                rgba8_requirements: rgba8_requirements(transform),
+                rgba8_failure_span: reachable_rgba8_span(
+                    module,
+                    TransformId(*original_index as u32),
+                    &mut vec![false; module.transforms.len()],
+                ),
                 span: transform.span,
             });
         }
@@ -318,22 +339,6 @@ impl NativeModule {
                 ));
             }
         }
-        for (index, span) in &signature.rgba8_requirements {
-            let NativeArgument::Image(image) = &arguments[*index] else {
-                unreachable!("RGBA8 operations consume an owned image parameter")
-            };
-            if image.format != ABI_IMAGE_FORMAT_RGBA8 {
-                let received = match image.format {
-                    ABI_IMAGE_FORMAT_OPAQUE_BYTES => "opaque-bytes".to_owned(),
-                    format => format!("unknown format tag {format}"),
-                };
-                return Err(Diagnostic::error(
-                    "image pixel iteration requires RGBA8 format",
-                    *span,
-                )
-                .with_note(format!("received {received} image storage")));
-            }
-        }
         let encoded = arguments
             .iter()
             .map(|argument| argument.encode())
@@ -346,6 +351,12 @@ impl NativeModule {
         // signature, borrowed buffers outlive the call, and the library handle
         // outlives this copied function pointer.
         let status = unsafe { entry(std::ptr::null_mut(), encoded.as_ptr(), &mut result) };
+        if status == ABI_STATUS_IMAGE_FORMAT {
+            return Err(Diagnostic::error(
+                "image pixel iteration requires RGBA8 format",
+                signature.rgba8_failure_span.unwrap_or(signature.span),
+            ));
+        }
         if status != ABI_STATUS_OK {
             return Err(Diagnostic::error(
                 format!("native transform returned ABI status {status}"),
@@ -382,35 +393,26 @@ impl NativeModule {
     }
 }
 
-fn rgba8_requirements(transform: &Transform) -> Vec<(usize, Span)> {
-    let mut requirements = Vec::new();
-    for value in &transform.values {
-        let ValueKind::ImageRgba8Scale { image, .. } = value.kind else {
-            continue;
-        };
-        let parameter = owned_image_parameter(transform, image)
-            .expect("supported native image operations originate at an owned parameter");
-        if !requirements
-            .iter()
-            .any(|(existing, _)| *existing == parameter)
-        {
-            requirements.push((parameter, value.span));
-        }
+fn reachable_rgba8_span(
+    module: &TypedModule,
+    id: TransformId,
+    visiting: &mut [bool],
+) -> Option<Span> {
+    let index = id.0 as usize;
+    if visiting[index] {
+        return None;
     }
-    requirements
-}
-
-fn owned_image_parameter(transform: &Transform, mut value: ValueId) -> Option<usize> {
-    loop {
-        match &transform.value(value).kind {
-            ValueKind::Parameter { index } => return usize::try_from(*index).ok(),
-            ValueKind::ImageZero { image }
-            | ValueKind::ImageFill { image, .. }
-            | ValueKind::ImageByteMap { image, .. }
-            | ValueKind::ImageRgba8Scale { image, .. } => value = *image,
-            _ => return None,
-        }
-    }
+    visiting[index] = true;
+    let transform = module.get(id);
+    let span = transform.values.iter().find_map(|value| match &value.kind {
+        ValueKind::ImageRgba8Scale { .. } => Some(value.span),
+        ValueKind::Call {
+            transform: callee, ..
+        } => reachable_rgba8_span(module, *callee, visiting),
+        _ => None,
+    });
+    visiting[index] = false;
+    span
 }
 
 fn link_load_image(object_path: &Path, export_count: usize) -> Result<PathBuf, Diagnostic> {
@@ -621,11 +623,14 @@ mod tests {
     }
 
     #[test]
-    fn selects_supported_leaf_transforms_and_leaves_fallbacks_absent() {
+    fn selects_supported_transforms_and_leaves_fallbacks_absent() {
         let compiled = crate::compile(
             "hybrid.tima",
             "transform scale(value: f32, factor: f32) -> f32 { return value * factor }\n\
-             transform checked(left: i64, right: i64) -> i64 { return left + right }\n",
+             transform checked(left: i64, right: i64) -> i64 { return left + right }\n\
+             transform checked_wrapper(left: i64, right: i64) -> i64 {\n\
+                 return checked(left, right)\n\
+             }\n",
         )
         .unwrap();
         let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
@@ -633,6 +638,85 @@ mod tests {
             .unwrap();
         assert!(native.contains(TransformId(0)));
         assert!(!native.contains(TransformId(1)));
+        assert!(!native.contains(TransformId(2)));
+    }
+
+    #[test]
+    fn links_native_calls_and_maps_image_bytes_through_a_scalar_callee() {
+        let compiled = crate::compile(
+            "calls.tima",
+            "transform checked(left: i64, right: i64) -> i64 { return left + right }\n\
+             transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
+                 if current == target { return replacement } else { return current }\n\
+             }\n\
+             transform replace(img: Image, target: u8, replacement: u8) -> Image {\n\
+                 for byte in img.bytes { byte = choose(byte, target, replacement) }\n\
+                 return img\n\
+             }\n\
+             transform choose_once(current: u8, target: u8, replacement: u8) -> u8 {\n\
+                 return choose(current, target, replacement)\n\
+             }\n\
+             transform clear(img: Image) -> Image { return image_zero(img) }\n\
+             transform clear_through_call(img: Image) -> Image { return clear(img) }\n",
+        )
+        .unwrap();
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
+            .unwrap()
+            .unwrap();
+        assert!(!native.contains(TransformId(0)));
+        for id in 1..=5 {
+            assert!(native.contains(TransformId(id)));
+        }
+
+        let mut image = NativeImage {
+            bytes: vec![1, 2, 1, 3],
+            format: ABI_IMAGE_FORMAT_OPAQUE_BYTES,
+            width: 2,
+            height: 2,
+            stride: 2,
+        };
+        {
+            let mut arguments = [
+                NativeArgument::Image(&mut image),
+                NativeArgument::Scalar(NativeScalar::U8(1)),
+                NativeArgument::Scalar(NativeScalar::U8(9)),
+            ];
+            assert_eq!(
+                native.invoke(TransformId(2), &mut arguments).unwrap(),
+                NativeResult::OwnedImageArgument(0)
+            );
+        }
+        assert_eq!(image.bytes, vec![9, 2, 9, 3]);
+
+        assert_eq!(
+            native
+                .invoke_scalars(
+                    TransformId(3),
+                    &[
+                        NativeScalar::U8(4),
+                        NativeScalar::U8(4),
+                        NativeScalar::U8(7),
+                    ],
+                )
+                .unwrap(),
+            NativeScalar::U8(7)
+        );
+
+        let mut image = NativeImage {
+            bytes: vec![8, 7, 6, 5],
+            format: ABI_IMAGE_FORMAT_OPAQUE_BYTES,
+            width: 2,
+            height: 2,
+            stride: 2,
+        };
+        {
+            let mut arguments = [NativeArgument::Image(&mut image)];
+            assert_eq!(
+                native.invoke(TransformId(5), &mut arguments).unwrap(),
+                NativeResult::OwnedImageArgument(0)
+            );
+        }
+        assert_eq!(image.bytes, vec![0, 0, 0, 0]);
     }
 
     #[test]
@@ -650,6 +734,14 @@ mod tests {
                      p.a *= a\n\
                  }\n\
                  return img\n\
+             }\n\
+             transform adjust_through_call(img: Image, factor: f32) -> Image {\n\
+                 return adjust(img, factor, factor, factor, factor)\n\
+             }\n\
+             transform prepare_and_adjust(img: Image, factor: f32) -> Image {\n\
+                 prepared = zero(img)\n\
+                 for p in prepared.pixels { p.r *= factor }\n\
+                 return prepared\n\
              }\n",
         )
         .unwrap();
@@ -745,6 +837,34 @@ mod tests {
             NativeArgument::Scalar(NativeScalar::F32(1.0)),
         ];
         let error = native.invoke(TransformId(3), &mut arguments).unwrap_err();
+        assert!(error.message.contains("requires RGBA8 format"));
+
+        let mut opaque = NativeImage {
+            bytes: vec![1, 2, 3, 4],
+            format: ABI_IMAGE_FORMAT_OPAQUE_BYTES,
+            width: 1,
+            height: 1,
+            stride: 4,
+        };
+        let mut arguments = [
+            NativeArgument::Image(&mut opaque),
+            NativeArgument::Scalar(NativeScalar::F32(0.5)),
+        ];
+        let error = native.invoke(TransformId(4), &mut arguments).unwrap_err();
+        assert!(error.message.contains("requires RGBA8 format"));
+
+        let mut opaque = NativeImage {
+            bytes: vec![1, 2, 3, 4],
+            format: ABI_IMAGE_FORMAT_OPAQUE_BYTES,
+            width: 1,
+            height: 1,
+            stride: 4,
+        };
+        let mut arguments = [
+            NativeArgument::Image(&mut opaque),
+            NativeArgument::Scalar(NativeScalar::F32(0.5)),
+        ];
+        let error = native.invoke(TransformId(5), &mut arguments).unwrap_err();
         assert!(error.message.contains("requires RGBA8 format"));
     }
 

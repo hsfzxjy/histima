@@ -26,6 +26,7 @@ pub const ABI_IMAGE_FORMAT_OPAQUE_BYTES: u32 = 0;
 pub const ABI_IMAGE_FORMAT_RGBA8: u32 = 1;
 
 pub const ABI_STATUS_OK: i32 = 0;
+pub const ABI_STATUS_IMAGE_FORMAT: i32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ownership {
