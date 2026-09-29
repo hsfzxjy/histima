@@ -66,7 +66,7 @@ pub enum RecordedValue {
     Bool(bool),
     Integer(i64),
     Float(f32),
-    String(Arc<str>),
+    String(Arc<String>),
     Materialized {
         kind: &'static str,
         content_id: ContentIdentity,

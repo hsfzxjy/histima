@@ -73,6 +73,16 @@ pub(crate) struct NativeImage {
     pub stride: usize,
 }
 
+#[derive(Debug)]
+pub(crate) struct NativeBuffer {
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeBufferView<'a> {
+    pub bytes: &'a [u8],
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeImageView<'a> {
     pub bytes: &'a [u8],
@@ -84,6 +94,10 @@ pub(crate) struct NativeImageView<'a> {
 
 pub(crate) enum NativeArgument<'a> {
     Scalar(NativeScalar),
+    String(&'a mut NativeBuffer),
+    StringView(NativeBufferView<'a>),
+    Bytes(&'a mut NativeBuffer),
+    BytesView(NativeBufferView<'a>),
     Image(&'a mut NativeImage),
     ImageView(NativeImageView<'a>),
 }
@@ -92,6 +106,10 @@ impl NativeArgument<'_> {
     fn ty(&self) -> Type {
         match self {
             Self::Scalar(value) => value.ty(),
+            Self::String(_) => Type::String,
+            Self::StringView(_) => Type::StringView,
+            Self::Bytes(_) => Type::Bytes,
+            Self::BytesView(_) => Type::BytesView,
             Self::Image(_) => Type::Image,
             Self::ImageView(_) => Type::ImageView,
         }
@@ -100,6 +118,14 @@ impl NativeArgument<'_> {
     fn encode(&self) -> AbiValue {
         match self {
             Self::Scalar(value) => value.encode(),
+            Self::String(buffer) | Self::Bytes(buffer) => buffer_value(
+                buffer.bytes.as_ptr(),
+                buffer.bytes.len(),
+                buffer.bytes.capacity(),
+            ),
+            Self::StringView(buffer) | Self::BytesView(buffer) => {
+                buffer_value(buffer.bytes.as_ptr(), buffer.bytes.len(), 0)
+            }
             Self::Image(image) => image_value(
                 image.bytes.as_ptr(),
                 image.bytes.len(),
@@ -125,8 +151,20 @@ impl NativeArgument<'_> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum NativeResult {
     Scalar(NativeScalar),
+    OwnedStringArgument(usize),
+    StringViewArgument(usize),
+    OwnedBytesArgument(usize),
+    BytesViewArgument(usize),
     OwnedImageArgument(usize),
     ImageViewArgument(usize),
+}
+
+fn buffer_value(pointer: *const u8, length: usize, capacity: usize) -> AbiValue {
+    let mut value = AbiValue::default();
+    value.words[ABI_POINTER_WORD] = pointer as usize as u64;
+    value.words[ABI_LENGTH_WORD] = length as u64;
+    value.words[ABI_CAPACITY_WORD] = capacity as u64;
+    value
 }
 
 fn image_value(
@@ -377,6 +415,18 @@ impl NativeModule {
                 continue;
             }
             return match (signature.result, argument) {
+                (Type::String, NativeArgument::String(_)) => {
+                    Ok(NativeResult::OwnedStringArgument(index))
+                }
+                (Type::StringView, NativeArgument::StringView(_)) => {
+                    Ok(NativeResult::StringViewArgument(index))
+                }
+                (Type::Bytes, NativeArgument::Bytes(_)) => {
+                    Ok(NativeResult::OwnedBytesArgument(index))
+                }
+                (Type::BytesView, NativeArgument::BytesView(_)) => {
+                    Ok(NativeResult::BytesViewArgument(index))
+                }
                 (Type::Image, NativeArgument::Image(_)) => {
                     Ok(NativeResult::OwnedImageArgument(index))
                 }
@@ -387,7 +437,7 @@ impl NativeModule {
             };
         }
         Err(Diagnostic::error(
-            "native transform returned an image descriptor that does not identify a compatible input",
+            "native transform returned a descriptor that does not identify a compatible input",
             signature.span,
         ))
     }
@@ -533,7 +583,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        NativeArgument, NativeImage, NativeImageView, NativeModule, NativeResult, NativeScalar,
+        NativeArgument, NativeBuffer, NativeBufferView, NativeImage, NativeImageView, NativeModule,
+        NativeResult, NativeScalar,
     };
     use crate::abi::{ABI_IMAGE_FORMAT_OPAQUE_BYTES, ABI_IMAGE_FORMAT_RGBA8};
     use crate::backend::cache::ArtifactCacheStatus;
@@ -620,6 +671,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cached.artifact().status, ArtifactCacheStatus::Hit);
+    }
+
+    #[test]
+    fn passes_owned_and_view_strings_and_bytes_without_descriptor_copies() {
+        let compiled = crate::compile(
+            "buffers.tima",
+            "transform text(value: String) -> String { return value }\n\
+             transform text_call(value: String) -> String { return text(value) }\n\
+             transform text_view(value: StringView) -> StringView { return value }\n\
+             transform bytes(value: Bytes) -> Bytes { return value }\n\
+             transform bytes_call(value: Bytes) -> Bytes { return bytes(value) }\n\
+             transform bytes_view(value: BytesView) -> BytesView { return value }\n",
+        )
+        .unwrap();
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
+            .unwrap()
+            .unwrap();
+
+        let mut text = NativeBuffer {
+            bytes: "hello".as_bytes().to_vec(),
+        };
+        let text_pointer = text.bytes.as_ptr();
+        let mut arguments = [NativeArgument::String(&mut text)];
+        assert_eq!(
+            native.invoke(TransformId(1), &mut arguments).unwrap(),
+            NativeResult::OwnedStringArgument(0)
+        );
+        assert_eq!(text.bytes.as_ptr(), text_pointer);
+
+        let text = "view";
+        let mut arguments = [NativeArgument::StringView(NativeBufferView {
+            bytes: text.as_bytes(),
+        })];
+        assert_eq!(
+            native.invoke(TransformId(2), &mut arguments).unwrap(),
+            NativeResult::StringViewArgument(0)
+        );
+
+        let mut bytes = NativeBuffer {
+            bytes: vec![1, 2, 3, 4],
+        };
+        let bytes_pointer = bytes.bytes.as_ptr();
+        let mut arguments = [NativeArgument::Bytes(&mut bytes)];
+        assert_eq!(
+            native.invoke(TransformId(4), &mut arguments).unwrap(),
+            NativeResult::OwnedBytesArgument(0)
+        );
+        assert_eq!(bytes.bytes.as_ptr(), bytes_pointer);
+
+        let bytes = [9, 8, 7];
+        let mut arguments = [NativeArgument::BytesView(NativeBufferView {
+            bytes: &bytes,
+        })];
+        assert_eq!(
+            native.invoke(TransformId(5), &mut arguments).unwrap(),
+            NativeResult::BytesViewArgument(0)
+        );
     }
 
     #[test]

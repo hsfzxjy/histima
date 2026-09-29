@@ -19,13 +19,14 @@ use crate::backend::{ArtifactBackend, BackendArtifact};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Constant, Terminator, Transform, Type, TypedModule, ValueId, ValueKind};
 
-pub const CRANELIFT_BACKEND_VERSION: &str = "5";
+pub const CRANELIFT_BACKEND_VERSION: &str = "6";
 pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 
 /// Ahead-of-time native object generation from backend-neutral Tima IR.
 ///
-/// The initial slice accepts scalar and owned/view image transforms, including
-/// native calls, byte maps, and RGBA8 scaling. Other typed IR is interpreted.
+/// The initial slice accepts scalar and owned/view buffer and image transforms,
+/// including native calls, byte maps, and RGBA8 scaling. Other typed IR is
+/// interpreted.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CraneliftBackend;
 
@@ -220,7 +221,9 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
                 ),
                 transform.span,
             )
-            .with_note("supported boundary types are bool, u8, i64, f32, Image, and ImageView"),
+            .with_note(
+                "supported boundary types are bool, u8, i64, f32, String, StringView, Bytes, BytesView, Image, and ImageView",
+            ),
         );
         return diagnostics;
     }
@@ -427,6 +430,7 @@ fn native_signature(module: &ObjectModule) -> Signature {
 #[derive(Clone, Copy)]
 enum LoweredValue {
     Scalar(cranelift_codegen::ir::Value),
+    Buffer([cranelift_codegen::ir::Value; 3]),
     Image([cranelift_codegen::ir::Value; 7]),
 }
 
@@ -452,6 +456,25 @@ fn load_abi_value(
             pointer,
             base,
         ));
+    }
+    let load_words = |builder: &mut FunctionBuilder<'_>, count: usize| {
+        (0..count)
+            .map(|word| {
+                builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    pointer,
+                    base + i32::try_from(word * 8).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if matches!(
+        ty,
+        Type::String | Type::StringView | Type::Bytes | Type::BytesView
+    ) {
+        let words = load_words(builder, 3);
+        return LoweredValue::Buffer(words.try_into().unwrap());
     }
     debug_assert!(matches!(ty, Type::Image | Type::ImageView));
     LoweredValue::Image(std::array::from_fn(|word| {
@@ -483,6 +506,16 @@ fn store_abi_value(
             builder
                 .ins()
                 .store(MemFlagsData::new(), value, pointer, base);
+        }
+        LoweredValue::Buffer(words) => {
+            for (word, value) in words.into_iter().enumerate() {
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    pointer,
+                    base + i32::try_from(word * 8).unwrap(),
+                );
+            }
         }
         LoweredValue::Image(words) => {
             for (word, value) in words.into_iter().enumerate() {
@@ -838,7 +871,16 @@ fn scalar_type(ty: Type) -> bool {
 }
 
 fn native_boundary_type(ty: Type) -> bool {
-    scalar_type(ty) || matches!(ty, Type::Image | Type::ImageView)
+    scalar_type(ty)
+        || matches!(
+            ty,
+            Type::String
+                | Type::StringView
+                | Type::Bytes
+                | Type::BytesView
+                | Type::Image
+                | Type::ImageView
+        )
 }
 
 fn clif_type(ty: Type) -> cranelift_codegen::ir::Type {
@@ -955,18 +997,18 @@ mod tests {
             .unwrap_err();
         assert!(diagnostics[0].message.contains("checked i64 arithmetic"));
 
-        let unsupported_boundary = crate::compile(
-            "owned.tima",
-            "transform own(bytes: Bytes) -> Bytes { return bytes }\n",
+        let unsupported_world_call = crate::compile(
+            "world.tima",
+            "transform read() -> Bytes uses file.read { return file.read(\"asset.bin\") }\n",
         )
         .unwrap();
         let diagnostics = CraneliftBackend
-            .emit(&unsupported_boundary.transforms)
+            .emit(&unsupported_world_call.transforms)
             .unwrap_err();
         assert!(
             diagnostics[0]
                 .message
-                .contains("does not yet support the boundary")
+                .contains("outside the initial Cranelift AOT subset")
         );
     }
 }

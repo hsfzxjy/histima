@@ -523,10 +523,11 @@ parameters receive detached mutable storage; views retain immutable shared
 storage and may alias. Multiple owned arguments and simultaneous owned/view
 arguments therefore cannot expose a mutable alias.
 
-Returned owned storage is frozen into an immutable outer value. Interpreter
-buffers transfer from their owned `Vec` into reference-counted immutable
-storage. Lineage is attached beside the outer payload and never enters the
-inner representation.
+Returned owned storage is frozen into an immutable outer value. String and byte
+outer storage retains an owned allocation behind immutable reference counting,
+so a uniquely held value can move into an owned inner parameter and back out
+without reallocating. Shared values detach once before mutation. Lineage is
+attached beside the outer payload and never enters the inner representation.
 
 The implemented AOT entry ABI is C-compatible. ABI version 2 uses one fixed
 descriptor per statically typed value:
@@ -552,11 +553,17 @@ RGBA8. Word 7 is reserved. Status zero means success; status 1 reports that an
 RGBA8 operation received another image format. Other nonzero statuses are
 reserved for later runtime failures.
 
-Before a native call, an owned `Image` is uniquely detached from immutable
-outer storage. Native code may mutate that allocation in place. A returned
-owned image descriptor must identify exactly one compatible owned argument;
-the host then adopts its allocation while freezing it into a new outer value.
-An `ImageView` points directly into retained immutable outer storage and a
+`String`, `StringView`, `Bytes`, and `BytesView` use words 0 through 2 for data
+pointer, byte length, and capacity. Views have zero capacity. String bytes are
+UTF-8; the host validates an owned String again when it freezes a native
+result. Remaining words are reserved and zero in the current ABI.
+
+Before a native call, an owned String, Bytes, or Image value is uniquely
+detached from immutable outer storage. Native code may mutate owned allocations
+in place subject to the statically known value type. A returned owned
+descriptor must identify exactly one compatible owned argument of the same
+type; the host then adopts its allocation while freezing it into a new outer
+value. A view points directly into retained immutable outer storage and a
 returned view must identify a compatible view argument. These restrictions
 make the current result path zero-copy without trusting or freeing a foreign
 allocation. Native allocation callbacks and newly allocated native results are
@@ -771,10 +778,13 @@ load image with Clang, and executes supported transforms through the native ABI.
 standard LLVM installation on Windows or `clang` from `PATH`.
 
 The implemented subset admits scalar parameters and results of `bool`, `u8`,
-`i64`, or `f32`; scalar constants, comparisons, control flow, and `f32`
-arithmetic; and direct calls whose complete callee closure is native-compatible.
-Calls marshal the same fixed descriptors through native stack storage, forward
-the runtime context, and propagate failure status to the outermost invocation.
+`i64`, or `f32`, plus owned and view `String`, `Bytes`, and `Image` boundaries;
+scalar constants, comparisons, control flow, and `f32` arithmetic; and direct
+calls whose complete callee closure is native-compatible. Calls marshal the
+same fixed descriptors through native stack storage, forward the runtime
+context, and propagate failure status to the outermost invocation. String and
+byte descriptors currently support identity returns and passthrough call
+chains; they have no native mutation operations yet.
 
 `Image` and `ImageView` may cross the descriptor boundary. Identity returns,
 owned `image_zero` and `image_fill`, byte-map loops, and RGBA8 channel scaling
@@ -783,12 +793,12 @@ once per storage byte, including calls. Native RGBA8 operations validate the
 runtime format before addressing pixels and preserve the scalar conversion and
 row-padding semantics in section 8.5.
 
-Checked `i64` arithmetic, String and Bytes values, newly allocated native
-results, and World calls are not compiled. A transform also remains interpreted
-when any transitive callee uses unsupported behavior. The hybrid `run-native`
-path makes that decision per outer invocation without changing lineage or
-Recipe identity. Histima product execution remains interpreted while the
-remaining buffer operations and World callbacks are implemented.
+Checked `i64` arithmetic, string literals and operations, newly allocated
+native results, and World calls are not compiled. A transform also remains
+interpreted when any transitive callee uses unsupported behavior. The hybrid
+`run-native` path makes that decision per outer invocation without changing
+lineage or Recipe identity. Histima product execution remains interpreted while
+allocation and World callbacks are implemented.
 
 Native artifacts are cached independently using Artifact IDs derived from the
 Transform ID plus the Cranelift/compiler version, target, inferred CPU feature

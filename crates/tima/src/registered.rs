@@ -228,7 +228,7 @@ fn execute_encode_ppm(
     let ValueData::Image(image) = &arguments[0].0.data else {
         unreachable!()
     };
-    Ok(OuterValue::plain(ValueData::Bytes(Arc::from(encode_ppm(
+    Ok(OuterValue::plain(ValueData::Bytes(Arc::new(encode_ppm(
         image,
     )))))
 }
@@ -254,7 +254,7 @@ fn execute_encode_png(
         unreachable!()
     };
     encode_png(image, compression as u8, arguments[0].1)
-        .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::from(bytes))))
+        .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::new(bytes))))
 }
 
 fn execute_encode_webp(
@@ -268,7 +268,7 @@ fn execute_encode_webp(
         unreachable!()
     };
     encode_webp(image, quality as u8, arguments[0].1)
-        .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::from(bytes))))
+        .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::new(bytes))))
 }
 
 fn decode_ppm(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {

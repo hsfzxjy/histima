@@ -15,6 +15,7 @@ mod stored_lineage;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tima::capability::{ENVIRONMENT_CAPABILITY, FILE_READ_CAPABILITY, HTTP_GET_CAPABILITY, World};
 use tima::identity::{
@@ -622,7 +623,7 @@ impl Workspace {
                 bytes.len()
             )));
         }
-        Ok(Some(OuterValue::plain(ValueData::Bytes(bytes.into()))))
+        Ok(Some(OuterValue::plain(ValueData::Bytes(Arc::new(bytes)))))
     }
 
     pub fn catalog_info(&self) -> Result<CatalogInfo> {
@@ -1045,10 +1046,10 @@ mod tests {
         )
         .unwrap();
 
-        let first = OuterValue::plain(ValueData::Bytes(b"first".as_slice().into()))
+        let first = OuterValue::plain(ValueData::Bytes(Arc::new(b"first".to_vec())))
             .with_lineage(lineage.clone());
         let conflicting =
-            OuterValue::plain(ValueData::Bytes(b"second".as_slice().into())).with_lineage(lineage);
+            OuterValue::plain(ValueData::Bytes(Arc::new(b"second".to_vec()))).with_lineage(lineage);
         workspace.record_value(&first).unwrap();
 
         let error = workspace.record_value(&conflicting).unwrap_err();

@@ -316,7 +316,7 @@ fn parse_recorded(
         }
         "string" => {
             require_no_content(kind, &content)?;
-            Ok(RecordedValue::String(Arc::from(text.ok_or_else(|| {
+            Ok(RecordedValue::String(Arc::new(text.ok_or_else(|| {
                 Error::catalog("stored string has no value")
             })?)))
         }
@@ -408,7 +408,7 @@ fn validate_argument(
             content_identity(&OuterValue::plain(ValueData::Float(*value)))
         }
         RecordedValue::String(value) => {
-            content_identity(&OuterValue::plain(ValueData::String(Arc::clone(value))))
+            content_identity(&OuterValue::plain(ValueData::String(value.clone())))
         }
         RecordedValue::Materialized { content_id, .. } => Ok(*content_id),
         RecordedValue::Source { .. } => unreachable!("source arguments return above"),

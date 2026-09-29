@@ -67,7 +67,7 @@ impl ContentStore {
     }
 
     pub fn put_bytes_value(&self, bytes: &[u8]) -> Result<StoredContent> {
-        let value = OuterValue::plain(ValueData::Bytes(Arc::from(bytes)));
+        let value = OuterValue::plain(ValueData::Bytes(Arc::new(bytes.to_vec())));
         let identity = content_identity(&value)
             .map_err(|error| Error::catalog(format!("cannot identify byte value: {error}")))?;
         self.put_known(identity, ContentKind::Bytes, bytes)
@@ -241,8 +241,8 @@ fn validate_bytes_text(path: &Path, expected: &str, kind: ContentKind, bytes: &[
 fn identity_for(kind: ContentKind, bytes: &[u8]) -> Result<ContentIdentity> {
     match kind {
         ContentKind::Raw => Ok(byte_content_identity(bytes)),
-        ContentKind::Bytes => content_identity(&OuterValue::plain(ValueData::Bytes(Arc::from(
-            bytes,
+        ContentKind::Bytes => content_identity(&OuterValue::plain(ValueData::Bytes(Arc::new(
+            bytes.to_vec(),
         ))))
         .map_err(|error| Error::catalog(format!("cannot identify stored byte value: {error}"))),
     }

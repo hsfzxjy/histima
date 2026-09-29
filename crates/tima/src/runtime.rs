@@ -10,8 +10,8 @@ use crate::abi::{ABI_IMAGE_FORMAT_OPAQUE_BYTES, ABI_IMAGE_FORMAT_RGBA8};
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::cache::CachedArtifact;
 use crate::backend::native::{
-    NativeArgument, NativeImage, NativeImageView, NativeModule, NativeResult,
-    NativeScalar as AbiScalar,
+    NativeArgument, NativeBuffer, NativeBufferView, NativeImage, NativeImageView, NativeModule,
+    NativeResult, NativeScalar as AbiScalar,
 };
 use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
@@ -56,8 +56,8 @@ pub enum ValueData {
     Bool(bool),
     Integer(i64),
     Float(f32),
-    String(Arc<str>),
-    Bytes(Arc<[u8]>),
+    String(Arc<String>),
+    Bytes(Arc<Vec<u8>>),
     List(Arc<[OuterValue]>),
     Record(Arc<BTreeMap<String, OuterValue>>),
     Asset(Arc<AssetValue>),
@@ -829,7 +829,7 @@ fn replay_argument(
                         span,
                     )
                 })?;
-                OuterValue::plain(ValueData::Bytes(Arc::from(bytes)))
+                OuterValue::plain(ValueData::Bytes(Arc::new(bytes)))
             } else if let Some(parent) = &argument.lineage {
                 replay_lineage(
                     program,
@@ -1060,7 +1060,7 @@ impl Interpreter<'_, '_, '_> {
             ExprKind::Integer(value) => OuterValue::plain(ValueData::Integer(*value)),
             ExprKind::Float(value) => OuterValue::plain(ValueData::Float(*value as f32)),
             ExprKind::String(value) => {
-                OuterValue::plain(ValueData::String(Arc::from(value.as_str())))
+                OuterValue::plain(ValueData::String(Arc::new(value.clone())))
             }
             ExprKind::Name(name) => self.resolve_name(name, expression.span)?,
             ExprKind::List(values) => {
@@ -1294,10 +1294,11 @@ impl Interpreter<'_, '_, '_> {
                 arguments[0].2,
             ));
         };
+        let locator: Arc<str> = Arc::from(locator.as_str());
         Ok(OuterValue::plain(ValueData::Asset(Arc::new(AssetValue {
             locator: locator.clone(),
         })))
-        .with_lineage(Lineage::source(locator.clone(), None)))
+        .with_lineage(Lineage::source(locator, None)))
     }
 
     fn read(
@@ -1354,7 +1355,7 @@ impl Interpreter<'_, '_, '_> {
                 }
             }
         }
-        Ok(OuterValue::plain(ValueData::Bytes(Arc::from(bytes)))
+        Ok(OuterValue::plain(ValueData::Bytes(Arc::new(bytes)))
             .with_lineage(Lineage::observed_source(value.locator.clone(), observed)))
     }
 
@@ -1644,9 +1645,9 @@ enum NativeScalar {
 enum InterpretedValue {
     Scalar(NativeScalar),
     String(String),
-    StringView(Arc<str>),
+    StringView(Arc<String>),
     Bytes(Vec<u8>),
-    BytesView(Arc<[u8]>),
+    BytesView(Arc<Vec<u8>>),
     Image(InterpretedImage),
     ImageView(Arc<ImageValue>),
 }
@@ -1695,6 +1696,10 @@ struct HybridAotEngine<'a> {
 
 enum PreparedNativeArgument {
     Scalar(AbiScalar),
+    String(NativeBuffer),
+    StringView(Arc<String>),
+    Bytes(NativeBuffer),
+    BytesView(Arc<Vec<u8>>),
     Image(NativeImage),
     ImageView(Arc<ImageValue>),
 }
@@ -1721,6 +1726,18 @@ impl TransformEngine for HybridAotEngine<'_> {
             .iter_mut()
             .map(|argument| match argument {
                 PreparedNativeArgument::Scalar(value) => NativeArgument::Scalar(*value),
+                PreparedNativeArgument::String(buffer) => NativeArgument::String(buffer),
+                PreparedNativeArgument::StringView(value) => {
+                    NativeArgument::StringView(NativeBufferView {
+                        bytes: value.as_bytes(),
+                    })
+                }
+                PreparedNativeArgument::Bytes(buffer) => NativeArgument::Bytes(buffer),
+                PreparedNativeArgument::BytesView(value) => {
+                    NativeArgument::BytesView(NativeBufferView {
+                        bytes: value.as_slice(),
+                    })
+                }
                 PreparedNativeArgument::Image(image) => NativeArgument::Image(image),
                 PreparedNativeArgument::ImageView(image) => {
                     NativeArgument::ImageView(NativeImageView {
@@ -1742,6 +1759,36 @@ impl TransformEngine for HybridAotEngine<'_> {
             NativeResult::Scalar(AbiScalar::U8(value)) => freeze_scalar(NativeScalar::U8(value)),
             NativeResult::Scalar(AbiScalar::I64(value)) => freeze_scalar(NativeScalar::I64(value)),
             NativeResult::Scalar(AbiScalar::F32(value)) => freeze_scalar(NativeScalar::F32(value)),
+            NativeResult::OwnedStringArgument(index) => {
+                let PreparedNativeArgument::String(buffer) = std::mem::replace(
+                    &mut prepared[index],
+                    PreparedNativeArgument::Scalar(AbiScalar::Bool(false)),
+                ) else {
+                    unreachable!("native owned string result identifies an owned string argument")
+                };
+                freeze_native_string(buffer, transform.span)?
+            }
+            NativeResult::StringViewArgument(index) => {
+                let PreparedNativeArgument::StringView(value) = &prepared[index] else {
+                    unreachable!("native string view result identifies a string view argument")
+                };
+                OuterValue::plain(ValueData::String(value.clone()))
+            }
+            NativeResult::OwnedBytesArgument(index) => {
+                let PreparedNativeArgument::Bytes(buffer) = std::mem::replace(
+                    &mut prepared[index],
+                    PreparedNativeArgument::Scalar(AbiScalar::Bool(false)),
+                ) else {
+                    unreachable!("native owned bytes result identifies an owned bytes argument")
+                };
+                OuterValue::plain(ValueData::Bytes(Arc::new(buffer.bytes)))
+            }
+            NativeResult::BytesViewArgument(index) => {
+                let PreparedNativeArgument::BytesView(value) = &prepared[index] else {
+                    unreachable!("native bytes view result identifies a bytes view argument")
+                };
+                OuterValue::plain(ValueData::Bytes(value.clone()))
+            }
             NativeResult::OwnedImageArgument(index) => {
                 let PreparedNativeArgument::Image(image) = std::mem::replace(
                     &mut prepared[index],
@@ -1788,6 +1835,20 @@ fn prepare_native_argument(
         }));
     }
     match (expected, value.data) {
+        (Type::String, ValueData::String(value)) => {
+            let value = Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone());
+            Ok(PreparedNativeArgument::String(NativeBuffer {
+                bytes: value.into_bytes(),
+            }))
+        }
+        (Type::StringView, ValueData::String(value)) => {
+            Ok(PreparedNativeArgument::StringView(value))
+        }
+        (Type::Bytes, ValueData::Bytes(value)) => {
+            let bytes = Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone());
+            Ok(PreparedNativeArgument::Bytes(NativeBuffer { bytes }))
+        }
+        (Type::BytesView, ValueData::Bytes(value)) => Ok(PreparedNativeArgument::BytesView(value)),
         (Type::Image, ValueData::Image(image)) => {
             let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
             let ImageValue {
@@ -1818,6 +1879,13 @@ fn prepare_native_argument(
             span,
         )),
     }
+}
+
+fn freeze_native_string(buffer: NativeBuffer, span: Span) -> Result<OuterValue, Diagnostic> {
+    let value = String::from_utf8(buffer.bytes).map_err(|_| {
+        Diagnostic::error("native transform returned invalid UTF-8 for String", span)
+    })?;
+    Ok(OuterValue::plain(ValueData::String(Arc::new(value))))
 }
 
 fn freeze_native_image(image: NativeImage) -> OuterValue {
@@ -1919,7 +1987,7 @@ impl IrInterpreter<'_> {
                 Constant::Bool(value) => InterpretedValue::Scalar(NativeScalar::Bool(*value)),
                 Constant::I64(value) => InterpretedValue::Scalar(NativeScalar::I64(*value)),
                 Constant::F32(value) => InterpretedValue::Scalar(NativeScalar::F32(*value)),
-                Constant::String(value) => InterpretedValue::StringView(Arc::from(value.as_str())),
+                Constant::String(value) => InterpretedValue::StringView(Arc::new(value.clone())),
             },
             ValueKind::Binary { op, left, right } => InterpretedValue::Scalar(native_binary(
                 *op,
@@ -2117,13 +2185,13 @@ fn lower_interpreted_value(
         (Type::F32, ValueData::Float(value)) => {
             Ok(InterpretedValue::Scalar(NativeScalar::F32(value)))
         }
-        (Type::String, ValueData::String(value)) => {
-            Ok(InterpretedValue::String(value.as_ref().to_owned()))
-        }
+        (Type::String, ValueData::String(value)) => Ok(InterpretedValue::String(
+            Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone()),
+        )),
         (Type::StringView, ValueData::String(value)) => Ok(InterpretedValue::StringView(value)),
-        (Type::Bytes, ValueData::Bytes(value)) => {
-            Ok(InterpretedValue::Bytes(value.as_ref().to_vec()))
-        }
+        (Type::Bytes, ValueData::Bytes(value)) => Ok(InterpretedValue::Bytes(
+            Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone()),
+        )),
         (Type::BytesView, ValueData::Bytes(value)) => Ok(InterpretedValue::BytesView(value)),
         (Type::Image, ValueData::Image(image)) => {
             let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
@@ -2198,9 +2266,9 @@ fn transfer_interpreted_argument(
 fn freeze_interpreted_value(value: InterpretedValue) -> OuterValue {
     match value {
         InterpretedValue::Scalar(value) => freeze_scalar(value),
-        InterpretedValue::String(value) => OuterValue::plain(ValueData::String(Arc::from(value))),
+        InterpretedValue::String(value) => OuterValue::plain(ValueData::String(Arc::new(value))),
         InterpretedValue::StringView(value) => OuterValue::plain(ValueData::String(value)),
-        InterpretedValue::Bytes(value) => OuterValue::plain(ValueData::Bytes(Arc::from(value))),
+        InterpretedValue::Bytes(value) => OuterValue::plain(ValueData::Bytes(Arc::new(value))),
         InterpretedValue::BytesView(value) => OuterValue::plain(ValueData::Bytes(value)),
         InterpretedValue::Image(image) => OuterValue::image(ImageValue {
             storage: Arc::new(ImageStorage::new(image.storage)),
@@ -2304,8 +2372,8 @@ mod tests {
         HybridAotEngine, ImageFormat, ImageValue, IrInterpreter, OuterValue,
         ReplayDependencyResolver, TransformEngine, ValueData, execute,
         execute_aot_cached_with_capabilities, execute_cached, execute_cached_with_capabilities,
-        execute_with, execute_with_capabilities, replay, replay_with_capabilities,
-        replay_with_dependencies, scale_rgba8_channel,
+        execute_with, execute_with_capabilities, freeze_interpreted_value, lower_interpreted_value,
+        replay, replay_with_capabilities, replay_with_dependencies, scale_rgba8_channel,
     };
     use crate::source::Span;
 
@@ -2512,15 +2580,15 @@ mod tests {
 
         assert_eq!(
             execution.bindings["mode_value"].data,
-            ValueData::String(Arc::from("dark"))
+            ValueData::String(Arc::new("dark".to_owned()))
         );
         assert_eq!(
             execution.bindings["file_value"].data,
-            ValueData::Bytes(Arc::from(&b"local"[..]))
+            ValueData::Bytes(Arc::new(b"local".to_vec()))
         );
         assert_eq!(
             execution.bindings["http_value"].data,
-            ValueData::Bytes(Arc::from(&b"remote"[..]))
+            ValueData::Bytes(Arc::new(b"remote".to_vec()))
         );
 
         for (binding, capability, key, content) in [
@@ -2866,7 +2934,7 @@ mod tests {
         };
         let bindings = BTreeMap::from([(
             "encoded".to_owned(),
-            OuterValue::plain(ValueData::Bytes(Arc::from(&b"P3\n"[..]))),
+            OuterValue::plain(ValueData::Bytes(Arc::new(b"P3\n".to_vec()))),
         )]);
 
         let diagnostics = execute_with(&compiled, &engine, bindings, None).unwrap_err();
@@ -2997,6 +3065,109 @@ mod tests {
         assert_eq!(filled.bytes(), &[7, 7, 7, 7]);
         assert!(!original.shares_storage_with(filled));
         assert!(original.shares_storage_with(viewed));
+    }
+
+    #[test]
+    fn native_owned_buffers_detach_while_views_alias() {
+        let compiled = crate::compile(
+            "native-buffers.tima",
+            "transform own_text(value: String) -> String { return value }\n\
+             transform view_text(value: StringView) -> StringView { return value }\n\
+             transform own_bytes(value: Bytes) -> Bytes { return value }\n\
+             transform view_bytes(value: BytesView) -> BytesView { return value }\n\
+             owned_text = own_text(text)\n\
+             viewed_text = view_text(text)\n\
+             owned_bytes = own_bytes(blob)\n\
+             viewed_bytes = view_bytes(blob)\n",
+        )
+        .unwrap();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join(format!("native-buffer-runtime-{}", std::process::id()));
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, root)
+            .unwrap()
+            .unwrap();
+        let engine = HybridAotEngine {
+            interpreter: IrInterpreter {
+                module: &compiled.transforms,
+                capabilities: None,
+            },
+            native: Some(&native),
+        };
+        let execution = execute_with(
+            &compiled,
+            &engine,
+            BTreeMap::from([
+                (
+                    "text".to_owned(),
+                    OuterValue::plain(ValueData::String(Arc::new("hello".to_owned()))),
+                ),
+                (
+                    "blob".to_owned(),
+                    OuterValue::plain(ValueData::Bytes(Arc::new(vec![1, 2, 3, 4]))),
+                ),
+            ]),
+            None,
+        )
+        .unwrap();
+
+        let ValueData::String(text) = &execution.bindings["text"].data else {
+            panic!("expected original string")
+        };
+        let ValueData::String(owned_text) = &execution.bindings["owned_text"].data else {
+            panic!("expected owned string result")
+        };
+        let ValueData::String(viewed_text) = &execution.bindings["viewed_text"].data else {
+            panic!("expected string view result")
+        };
+        assert_eq!(owned_text.as_str(), "hello");
+        assert!(!Arc::ptr_eq(text, owned_text));
+        assert!(Arc::ptr_eq(text, viewed_text));
+
+        let ValueData::Bytes(blob) = &execution.bindings["blob"].data else {
+            panic!("expected original bytes")
+        };
+        let ValueData::Bytes(owned_bytes) = &execution.bindings["owned_bytes"].data else {
+            panic!("expected owned bytes result")
+        };
+        let ValueData::Bytes(viewed_bytes) = &execution.bindings["viewed_bytes"].data else {
+            panic!("expected bytes view result")
+        };
+        assert_eq!(owned_bytes.as_slice(), &[1, 2, 3, 4]);
+        assert!(!Arc::ptr_eq(blob, owned_bytes));
+        assert!(Arc::ptr_eq(blob, viewed_bytes));
+    }
+
+    #[test]
+    fn unique_owned_string_and_byte_allocations_cross_the_interpreter_without_copying() {
+        let text = String::from("allocation stays put");
+        let text_pointer = text.as_ptr();
+        let lowered = lower_interpreted_value(
+            OuterValue::plain(ValueData::String(Arc::new(text))),
+            crate::ir::Type::String,
+            Span::default(),
+        )
+        .unwrap();
+        let frozen = freeze_interpreted_value(lowered);
+        let ValueData::String(text) = frozen.data else {
+            panic!("expected frozen string")
+        };
+        assert_eq!(text.as_ptr(), text_pointer);
+
+        let bytes = vec![1, 2, 3, 4, 5];
+        let bytes_pointer = bytes.as_ptr();
+        let lowered = lower_interpreted_value(
+            OuterValue::plain(ValueData::Bytes(Arc::new(bytes))),
+            crate::ir::Type::Bytes,
+            Span::default(),
+        )
+        .unwrap();
+        let frozen = freeze_interpreted_value(lowered);
+        let ValueData::Bytes(bytes) = frozen.data else {
+            panic!("expected frozen bytes")
+        };
+        assert_eq!(bytes.as_ptr(), bytes_pointer);
     }
 
     #[test]
