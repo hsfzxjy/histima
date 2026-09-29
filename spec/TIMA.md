@@ -640,10 +640,10 @@ asset capability. Tima code has no ambient OS access outside the World.
 
 Registered transforms use normal outer call and pipeline syntax. They have
 versioned semantic identities and use the same normalized arguments, lineage,
-result cache, and replay machinery as user transforms. The current codecs are
-provisional host implementations behind that registry. A future registered
-Wasm plugin may implement the same transform contract, but the plugin ABI is
-not yet specified. The registry is not general native-library FFI.
+result cache, and replay machinery as user transforms. `ppm.decode` is the
+first registered-Wasm implementation; the remaining codecs are provisional
+host implementations behind the same registry. The registry is not general
+native-library FFI.
 
 | Transform | Parameters | Result | Contract |
 | --- | --- | --- | --- |
@@ -657,6 +657,41 @@ Omitting a default and spelling its canonical value produce identical lineage
 arguments and Recipe IDs. A registered-transform implementation change that
 can alter output must bump that transform's semantic version. WebP decoding is
 not implemented.
+
+### 11.1 Registered-Wasm ABI v1
+
+The first ABI is intentionally the exact slice required by `ppm.decode`: one
+immutable bytes input and one owned RGBA8 image result. A module:
+
+- is Wasm32 and imports nothing (in particular, it has no WASI);
+- exports `memory`;
+- exports `tima_abi_version() -> i32`, which returns `1`;
+- exports `tima_reset()` and `tima_alloc(length: i32) -> i32` for one
+  invocation's guest arena;
+- exports `tima_transform(input: i32, input_length: i32,
+  result_descriptor: i32) -> i32`.
+
+All pointers are unsigned offsets into the exported linear memory. A zero
+`tima_transform` status means that its eight little-endian `u32` result words
+are initialized. Result kind `0` is an image with words
+`[kind, data, length, format, width, height, stride, reserved]`; format `1` is
+RGBA8. Result kind `1` is a UTF-8 diagnostic with words
+`[kind, data, length, 0, 0, 0, 0, 0]`. Other statuses, kinds, formats, invalid
+ranges, and invalid image layouts fail the invocation.
+
+The host runs plugins in a fuel-metered interpreter, with no JIT, and limits
+linear memory to 64 MiB. ABI v1 limits input bytes to 32 MiB, result bytes to
+64 MiB, and diagnostic text to 4096 bytes. An immutable input crosses the
+sandbox boundary once into guest memory. The result crosses once into the
+final host-owned buffer, which is validated and frozen directly as an outer
+value; freezing does not make a second copy. Direct zero-copy sharing with
+guest linear memory is intentionally not part of the isolation contract.
+
+Transform ID remains the registry's semantic name/version identity. A
+registered-Wasm Artifact ID is separate and includes Transform ID, ABI/backend
+configuration, and the exact module content identity. Changing observable
+codec behavior requires a semantic version bump even if the Wasm artifact was
+also replaced.
 
 ## 12. Lineage, identity, caching, and replay
 

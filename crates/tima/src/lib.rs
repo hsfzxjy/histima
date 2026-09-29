@@ -17,6 +17,7 @@ pub mod lexer;
 pub mod lineage;
 pub mod parser;
 mod registered;
+mod registered_wasm;
 pub mod runtime;
 pub mod semantic;
 pub mod source;

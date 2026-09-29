@@ -548,6 +548,30 @@ pub fn artifact_identity(
     ArtifactIdentity(Digest::from_hasher(hasher))
 }
 
+/// Identifies one precompiled registered-Wasm module independently from the
+/// semantic transform it implements. Module replacement therefore changes
+/// Artifact ID even when the registry retains a semantically equivalent
+/// Transform ID.
+pub fn registered_wasm_artifact_identity(
+    transform: TransformIdentity,
+    module_bytes: &[u8],
+    abi_version: u32,
+) -> ArtifactIdentity {
+    let module_content = byte_content_identity(module_bytes).to_string();
+    artifact_identity(
+        transform,
+        &ArtifactConfiguration {
+            backend: "registered-wasm",
+            backend_version: "1",
+            compiler_version: &module_content,
+            target: "wasm32-unknown-unknown",
+            cpu_features: &[],
+            optimization: "precompiled",
+            abi_version,
+        },
+    )
+}
+
 /// Identity of one backend compilation unit containing an ordered set of
 /// transform artifacts. Transform order is included because generated adapter
 /// symbols are indexed by module order.

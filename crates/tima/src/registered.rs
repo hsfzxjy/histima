@@ -6,7 +6,8 @@ use crate::identity::{TransformIdentity, registered_transform_identity};
 use crate::runtime::{ImageFormat, ImageValue, OuterValue, ValueData};
 use crate::source::Span;
 
-const PPM_TRANSFORM_VERSION: u32 = 1;
+const PPM_DECODE_TRANSFORM_VERSION: u32 = 2;
+const PPM_ENCODE_TRANSFORM_VERSION: u32 = 1;
 const PNG_DECODE_TRANSFORM_VERSION: u32 = 1;
 const PNG_ENCODE_TRANSFORM_VERSION: u32 = 2;
 const PNG_DEFAULT_COMPRESSION: i64 = 6;
@@ -43,7 +44,7 @@ const WEBP_ENCODE_DEFAULTS: &[Option<DefaultValue>] =
 const REGISTERED_TRANSFORMS: &[RegisteredTransform] = &[
     RegisteredTransform {
         name: "ppm.decode",
-        semantic_version: PPM_TRANSFORM_VERSION,
+        semantic_version: PPM_DECODE_TRANSFORM_VERSION,
         parameters: &["bytes"],
         defaults: NO_DEFAULTS_1,
         validate: validate_bytes,
@@ -51,7 +52,7 @@ const REGISTERED_TRANSFORMS: &[RegisteredTransform] = &[
     },
     RegisteredTransform {
         name: "ppm.encode",
-        semantic_version: PPM_TRANSFORM_VERSION,
+        semantic_version: PPM_ENCODE_TRANSFORM_VERSION,
         parameters: &["image"],
         defaults: NO_DEFAULTS_1,
         validate: validate_rgba8,
@@ -272,84 +273,7 @@ fn execute_encode_webp(
 }
 
 fn decode_ppm(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        Diagnostic::error("ppm.decode currently requires ASCII P3 data", span)
-            .with_note("binary P6 support is deferred")
-    })?;
-    let tokens = text
-        .lines()
-        .flat_map(|line| line.split('#').next().unwrap_or("").split_whitespace())
-        .collect::<Vec<_>>();
-    if tokens.first().copied() != Some("P3") {
-        return Err(Diagnostic::error(
-            "ppm.decode expected an ASCII P3 header",
-            span,
-        ));
-    }
-    if tokens.len() < 4 {
-        return Err(Diagnostic::error("ppm.decode header is incomplete", span));
-    }
-    let width = ppm_usize(tokens[1], "width", span)?;
-    let height = ppm_usize(tokens[2], "height", span)?;
-    if width == 0 || height == 0 {
-        return Err(Diagnostic::error(
-            "ppm.decode requires non-zero dimensions",
-            span,
-        ));
-    }
-    let maximum = ppm_usize(tokens[3], "maximum channel value", span)?;
-    if maximum != 255 {
-        return Err(Diagnostic::error(
-            "ppm.decode currently requires maximum channel value 255",
-            span,
-        ));
-    }
-    let pixels = width
-        .checked_mul(height)
-        .ok_or_else(|| Diagnostic::error("ppm.decode image dimensions overflow usize", span))?;
-    let expected_samples = pixels
-        .checked_mul(3)
-        .ok_or_else(|| Diagnostic::error("ppm.decode sample count overflows usize", span))?;
-    let expected_tokens = expected_samples
-        .checked_add(4)
-        .ok_or_else(|| Diagnostic::error("ppm.decode token count overflows usize", span))?;
-    if tokens.len() != expected_tokens {
-        return Err(Diagnostic::error(
-            format!(
-                "ppm.decode expected {expected_samples} channel samples, found {}",
-                tokens.len().saturating_sub(4)
-            ),
-            span,
-        ));
-    }
-    let byte_len = pixels
-        .checked_mul(4)
-        .ok_or_else(|| Diagnostic::error("ppm.decode RGBA byte length overflows usize", span))?;
-    let stride = width
-        .checked_mul(4)
-        .ok_or_else(|| Diagnostic::error("ppm.decode RGBA stride overflows usize", span))?;
-    let mut rgba = Vec::with_capacity(byte_len);
-    for token in &tokens[4..] {
-        let value = token.parse::<u8>().map_err(|_| {
-            Diagnostic::error(
-                format!("ppm.decode has invalid channel sample `{token}`"),
-                span,
-            )
-        })?;
-        rgba.push(value);
-        if rgba.len() % 4 == 3 {
-            rgba.push(255);
-        }
-    }
-    ImageValue::new_rgba8(width, height, stride, rgba).map_err(|error| {
-        Diagnostic::error(format!("ppm.decode produced invalid image: {error}"), span)
-    })
-}
-
-fn ppm_usize(token: &str, field: &str, span: Span) -> Result<usize, Diagnostic> {
-    token
-        .parse()
-        .map_err(|_| Diagnostic::error(format!("ppm.decode has invalid {field} `{token}`"), span))
+    crate::registered_wasm::decode_ppm(bytes, span)
 }
 
 fn encode_ppm(image: &ImageValue) -> Vec<u8> {
@@ -561,7 +485,11 @@ mod tests {
     fn ppm_codec_rejects_incomplete_pixels() {
         let diagnostic = decode_ppm(b"P3\n1 1\n255\n1 2\n", Span::default()).unwrap_err();
 
-        assert!(diagnostic.message.contains("expected 3 channel samples"));
+        assert!(
+            diagnostic
+                .message
+                .contains("channel sample count is incomplete")
+        );
     }
 
     #[test]
