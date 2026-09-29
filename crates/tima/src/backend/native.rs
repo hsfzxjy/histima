@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,13 +8,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use libloading::Library;
 
 use crate::abi::{
-    ABI_CAPACITY_WORD, ABI_IMAGE_FORMAT_WORD, ABI_IMAGE_HEIGHT_WORD, ABI_IMAGE_STRIDE_WORD,
-    ABI_IMAGE_WIDTH_WORD, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_IMAGE_FORMAT,
-    ABI_STATUS_OK, AbiValue,
+    ABI_ALLOCATION_BYTES, ABI_ALLOCATION_IMAGE, ABI_ALLOCATION_STRING, ABI_CAPACITY_WORD,
+    ABI_IMAGE_FORMAT_WORD, ABI_IMAGE_HEIGHT_WORD, ABI_IMAGE_STRIDE_WORD, ABI_IMAGE_WIDTH_WORD,
+    ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_IMAGE_FORMAT, ABI_STATUS_OK, ABI_STATUS_RUNTIME,
+    ABI_WORLD_ENVIRONMENT_READ, ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET, AbiRuntimeContext,
+    AbiValue, abi_callsite,
 };
 use crate::backend::ArtifactBackend;
 use crate::backend::cache::{CachedArtifact, NativeArtifactCache};
 use crate::backend::cranelift::CraneliftBackend;
+use crate::capability::CapabilitySession;
 use crate::diagnostic::Diagnostic;
 use crate::identity::TransformIdentities;
 use crate::ir::{TransformId, Type, TypedModule, ValueKind};
@@ -73,7 +77,7 @@ pub(crate) struct NativeImage {
     pub stride: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct NativeBuffer {
     pub bytes: Vec<u8>,
 }
@@ -148,12 +152,14 @@ impl NativeArgument<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum NativeResult {
     Scalar(NativeScalar),
     OwnedStringArgument(usize),
+    OwnedStringAllocation(NativeBuffer),
     StringViewArgument(usize),
     OwnedBytesArgument(usize),
+    OwnedBytesAllocation(NativeBuffer),
     BytesViewArgument(usize),
     OwnedImageArgument(usize),
     ImageViewArgument(usize),
@@ -165,6 +171,162 @@ fn buffer_value(pointer: *const u8, length: usize, capacity: usize) -> AbiValue 
     value.words[ABI_LENGTH_WORD] = length as u64;
     value.words[ABI_CAPACITY_WORD] = capacity as u64;
     value
+}
+
+struct NativeAllocation {
+    ty: Type,
+    buffer: NativeBuffer,
+}
+
+struct NativeCallState<'a, 'world> {
+    capabilities: &'a mut CapabilitySession<'world>,
+    call_spans: &'a BTreeMap<u64, Span>,
+    allocations: Vec<NativeAllocation>,
+    diagnostic: Option<Diagnostic>,
+}
+
+impl NativeCallState<'_, '_> {
+    fn span(&self, callsite: u64) -> Span {
+        self.call_spans.get(&callsite).copied().unwrap_or_default()
+    }
+
+    fn fail(&mut self, diagnostic: Diagnostic) -> i32 {
+        if self.diagnostic.is_none() {
+            self.diagnostic = Some(diagnostic);
+        }
+        ABI_STATUS_RUNTIME
+    }
+
+    fn register_buffer(&mut self, ty: Type, bytes: Vec<u8>) -> AbiValue {
+        self.allocations.push(NativeAllocation {
+            ty,
+            buffer: NativeBuffer { bytes },
+        });
+        let allocation = self.allocations.last().unwrap();
+        buffer_value(
+            allocation.buffer.bytes.as_ptr(),
+            allocation.buffer.bytes.len(),
+            allocation.buffer.bytes.capacity(),
+        )
+    }
+
+    fn take_buffer(&mut self, ty: Type, descriptor: AbiValue) -> Option<NativeBuffer> {
+        let index = self.allocations.iter().position(|allocation| {
+            allocation.ty == ty
+                && buffer_value(
+                    allocation.buffer.bytes.as_ptr(),
+                    allocation.buffer.bytes.len(),
+                    allocation.buffer.bytes.capacity(),
+                ) == descriptor
+        })?;
+        Some(self.allocations.swap_remove(index).buffer)
+    }
+}
+
+unsafe extern "C" fn abi_allocate(
+    user_data: *mut c_void,
+    kind: u32,
+    length: u64,
+    result: *mut AbiValue,
+) -> i32 {
+    // SAFETY: `NativeModule::invoke_with_capabilities` installs this exact
+    // state for the duration of the native call.
+    let state = unsafe { &mut *user_data.cast::<NativeCallState<'_, '_>>() };
+    let ty = match kind {
+        ABI_ALLOCATION_STRING => Type::String,
+        ABI_ALLOCATION_BYTES => Type::Bytes,
+        ABI_ALLOCATION_IMAGE => {
+            return state.fail(Diagnostic::error(
+                "native image allocation requires layout metadata and is not available yet",
+                Span::default(),
+            ));
+        }
+        _ => {
+            return state.fail(Diagnostic::error(
+                format!("native transform requested unknown allocation kind {kind}"),
+                Span::default(),
+            ));
+        }
+    };
+    let Ok(length) = usize::try_from(length) else {
+        return state.fail(Diagnostic::error(
+            "native allocation length does not fit the host address space",
+            Span::default(),
+        ));
+    };
+    let mut bytes = Vec::new();
+    if let Err(error) = bytes.try_reserve_exact(length) {
+        return state.fail(Diagnostic::error(
+            format!("native allocation of {length} bytes failed: {error}"),
+            Span::default(),
+        ));
+    }
+    bytes.resize(length, 0);
+    // SAFETY: the generated backend supplies a valid result descriptor.
+    unsafe { result.write(state.register_buffer(ty, bytes)) };
+    ABI_STATUS_OK
+}
+
+unsafe extern "C" fn abi_world_call(
+    user_data: *mut c_void,
+    callsite: u64,
+    operation: u32,
+    key: *const u8,
+    key_length: u64,
+    result: *mut AbiValue,
+) -> i32 {
+    // SAFETY: `NativeModule::invoke_with_capabilities` installs this exact
+    // state for the duration of the native call.
+    let state = unsafe { &mut *user_data.cast::<NativeCallState<'_, '_>>() };
+    let span = state.span(callsite);
+    let Ok(key_length) = usize::try_from(key_length) else {
+        return state.fail(Diagnostic::error(
+            "native World key length does not fit the host address space",
+            span,
+        ));
+    };
+    let key = if key_length == 0 {
+        &[]
+    } else {
+        if key.is_null() {
+            return state.fail(Diagnostic::error(
+                "native World call supplied a null key pointer",
+                span,
+            ));
+        }
+        // SAFETY: the typed backend forwards a live StringView descriptor and
+        // the call cannot outlive its retained outer storage.
+        unsafe { std::slice::from_raw_parts(key, key_length) }
+    };
+    let Ok(key) = std::str::from_utf8(key) else {
+        return state.fail(Diagnostic::error(
+            "native World call key is not valid UTF-8",
+            span,
+        ));
+    };
+    let (ty, bytes) = match operation {
+        ABI_WORLD_ENVIRONMENT_READ => match state.capabilities.environment(key, span) {
+            Ok(value) => (Type::String, value.into_bytes()),
+            Err(diagnostic) => return state.fail(diagnostic),
+        },
+        ABI_WORLD_FILE_READ => match state.capabilities.read_file(key, span) {
+            Ok(value) => (Type::Bytes, value),
+            Err(diagnostic) => return state.fail(diagnostic),
+        },
+        ABI_WORLD_HTTP_GET => match state.capabilities.http_get(key, span) {
+            Ok(value) => (Type::Bytes, value),
+            Err(diagnostic) => return state.fail(diagnostic),
+        },
+        _ => {
+            return state.fail(Diagnostic::error(
+                format!("native transform requested unknown World operation {operation}"),
+                span,
+            ));
+        }
+    };
+    // SAFETY: the generated backend supplies a valid result descriptor.
+    unsafe { result.write(state.register_buffer(ty, bytes)) };
+    ABI_STATUS_OK
 }
 
 fn image_value(
@@ -206,6 +368,7 @@ pub struct NativeModule {
     _library: Library,
     transforms: Vec<Option<LoadedTransform>>,
     signatures: Vec<Option<NativeSignature>>,
+    call_spans: BTreeMap<u64, Span>,
     artifact: CachedArtifact,
 }
 
@@ -277,6 +440,7 @@ impl NativeModule {
         })?;
         let mut transforms = vec![None; module.transforms.len()];
         let mut signatures = vec![None; module.transforms.len()];
+        let mut call_spans = BTreeMap::new();
         for (native_index, (original_index, transform)) in selected.iter().enumerate() {
             let symbol_name = format!("tima_transform_{native_index}\0");
             // SAFETY: the Cranelift backend emits every selected export with
@@ -306,12 +470,21 @@ impl NativeModule {
                 ),
                 span: transform.span,
             });
+            for (value_index, value) in transform.values.iter().enumerate() {
+                if matches!(&value.kind, ValueKind::RuntimeCall(_)) {
+                    call_spans.insert(
+                        abi_callsite(native_index as u32, value_index as u32),
+                        value.span,
+                    );
+                }
+            }
         }
 
         Ok(Some(Self {
             _library: library,
             transforms,
             signatures,
+            call_spans,
             artifact,
         }))
     }
@@ -346,6 +519,16 @@ impl NativeModule {
         &self,
         id: TransformId,
         arguments: &mut [NativeArgument<'_>],
+    ) -> Result<NativeResult, Diagnostic> {
+        let mut capabilities = CapabilitySession::new(None);
+        self.invoke_with_capabilities(id, arguments, &mut capabilities)
+    }
+
+    pub(crate) fn invoke_with_capabilities(
+        &self,
+        id: TransformId,
+        arguments: &mut [NativeArgument<'_>],
+        capabilities: &mut CapabilitySession<'_>,
     ) -> Result<NativeResult, Diagnostic> {
         let Some(signature) = self.signatures.get(id.0 as usize).and_then(Option::as_ref) else {
             return Err(native_error(format!(
@@ -385,10 +568,31 @@ impl NativeModule {
         let entry = self.transforms[id.0 as usize]
             .expect("native signature and entry tables agree")
             .entry;
+        let mut state = NativeCallState {
+            capabilities,
+            call_spans: &self.call_spans,
+            allocations: Vec::new(),
+            diagnostic: None,
+        };
+        let mut context = AbiRuntimeContext {
+            user_data: std::ptr::from_mut(&mut state).cast(),
+            allocate: abi_allocate,
+            world_call: abi_world_call,
+        };
         // SAFETY: argument/result descriptors match the statically checked
-        // signature, borrowed buffers outlive the call, and the library handle
-        // outlives this copied function pointer.
-        let status = unsafe { entry(std::ptr::null_mut(), encoded.as_ptr(), &mut result) };
+        // signature, borrowed buffers and the runtime callback table outlive
+        // the call, and the library handle outlives this copied function
+        // pointer.
+        let status = unsafe {
+            entry(
+                std::ptr::from_mut(&mut context).cast(),
+                encoded.as_ptr(),
+                &mut result,
+            )
+        };
+        if let Some(diagnostic) = state.diagnostic.take() {
+            return Err(diagnostic);
+        }
         if status == ABI_STATUS_IMAGE_FORMAT {
             return Err(Diagnostic::error(
                 "image pixel iteration requires RGBA8 format",
@@ -435,6 +639,19 @@ impl NativeModule {
                 }
                 _ => continue,
             };
+        }
+        match signature.result {
+            Type::String => {
+                if let Some(buffer) = state.take_buffer(Type::String, result) {
+                    return Ok(NativeResult::OwnedStringAllocation(buffer));
+                }
+            }
+            Type::Bytes => {
+                if let Some(buffer) = state.take_buffer(Type::Bytes, result) {
+                    return Ok(NativeResult::OwnedBytesAllocation(buffer));
+                }
+            }
+            _ => {}
         }
         Err(Diagnostic::error(
             "native transform returned a descriptor that does not identify a compatible input",
@@ -583,12 +800,17 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        NativeArgument, NativeBuffer, NativeBufferView, NativeImage, NativeImageView, NativeModule,
-        NativeResult, NativeScalar,
+        NativeArgument, NativeBuffer, NativeBufferView, NativeCallState, NativeImage,
+        NativeImageView, NativeModule, NativeResult, NativeScalar, abi_allocate,
     };
-    use crate::abi::{ABI_IMAGE_FORMAT_OPAQUE_BYTES, ABI_IMAGE_FORMAT_RGBA8};
+    use crate::abi::{
+        ABI_ALLOCATION_BYTES, ABI_IMAGE_FORMAT_OPAQUE_BYTES, ABI_IMAGE_FORMAT_RGBA8,
+        ABI_POINTER_WORD, ABI_STATUS_OK, AbiValue,
+    };
     use crate::backend::cache::ArtifactCacheStatus;
-    use crate::ir::TransformId;
+    use crate::capability::{CapabilitySession, World};
+    use crate::ir::{TransformId, Type};
+    use crate::lineage::LineageNode;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -728,6 +950,125 @@ mod tests {
             native.invoke(TransformId(5), &mut arguments).unwrap(),
             NativeResult::BytesViewArgument(0)
         );
+    }
+
+    #[test]
+    fn host_allocator_registers_an_exactly_adoptable_buffer() {
+        let mut capabilities = CapabilitySession::new(None);
+        let spans = std::collections::BTreeMap::new();
+        let mut state = NativeCallState {
+            capabilities: &mut capabilities,
+            call_spans: &spans,
+            allocations: Vec::new(),
+            diagnostic: None,
+        };
+        let mut descriptor = AbiValue::default();
+        // SAFETY: this test supplies the callback's expected state and result
+        // storage for the complete call.
+        let status = unsafe {
+            abi_allocate(
+                std::ptr::from_mut(&mut state).cast(),
+                ABI_ALLOCATION_BYTES,
+                4,
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ABI_STATUS_OK);
+        // SAFETY: the successful allocator returned a live four-byte buffer.
+        unsafe {
+            std::slice::from_raw_parts_mut(descriptor.words[ABI_POINTER_WORD] as *mut u8, 4)
+                .copy_from_slice(&[1, 2, 3, 4]);
+        }
+        assert_eq!(
+            state.take_buffer(Type::Bytes, descriptor).unwrap().bytes,
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn executes_world_calls_and_adopts_host_buffers() {
+        struct FixedWorld;
+
+        impl World for FixedWorld {
+            fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
+                Ok(format!("env:{name}").into_bytes())
+            }
+
+            fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+                Ok(format!("file:{path}").into_bytes())
+            }
+
+            fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
+                Ok(format!("http:{url}").into_bytes())
+            }
+        }
+
+        let compiled = crate::compile(
+            "world.tima",
+            "transform environment(key: StringView) -> String uses env.read {
+                 return env.read(key)
+             }
+             transform file(path: StringView) -> Bytes uses file.read {
+                 return file.read(path)
+             }
+             transform http(url: StringView) -> Bytes uses http.get {
+                 return http.get(url)
+             }
+             transform file_through_call(path: StringView) -> Bytes uses file.read {
+                 return file(path)
+             }
+",
+        )
+        .unwrap();
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
+            .unwrap()
+            .unwrap();
+        for id in 0..4 {
+            assert!(native.contains(TransformId(id)));
+        }
+
+        let world = FixedWorld;
+        let mut capabilities = CapabilitySession::new(Some(&world));
+        for (id, key, expected) in [
+            (0, "MODE", b"env:MODE".as_slice()),
+            (1, "asset.bin", b"file:asset.bin".as_slice()),
+            (
+                2,
+                "https://example.test/a",
+                b"http:https://example.test/a".as_slice(),
+            ),
+            (3, "nested.bin", b"file:nested.bin".as_slice()),
+        ] {
+            let mut arguments = [NativeArgument::StringView(NativeBufferView {
+                bytes: key.as_bytes(),
+            })];
+            let result = native
+                .invoke_with_capabilities(TransformId(id), &mut arguments, &mut capabilities)
+                .unwrap();
+            let bytes = match result {
+                NativeResult::OwnedStringAllocation(buffer)
+                | NativeResult::OwnedBytesAllocation(buffer) => buffer.bytes,
+                other => panic!("expected allocated World result, found {other:?}"),
+            };
+            assert_eq!(bytes, expected);
+        }
+        let observations = capabilities.finish();
+        assert_eq!(observations.len(), 4);
+        assert!(
+            observations.iter().all(|observation| matches!(
+                observation.node(),
+                LineageNode::ExternalObservation(_)
+            ))
+        );
+
+        let key = "denied";
+        let mut arguments = [NativeArgument::StringView(NativeBufferView {
+            bytes: key.as_bytes(),
+        })];
+        let error = native.invoke(TransformId(1), &mut arguments).unwrap_err();
+        assert!(error.message.contains("filesystem access is unavailable"));
+        let expected_span = compiled.transforms.get(TransformId(1)).values[1].span;
+        assert_eq!(error.labels[0].span, expected_span);
     }
 
     #[test]

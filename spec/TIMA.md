@@ -550,8 +550,9 @@ defined by their type. An `Image` or `ImageView` uses words 0 through 6 for its
 data pointer, byte length, capacity, format, width, height, and row stride;
 views have zero capacity. Format tag 0 denotes opaque bytes and tag 1 denotes
 RGBA8. Word 7 is reserved. Status zero means success; status 1 reports that an
-RGBA8 operation received another image format. Other nonzero statuses are
-reserved for later runtime failures.
+RGBA8 operation received another image format. Status 2 reports a host callback
+failure; the host retains the source-spanned diagnostic rather than placing
+diagnostic objects in the ABI. Other nonzero statuses are reserved.
 
 `String`, `StringView`, `Bytes`, and `BytesView` use words 0 through 2 for data
 pointer, byte length, and capacity. Views have zero capacity. String bytes are
@@ -566,14 +567,20 @@ type; the host then adopts its allocation while freezing it into a new outer
 value. A view points directly into retained immutable outer storage and a
 returned view must identify a compatible view argument. These restrictions
 make the current result path zero-copy without trusting or freeing a foreign
-allocation. Native allocation callbacks and newly allocated native results are
-not yet supported.
+allocation.
 
-The runtime context is currently null and reserved for later allocation,
-diagnostic, and World callbacks. No Rust object, dynamic outer tag, lineage, or
-cache metadata crosses this boundary. The ABI supports little-endian x86-64
-and AArch64 hosts. ABI and backend versions are part of Artifact identity, not
-Transform identity.
+The runtime context points to a C-compatible callback table containing opaque
+host user data, a checked String/Bytes allocator, and a World-call trampoline.
+Allocations remain in host call state and can be frozen only when the returned
+descriptor exactly identifies a registered allocation of the expected static
+type. World calls may directly register an already-owned host buffer, avoiding
+a copy solely for ABI transfer. Image allocation is reserved until its layout
+metadata contract is defined.
+
+Generated code receives only the callback table, function pointers, and opaque
+user data. No Rust layout, dynamic outer tag, lineage, or cache metadata is
+part of the ABI. The ABI supports little-endian x86-64 and AArch64 hosts. ABI
+and backend versions are part of Artifact identity, not Transform identity.
 
 ## 10. Runtime-mediated capabilities
 
@@ -794,11 +801,16 @@ runtime format before addressing pixels and preserve the scalar conversion and
 row-padding semantics in section 8.5.
 
 Checked `i64` arithmetic, string literals and operations, newly allocated
-native results, and World calls are not compiled. A transform also remains
-interpreted when any transitive callee uses unsupported behavior. The hybrid
-`run-native` path makes that decision per outer invocation without changing
-lineage or Recipe identity. Histima product execution remains interpreted while
-allocation and World callbacks are implemented.
+native images, and `environment_i64` are not compiled. `env.read`, `file.read`,
+and `http.get` are compiled when their key is supplied by a `StringView`
+parameter or another native-compatible value. They call the host through the
+runtime context, retain precise observations, propagate source-spanned errors,
+and return registered host allocations for zero-copy freeze. Because static
+string data is not emitted yet, a transform containing a string literal remains
+interpreted. A transform also remains interpreted when any transitive callee
+uses unsupported behavior. The hybrid `run-native` path makes that decision per
+outer invocation without changing lineage or Recipe identity. Histima product
+execution remains interpreted while the native path matures.
 
 Native artifacts are cached independently using Artifact IDs derived from the
 Transform ID plus the Cranelift/compiler version, target, inferred CPU feature

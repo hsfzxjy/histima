@@ -71,13 +71,18 @@ impl<'a> CapabilitySession<'a> {
                 span,
             )
         })?;
-        let text = String::from_utf8(bytes.clone()).map_err(|_| {
+        let text = String::from_utf8(bytes).map_err(|_| {
             Diagnostic::error(
                 format!("environment dependency `{name}` is not valid UTF-8"),
                 span,
             )
         })?;
-        self.record_observation(ENVIRONMENT_CAPABILITY, name.as_bytes(), &bytes, span)?;
+        self.record_observation(
+            ENVIRONMENT_CAPABILITY,
+            name.as_bytes(),
+            text.as_bytes(),
+            span,
+        )?;
         Ok(text)
     }
 

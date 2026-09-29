@@ -11,15 +11,19 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::abi::{
     ABI_IMAGE_FORMAT_RGBA8, ABI_IMAGE_FORMAT_WORD, ABI_IMAGE_HEIGHT_WORD, ABI_IMAGE_STRIDE_WORD,
-    ABI_IMAGE_WIDTH_WORD, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_IMAGE_FORMAT,
-    ABI_VALUE_BYTES, TIMA_ABI_VERSION,
+    ABI_IMAGE_WIDTH_WORD, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_RUNTIME_USER_DATA_OFFSET,
+    ABI_RUNTIME_WORLD_CALL_OFFSET, ABI_STATUS_IMAGE_FORMAT, ABI_VALUE_BYTES,
+    ABI_WORLD_ENVIRONMENT_READ, ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET, TIMA_ABI_VERSION,
+    abi_callsite,
 };
 use crate::ast::BinaryOp;
 use crate::backend::{ArtifactBackend, BackendArtifact};
 use crate::diagnostic::Diagnostic;
-use crate::ir::{Constant, Terminator, Transform, Type, TypedModule, ValueId, ValueKind};
+use crate::ir::{
+    Constant, RuntimeCall, Terminator, Transform, Type, TypedModule, ValueId, ValueKind,
+};
 
-pub const CRANELIFT_BACKEND_VERSION: &str = "6";
+pub const CRANELIFT_BACKEND_VERSION: &str = "7";
 pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 
 /// Ahead-of-time native object generation from backend-neutral Tima IR.
@@ -249,11 +253,18 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
             | ValueKind::ImageByteElement
             | ValueKind::ImageByteMap { .. }
             | ValueKind::ImageRgba8Scale { .. } => {}
-            ValueKind::Constant(Constant::String(_)) | ValueKind::RuntimeCall(_) => diagnostics
-                .push(Diagnostic::error(
+            ValueKind::RuntimeCall(
+                RuntimeCall::EnvironmentRead { .. }
+                | RuntimeCall::FileRead { .. }
+                | RuntimeCall::HttpGet { .. },
+            ) => {}
+            ValueKind::Constant(Constant::String(_))
+            | ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { .. }) => {
+                diagnostics.push(Diagnostic::error(
                     "operation is outside the initial Cranelift AOT subset",
                     value.span,
-                )),
+                ))
+            }
         }
     }
     diagnostics
@@ -266,8 +277,10 @@ fn lower_transform(
     function_ids: &[FuncId],
 ) -> Result<Function, Vec<Diagnostic>> {
     let signature = native_signature(module);
+    let world_call_signature = world_call_signature(module);
     let frontend_config = module.target_config();
     let mut function = Function::with_name_signature(UserFuncName::user(0, index), signature);
+    let world_call_signature = function.import_signature(world_call_signature);
     let function_refs = function_ids
         .iter()
         .map(|callee| module.declare_func_in_func(*callee, &mut function))
@@ -378,6 +391,15 @@ fn lower_transform(
                         emit_image_rgba8_scale(&mut builder, image, &channels);
                         LoweredValue::Image(image)
                     }
+                    ValueKind::RuntimeCall(call) => emit_world_call(
+                        &mut builder,
+                        runtime_context,
+                        world_call_signature,
+                        abi_callsite(index, id.0),
+                        call,
+                        value.ty,
+                        &values,
+                    ),
                     _ => unreachable!("validation rejects unsupported operations"),
                 };
                 values[id.0 as usize] = Some(lowered);
@@ -421,6 +443,21 @@ fn native_signature(module: &ObjectModule) -> Signature {
     signature.params.extend([
         AbiParam::new(pointer_type),
         AbiParam::new(pointer_type),
+        AbiParam::new(pointer_type),
+    ]);
+    signature.returns.push(AbiParam::new(types::I32));
+    signature
+}
+
+fn world_call_signature(module: &ObjectModule) -> Signature {
+    let mut signature = module.make_signature();
+    let pointer_type = module.target_config().pointer_type();
+    signature.params.extend([
+        AbiParam::new(pointer_type),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I32),
+        AbiParam::new(pointer_type),
+        AbiParam::new(types::I64),
         AbiParam::new(pointer_type),
     ]);
     signature.returns.push(AbiParam::new(types::I32));
@@ -582,6 +619,69 @@ fn emit_transform_call(
     let call = builder
         .ins()
         .call(callee, &[runtime_context, argument_pointer, result_pointer]);
+    let status = builder.inst_results(call)[0];
+    let success = builder.create_block();
+    let failure = builder.create_block();
+    let succeeded = builder.ins().icmp_imm_u(IntCC::Equal, status, 0);
+    builder.ins().brif(succeeded, success, &[], failure, &[]);
+    builder.switch_to_block(failure);
+    builder.ins().return_(&[status]);
+    builder.switch_to_block(success);
+    load_abi_value(builder, result_pointer, result_type, 0)
+}
+
+fn emit_world_call(
+    builder: &mut FunctionBuilder<'_>,
+    runtime_context: cranelift_codegen::ir::Value,
+    signature: cranelift_codegen::ir::SigRef,
+    callsite: u64,
+    call: &RuntimeCall,
+    result_type: Type,
+    values: &[Option<LoweredValue>],
+) -> LoweredValue {
+    let (operation, key) = match call {
+        RuntimeCall::EnvironmentRead { name } => (ABI_WORLD_ENVIRONMENT_READ, *name),
+        RuntimeCall::FileRead { path } => (ABI_WORLD_FILE_READ, *path),
+        RuntimeCall::HttpGet { url } => (ABI_WORLD_HTTP_GET, *url),
+        RuntimeCall::EnvironmentI64 { .. } => {
+            unreachable!("validation rejects legacy environment_i64 calls")
+        }
+    };
+    let key = required_buffer(values, key);
+    let pointer_type = builder.func.dfg.value_type(runtime_context);
+    let user_data = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        runtime_context,
+        ABI_RUNTIME_USER_DATA_OFFSET,
+    );
+    let callback = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        runtime_context,
+        ABI_RUNTIME_WORLD_CALL_OFFSET,
+    );
+    let result_slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        u32::try_from(ABI_VALUE_BYTES).unwrap(),
+        3,
+    ));
+    let result_pointer = builder.ins().stack_addr(pointer_type, result_slot, 0);
+    clear_abi_value(builder, result_pointer, 0);
+    let callsite = builder.ins().iconst(types::I64, callsite as i64);
+    let operation = builder.ins().iconst(types::I32, i64::from(operation));
+    let call = builder.ins().call_indirect(
+        signature,
+        callback,
+        &[
+            user_data,
+            callsite,
+            operation,
+            key[ABI_POINTER_WORD],
+            key[ABI_LENGTH_WORD],
+            result_pointer,
+        ],
+    );
     let status = builder.inst_results(call)[0];
     let success = builder.create_block();
     let failure = builder.create_block();
@@ -903,6 +1003,16 @@ fn required_value(values: &[Option<LoweredValue>], id: ValueId) -> LoweredValue 
 fn required_scalar(values: &[Option<LoweredValue>], id: ValueId) -> cranelift_codegen::ir::Value {
     let LoweredValue::Scalar(value) = required_value(values, id) else {
         unreachable!("typed scalar operation has a scalar operand")
+    };
+    value
+}
+
+fn required_buffer(
+    values: &[Option<LoweredValue>],
+    id: ValueId,
+) -> [cranelift_codegen::ir::Value; 3] {
+    let LoweredValue::Buffer(value) = required_value(values, id) else {
+        unreachable!("typed buffer operation has a buffer operand")
     };
     value
 }

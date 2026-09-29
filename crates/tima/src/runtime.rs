@@ -1750,7 +1750,9 @@ impl TransformEngine for HybridAotEngine<'_> {
                 }
             })
             .collect::<Vec<_>>();
-        let result = native.invoke(id, &mut native_arguments)?;
+        let mut capabilities = CapabilitySession::new(self.interpreter.capabilities);
+        let result =
+            native.invoke_with_capabilities(id, &mut native_arguments, &mut capabilities)?;
         drop(native_arguments);
         let value = match result {
             NativeResult::Scalar(AbiScalar::Bool(value)) => {
@@ -1768,6 +1770,9 @@ impl TransformEngine for HybridAotEngine<'_> {
                 };
                 freeze_native_string(buffer, transform.span)?
             }
+            NativeResult::OwnedStringAllocation(buffer) => {
+                freeze_native_string(buffer, transform.span)?
+            }
             NativeResult::StringViewArgument(index) => {
                 let PreparedNativeArgument::StringView(value) = &prepared[index] else {
                     unreachable!("native string view result identifies a string view argument")
@@ -1781,6 +1786,9 @@ impl TransformEngine for HybridAotEngine<'_> {
                 ) else {
                     unreachable!("native owned bytes result identifies an owned bytes argument")
                 };
+                OuterValue::plain(ValueData::Bytes(Arc::new(buffer.bytes)))
+            }
+            NativeResult::OwnedBytesAllocation(buffer) => {
                 OuterValue::plain(ValueData::Bytes(Arc::new(buffer.bytes)))
             }
             NativeResult::BytesViewArgument(index) => {
@@ -1807,7 +1815,7 @@ impl TransformEngine for HybridAotEngine<'_> {
         };
         Ok(TransformOutcome {
             value,
-            observations: Vec::new(),
+            observations: capabilities.finish(),
         })
     }
 
@@ -2479,6 +2487,55 @@ mod tests {
         assert_eq!(
             execution.execution.bindings["interpreted_out"].data,
             ValueData::Integer(42)
+        );
+    }
+
+    #[test]
+    fn aot_world_reads_preserve_observations_and_freeze_host_allocations() {
+        let compiled = crate::compile(
+            "native-world.tima",
+            "transform load(path: StringView) -> Bytes uses file.read {
+                 return file.read(path)
+             }
+             path = \"asset.bin\"
+             out = load(path)
+",
+        )
+        .unwrap();
+        let world = FixedWorld {
+            environment: BTreeMap::new(),
+            files: BTreeMap::from([("asset.bin".to_owned(), vec![1, 2, 3, 4])]),
+            urls: BTreeMap::new(),
+        };
+        let mut cache = TransformResultCache::default();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join(format!("aot-world-runtime-{}", std::process::id()));
+        let execution =
+            execute_aot_cached_with_capabilities(&compiled, &mut cache, &world, root).unwrap();
+        assert!(execution.artifact.is_some());
+        assert_eq!(
+            execution.execution.bindings["out"].data,
+            ValueData::Bytes(Arc::new(vec![1, 2, 3, 4]))
+        );
+        let lineage = execution.execution.bindings["out"]
+            .lineage
+            .as_ref()
+            .unwrap();
+        let LineageNode::Invocation(invocation) = lineage.node() else {
+            panic!("expected invocation lineage")
+        };
+        assert_eq!(invocation.observations.len(), 1);
+        let LineageNode::ExternalObservation(observation) = invocation.observations[0].node()
+        else {
+            panic!("expected external observation")
+        };
+        assert_eq!(observation.capability.as_ref(), "file.read");
+        assert_eq!(observation.key.as_ref(), b"asset.bin");
+        assert_eq!(
+            observation.observed_content,
+            byte_content_identity(&[1, 2, 3, 4])
         );
     }
 
