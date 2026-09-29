@@ -332,14 +332,17 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             finished(&mut arguments)?;
             let source_name = "<command-line-pipeline>";
             let diagnostic_source = SourceFile::new(source_name, expression.clone());
-            let compiled = tima::compile(source_name, expression).map_err(|diagnostics| {
-                format!(
-                    "Tima pipeline expression was rejected:\n{}",
-                    render_diagnostics(&diagnostic_source, &diagnostics)
-                )
-            })?;
             let mut workspace =
                 Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let compiled =
+                workspace
+                    .compile_tima(source_name, expression)
+                    .map_err(|diagnostics| {
+                        format!(
+                            "Tima pipeline expression was rejected:\n{}",
+                            render_diagnostics(&diagnostic_source, &diagnostics)
+                        )
+                    })?;
             let result = workspace
                 .evaluate_pipeline(&compiled)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
@@ -380,14 +383,16 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let text = fs::read_to_string(&script_path)
                 .map_err(|error| format!("could not read {script_path}: {error}"))?;
             let diagnostic_source = SourceFile::new(script_path.clone(), text.clone());
-            let compiled = tima::compile(script_path, text).map_err(|diagnostics| {
-                format!(
-                    "Tima source was rejected:\n{}",
-                    render_diagnostics(&diagnostic_source, &diagnostics)
-                )
-            })?;
             let mut workspace =
                 Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let compiled = workspace
+                .compile_tima(script_path, text)
+                .map_err(|diagnostics| {
+                    format!(
+                        "Tima source was rejected:\n{}",
+                        render_diagnostics(&diagnostic_source, &diagnostics)
+                    )
+                })?;
             let result = workspace
                 .execute(&compiled)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
@@ -451,13 +456,15 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let text = fs::read_to_string(&script_path)
                 .map_err(|error| format!("could not read {script_path}: {error}"))?;
             let diagnostic_source = SourceFile::new(script_path.clone(), text.clone());
-            let compiled = tima::compile(script_path, text).map_err(|diagnostics| {
-                format!(
-                    "Tima source was rejected:\n{}",
-                    render_diagnostics(&diagnostic_source, &diagnostics)
-                )
-            })?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let compiled = workspace
+                .compile_tima(script_path, text)
+                .map_err(|diagnostics| {
+                    format!(
+                        "Tima source was rejected:\n{}",
+                        render_diagnostics(&diagnostic_source, &diagnostics)
+                    )
+                })?;
             let replayed = workspace
                 .replay_recipe_with_policy(&compiled, recipe, policy)
                 .map_err(|error| render_run_error(&compiled.source, error))?;

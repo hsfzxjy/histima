@@ -157,6 +157,43 @@ touching those external resources. Snapshot availability is execution/storage
 policy; it does not change Dependency or Recipe identity. Source assets still
 follow their separately recorded source-validation rules.
 
+## Workspace Wasm plugins
+
+A workspace may opt into local registered-Wasm transforms explicitly:
+
+```toml
+# <workspace>/.histima.toml
+[plugins]
+manifests = ["plugins/example-encode.toml"]
+```
+
+```toml
+# <workspace>/plugins/example-encode.toml
+name = "example.encode"
+semantic_version = 1
+abi_version = 3
+module = "example_encode.wasm"
+module_content = "<64-character Tima Content ID of the module bytes>"
+result = "bytes"
+
+[[parameters]]
+name = "image"
+type = "rgba8-image"
+```
+
+The current manifest types are `bytes`, `rgba8-image`, and `i64`; results are
+limited to `bytes` or `rgba8-image`. Manifest and module paths are resolved and
+required to remain inside the canonical workspace. Opening the workspace
+verifies the declared module Content ID, ABI version, signature, exports,
+absence of imports/WASI, and transform-name uniqueness before compiling the
+module in the existing sandbox. `histima import <module>` prints the raw byte
+Content ID accepted by `module_content`.
+
+Plugin transforms use ordinary call, pipeline, and `name#hash` syntax and
+participate in the same lineage, Recipe cache, trace, and replay behavior as
+built-ins. Histima does not search for, download, update, or grant ambient
+capabilities to plugins.
+
 ## Storage, lineage, and identity
 
 The filesystem CAS contains immutable payloads; SQLite contains queryable

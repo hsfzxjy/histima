@@ -23,6 +23,7 @@ use tima::identity::{
     byte_content_identity, source_identity,
 };
 use tima::lineage::{Lineage, LineageNode};
+use tima::plugin::{PluginDefinition, PluginParameter, PluginRegistry, PluginValueType};
 use tima::runtime::{OuterValue, ValueData};
 
 use cas::{ContentKind, ContentStore};
@@ -31,6 +32,8 @@ use catalog::{Catalog, validate_artifact_identities};
 const CATALOG_FILE_NAME: &str = ".histima.sql3";
 const LEGACY_CATALOG_FILE_NAME: &str = "catalog.sqlite3";
 const WORLD_HTTP_READ_LIMIT: u64 = 64 * 1024 * 1024;
+const PLUGIN_MANIFEST_READ_LIMIT: u64 = 1024 * 1024;
+const PLUGIN_MODULE_READ_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub use catalog::{
     ArtifactBundleMember, ArtifactInfo, ArtifactSummary, AssetSummary, CATALOG_LIST_LIMIT,
@@ -114,6 +117,7 @@ pub struct Workspace {
     content: ContentStore,
     catalog: Catalog,
     world: WorldPolicy,
+    plugins: Arc<PluginRegistry>,
 }
 
 #[derive(Debug)]
@@ -247,6 +251,240 @@ fn config_strings(value: Option<&toml::Value>, key: &str) -> Result<Vec<String>>
         .collect()
 }
 
+fn load_plugins(root: &Path) -> Result<Arc<PluginRegistry>> {
+    let config_path = root.join(".histima.toml");
+    if !config_path.is_file() {
+        return Ok(Arc::default());
+    }
+    let text = fs::read_to_string(&config_path)
+        .map_err(|error| Error::io("read workspace configuration", &config_path, error))?;
+    let config = toml::from_str::<toml::Value>(&text)
+        .map_err(|error| Error::catalog(format!("invalid {}: {error}", config_path.display())))?;
+    let Some(plugins) = config.get("plugins") else {
+        return Ok(Arc::default());
+    };
+    let plugins = plugins.as_table().ok_or_else(|| {
+        Error::catalog(format!(
+            "[plugins] in {} must be a table",
+            config_path.display()
+        ))
+    })?;
+    reject_unknown_fields(plugins, &["manifests"], "[plugins]", &config_path)?;
+    let manifests = config_strings(plugins.get("manifests"), "[plugins].manifests")?;
+    let workspace_root = fs::canonicalize(root)
+        .map_err(|error| Error::io("resolve Histima workspace", root, error))?;
+    let mut definitions = Vec::with_capacity(manifests.len());
+    let mut loaded_manifests = BTreeSet::new();
+    for configured in manifests {
+        let path =
+            confined_plugin_path(&workspace_root, &root.join(&configured), "plugin manifest")?;
+        if !loaded_manifests.insert(path.clone()) {
+            return Err(Error::catalog(format!(
+                "plugin manifest {} is configured more than once",
+                path.display()
+            )));
+        }
+        definitions.push(load_plugin_manifest(&workspace_root, &path)?);
+    }
+    PluginRegistry::new(definitions)
+        .map(Arc::new)
+        .map_err(|error| Error::catalog(error.to_string()))
+}
+
+fn load_plugin_manifest(workspace_root: &Path, path: &Path) -> Result<PluginDefinition> {
+    let manifest_size = fs::metadata(path)
+        .map_err(|error| Error::io("inspect plugin manifest", path, error))?
+        .len();
+    if manifest_size > PLUGIN_MANIFEST_READ_LIMIT {
+        return Err(Error::catalog(format!(
+            "plugin manifest {} is {manifest_size} bytes; the limit is {PLUGIN_MANIFEST_READ_LIMIT}",
+            path.display()
+        )));
+    }
+    let text =
+        fs::read_to_string(path).map_err(|error| Error::io("read plugin manifest", path, error))?;
+    let manifest = toml::from_str::<toml::Value>(&text)
+        .map_err(|error| Error::catalog(format!("invalid {}: {error}", path.display())))?;
+    let table = manifest.as_table().ok_or_else(|| {
+        Error::catalog(format!(
+            "plugin manifest {} must be a table",
+            path.display()
+        ))
+    })?;
+    const FIELDS: &[&str] = &[
+        "name",
+        "semantic_version",
+        "abi_version",
+        "module",
+        "module_content",
+        "result",
+        "parameters",
+    ];
+    reject_unknown_fields(table, FIELDS, "plugin manifest", path)?;
+
+    let name = manifest_string(table, "name", path)?.to_owned();
+    let semantic_version = manifest_u32(table, "semantic_version", path)?;
+    let abi_version = manifest_u32(table, "abi_version", path)?;
+    let module_name = manifest_string(table, "module", path)?;
+    let module_content = manifest_string(table, "module_content", path)?
+        .parse::<ContentIdentity>()
+        .map_err(|error| {
+            Error::catalog(format!(
+                "plugin manifest {} has invalid module_content: {error}",
+                path.display()
+            ))
+        })?;
+    let result = manifest_value_type(manifest_string(table, "result", path)?, path)?;
+    let parameters = table
+        .get("parameters")
+        .ok_or_else(|| manifest_missing("parameters", path))?
+        .as_array()
+        .ok_or_else(|| {
+            Error::catalog(format!(
+                "plugin manifest {} field `parameters` must be an array of tables",
+                path.display()
+            ))
+        })?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let parameter = value.as_table().ok_or_else(|| {
+                Error::catalog(format!(
+                    "plugin manifest {} parameter {index} must be a table",
+                    path.display()
+                ))
+            })?;
+            reject_unknown_fields(parameter, &["name", "type"], "plugin parameter", path)?;
+            Ok(PluginParameter {
+                name: manifest_string(parameter, "name", path)?.to_owned(),
+                value_type: manifest_value_type(manifest_string(parameter, "type", path)?, path)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let module_candidate = path
+        .parent()
+        .expect("a canonical manifest path has a parent")
+        .join(module_name);
+    let module_path = confined_plugin_path(workspace_root, &module_candidate, "plugin module")?;
+    let module_size = fs::metadata(&module_path)
+        .map_err(|error| Error::io("inspect plugin module", &module_path, error))?
+        .len();
+    if module_size > PLUGIN_MODULE_READ_LIMIT {
+        return Err(Error::catalog(format!(
+            "plugin module {} is {module_size} bytes; the limit is {PLUGIN_MODULE_READ_LIMIT}",
+            module_path.display()
+        )));
+    }
+    let module_bytes = fs::read(&module_path)
+        .map_err(|error| Error::io("read plugin module", &module_path, error))?;
+    Ok(PluginDefinition {
+        name,
+        semantic_version,
+        abi_version,
+        parameters,
+        result,
+        expected_module_content: module_content,
+        module_bytes,
+    })
+}
+
+fn confined_plugin_path(workspace_root: &Path, candidate: &Path, kind: &str) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(candidate)
+        .map_err(|error| Error::io("resolve configured plugin path", candidate, error))?;
+    if !resolved.starts_with(workspace_root) {
+        return Err(Error::catalog(format!(
+            "{kind} {} is outside workspace {}",
+            resolved.display(),
+            workspace_root.display()
+        )));
+    }
+    if !resolved.is_file() {
+        return Err(Error::catalog(format!(
+            "{kind} {} is not a file",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn reject_unknown_fields(
+    table: &toml::map::Map<String, toml::Value>,
+    allowed: &[&str],
+    kind: &str,
+    path: &Path,
+) -> Result<()> {
+    if let Some(field) = table
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(Error::catalog(format!(
+            "{kind} {} has unknown field `{field}`",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn manifest_string<'a>(
+    table: &'a toml::map::Map<String, toml::Value>,
+    field: &str,
+    path: &Path,
+) -> Result<&'a str> {
+    table
+        .get(field)
+        .ok_or_else(|| manifest_missing(field, path))?
+        .as_str()
+        .ok_or_else(|| {
+            Error::catalog(format!(
+                "plugin manifest {} field `{field}` must be a string",
+                path.display()
+            ))
+        })
+}
+
+fn manifest_u32(
+    table: &toml::map::Map<String, toml::Value>,
+    field: &str,
+    path: &Path,
+) -> Result<u32> {
+    let value = table
+        .get(field)
+        .ok_or_else(|| manifest_missing(field, path))?
+        .as_integer()
+        .ok_or_else(|| {
+            Error::catalog(format!(
+                "plugin manifest {} field `{field}` must be a non-negative 32-bit integer",
+                path.display()
+            ))
+        })?;
+    u32::try_from(value).map_err(|_| {
+        Error::catalog(format!(
+            "plugin manifest {} field `{field}` must be a non-negative 32-bit integer",
+            path.display()
+        ))
+    })
+}
+
+fn manifest_missing(field: &str, path: &Path) -> Error {
+    Error::catalog(format!(
+        "plugin manifest {} is missing field `{field}`",
+        path.display()
+    ))
+}
+
+fn manifest_value_type(value: &str, path: &Path) -> Result<PluginValueType> {
+    match value {
+        "bytes" => Ok(PluginValueType::Bytes),
+        "rgba8-image" => Ok(PluginValueType::Rgba8Image),
+        "i64" => Ok(PluginValueType::I64),
+        _ => Err(Error::catalog(format!(
+            "plugin manifest {} has unsupported value type {value:?}; expected bytes, rgba8-image, or i64",
+            path.display()
+        ))),
+    }
+}
+
 impl Workspace {
     /// Finds the nearest initialized Histima workspace at or above `start`.
     ///
@@ -271,16 +509,26 @@ impl Workspace {
         let content = ContentStore::open(&root)?;
         let catalog = Catalog::open(&root.join(CATALOG_FILE_NAME))?;
         let world = WorldPolicy::load(&root)?;
+        let plugins = load_plugins(&root)?;
         Ok(Self {
             root,
             content,
             catalog,
             world,
+            plugins,
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn compile_tima(
+        &self,
+        name: impl Into<String>,
+        text: impl Into<String>,
+    ) -> std::result::Result<tima::CompiledProgram, Vec<tima::diagnostic::Diagnostic>> {
+        tima::compile_with_plugins(name, text, Arc::clone(&self.plugins))
     }
 
     fn retain_world_snapshot(

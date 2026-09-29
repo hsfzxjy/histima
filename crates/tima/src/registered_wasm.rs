@@ -10,7 +10,7 @@ use crate::diagnostic::Diagnostic;
 use crate::runtime::ImageValue;
 use crate::source::Span;
 
-const PLUGIN_ABI_VERSION: u32 = 3;
+pub(crate) const PLUGIN_ABI_VERSION: u32 = 3;
 const VALUE_WORDS: usize = 8;
 const VALUE_BYTES: usize = VALUE_WORDS * size_of::<u32>();
 const VALUE_BYTES_VIEW: u32 = 1;
@@ -35,19 +35,19 @@ struct PluginState {
     limits: StoreLimits,
 }
 
-enum PluginArgument<'a> {
+pub(crate) enum PluginArgument<'a> {
     BytesView(&'a [u8]),
     ImageView(&'a ImageValue),
     I64(i64),
 }
 
 #[derive(Clone, Copy)]
-enum PluginResultType {
+pub(crate) enum PluginResultType {
     Bytes,
     Image,
 }
 
-enum PluginResult {
+pub(crate) enum PluginResult {
     Bytes(Vec<u8>),
     Image(ImageValue),
 }
@@ -56,14 +56,15 @@ enum PluginResult {
 ///
 /// ABI v3 admits only the concrete native-safe types exercised by the current
 /// codecs: immutable byte/image views, `i64`, and owned byte/image results.
-struct RegisteredWasmPlugin {
-    name: &'static str,
+pub(crate) struct RegisteredWasmPlugin {
+    name: String,
     engine: Engine,
     module: Module,
 }
 
 impl RegisteredWasmPlugin {
-    fn compile(name: &'static str, bytes: &'static [u8]) -> Result<Self, String> {
+    pub(crate) fn compile(name: impl Into<String>, bytes: &[u8]) -> Result<Self, String> {
+        let name = name.into();
         let mut configuration = Config::default();
         configuration.consume_fuel(true);
         configuration.set_max_recursion_depth(32);
@@ -78,14 +79,52 @@ impl RegisteredWasmPlugin {
                 import.module()
             ));
         }
-        Ok(Self {
+        let plugin = Self {
             name,
             engine,
             module,
-        })
+        };
+        plugin.validate_load_contract()?;
+        Ok(plugin)
     }
 
-    fn invoke(
+    fn validate_load_contract(&self) -> Result<(), String> {
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(MAX_LINEAR_MEMORY)
+            .build();
+        let mut store = Store::new(&self.engine, PluginState { limits });
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(INVOCATION_FUEL)
+            .map_err(|error| error.to_string())?;
+        let instance = Instance::new(&mut store, &self.module, &[])
+            .map_err(|error| format!("could not instantiate: {error}"))?;
+        instance
+            .get_memory(&store, "memory")
+            .ok_or_else(|| "does not export `memory`".to_owned())?;
+        let version = instance
+            .get_typed_func::<(), i32>(&store, "tima_abi_version")
+            .map_err(|error| format!("invalid `tima_abi_version`: {error}"))?
+            .call(&mut store, ())
+            .map_err(|error| format!("ABI query trapped: {error}"))?;
+        if version != PLUGIN_ABI_VERSION as i32 {
+            return Err(format!(
+                "uses ABI version {version}; this runtime requires {PLUGIN_ABI_VERSION}"
+            ));
+        }
+        instance
+            .get_typed_func::<(), ()>(&store, "tima_reset")
+            .map_err(|error| format!("invalid `tima_reset`: {error}"))?;
+        instance
+            .get_typed_func::<i32, i32>(&store, "tima_alloc")
+            .map_err(|error| format!("invalid `tima_alloc`: {error}"))?;
+        instance
+            .get_typed_func::<(i32, i32, i32), i32>(&store, "tima_transform")
+            .map_err(|error| format!("invalid `tima_transform`: {error}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn invoke(
         &self,
         arguments: &[PluginArgument<'_>],
         result_type: PluginResultType,

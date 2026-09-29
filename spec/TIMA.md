@@ -701,11 +701,60 @@ frozen directly as an outer value; freezing does not make a second copy.
 Direct zero-copy sharing with guest linear memory is intentionally not part of
 the isolation contract.
 
-Transform ID remains the registry's semantic name/version identity. A
-registered-Wasm Artifact ID is separate and includes Transform ID, ABI/backend
-configuration, and the exact module content identity. Changing observable
-codec behavior requires a semantic version bump even if the Wasm artifact was
-also replaced.
+Built-in Transform ID remains the registry's semantic name/version identity.
+For workspace plugins it includes the namespaced name, semantic version, ABI
+version, ordered parameter names and types, and result type. A registered-Wasm
+Artifact ID is separate and includes Transform ID, ABI/backend configuration,
+and the exact module content identity. Replacing a module while claiming the
+same semantic contract changes Artifact ID but not Transform ID; changing
+observable behavior requires a semantic version bump.
+
+### 11.2 Workspace-local plugin registration
+
+Histima workspaces may explicitly opt into external ABI-v3 modules through
+`.histima.toml`:
+
+```toml
+[plugins]
+manifests = ["plugins/example-encode.toml"]
+```
+
+Each listed TOML manifest contains exactly these fields:
+
+```toml
+name = "example.encode"
+semantic_version = 1
+abi_version = 3
+module = "example_encode.wasm"
+module_content = "<module byte Content ID>"
+result = "bytes"
+
+[[parameters]]
+name = "image"
+type = "rgba8-image"
+```
+
+The transform name is exactly two Tima identifiers separated by one dot and
+may not collide with a built-in or another configured plugin. Parameters are
+ordered, uniquely named, and currently have no defaults. Parameter types are
+`bytes`, `rgba8-image`, or `i64`; result type is `bytes` or `rgba8-image`.
+These spellings map directly to ABI-v3 immutable views, scalar arguments, and
+owned results.
+
+Manifest paths are relative to the workspace. Module paths are relative to
+their manifest. Both are canonicalized and must remain files inside the
+workspace, including after resolving `..` and filesystem links. Manifests are
+limited to 1 MiB and modules to 64 MiB. `module_content` is the Tima Content ID
+of the exact module bytes; a mismatch rejects workspace opening before Wasm
+compilation.
+
+Loading also verifies the ABI version, no-import rule, memory and function
+exports, and function signatures. A configured plugin receives no World
+capabilities and has no WASI. There is no ambient discovery, download, update,
+package manager, or native-library fallback. Once loaded, its calls use normal
+pipeline and `name#hash` syntax and the standard Recipe cache, lineage, trace,
+and replay rules. Replay requires the same semantic plugin definition to be
+available when the workspace is reopened.
 
 ## 12. Lineage, identity, caching, and replay
 

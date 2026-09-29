@@ -5,6 +5,8 @@
 //! backends consume [`ir::TypedModule`], never syntax or a host-specific code
 //! format.
 
+use std::sync::Arc;
+
 pub mod abi;
 pub mod ast;
 pub mod backend;
@@ -16,6 +18,7 @@ pub mod ir;
 pub mod lexer;
 pub mod lineage;
 pub mod parser;
+pub mod plugin;
 mod registered;
 mod registered_wasm;
 pub mod runtime;
@@ -35,6 +38,7 @@ pub struct CompiledProgram {
     pub syntax: Program,
     pub transforms: TypedModule,
     pub identities: TransformIdentities,
+    pub plugins: Arc<plugin::PluginRegistry>,
 }
 
 /// Runs the shared frontend and the inner-transform semantic pass.
@@ -42,16 +46,26 @@ pub fn compile(
     name: impl Into<String>,
     text: impl Into<String>,
 ) -> Result<CompiledProgram, Vec<Diagnostic>> {
+    compile_with_plugins(name, text, Arc::default())
+}
+
+/// Runs the frontend with an explicit immutable registered-Wasm transform set.
+pub fn compile_with_plugins(
+    name: impl Into<String>,
+    text: impl Into<String>,
+    plugins: Arc<plugin::PluginRegistry>,
+) -> Result<CompiledProgram, Vec<Diagnostic>> {
     let source = SourceFile::new(name, text);
     let syntax = parser::parse(&source)?;
     let transforms = semantic::check(&syntax)?;
     let identities = identity::transform_identities(&transforms)?;
-    validate_identity_qualifiers(&syntax, &transforms, &identities)?;
+    validate_identity_qualifiers(&syntax, &transforms, &identities, &plugins)?;
     Ok(CompiledProgram {
         source,
         syntax,
         transforms,
         identities,
+        plugins,
     })
 }
 
@@ -59,6 +73,7 @@ fn validate_identity_qualifiers(
     syntax: &Program,
     transforms: &TypedModule,
     identities: &TransformIdentities,
+    plugins: &plugin::PluginRegistry,
 ) -> Result<(), Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
     for expression in &syntax.expressions {
@@ -80,7 +95,8 @@ fn validate_identity_qualifiers(
         let actual = transforms
             .find(&name)
             .map(|(id, _)| identities.get(id))
-            .or_else(|| registered::RegisteredTransform::find(&name).map(|value| value.identity()));
+            .or_else(|| registered::RegisteredTransform::find(&name).map(|value| value.identity()))
+            .or_else(|| plugins.find(&name).map(|value| value.identity()));
         let Some(actual) = actual else {
             diagnostics.push(Diagnostic::error(
                 format!("no semantic transform named `{name}` can be identity-qualified"),

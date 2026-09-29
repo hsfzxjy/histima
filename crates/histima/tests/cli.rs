@@ -590,6 +590,99 @@ fn cli_pipeline_evaluates_one_expression_and_stocks_byte_results() {
     assert!(stderr(&malformed).contains("<command-line-pipeline>:1"));
 }
 
+#[test]
+fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let source = test.path().join("source.ppm");
+    let script = test.path().join("plugin-pipeline.tima");
+    fs::write(&source, b"P3\n1 1\n255\n24 48 96\n").unwrap();
+    let source_locator = portable(&source);
+
+    assert_success(&histima(["init", text(&workspace)]));
+    let plugin_directory = workspace.join("plugins");
+    fs::create_dir_all(&plugin_directory).unwrap();
+    let checked_in_module = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("plugins/ppm-encode/ppm_encode.wasm");
+    let module = fs::read(checked_in_module).unwrap();
+    let module_path = plugin_directory.join("fixture.wasm");
+    fs::write(&module_path, &module).unwrap();
+    let module_content = tima::identity::byte_content_identity(&module);
+    let transform_id = tima::identity::registered_wasm_transform_identity(
+        "fixture.encode",
+        1,
+        3,
+        &[("image", 2)],
+        1,
+    );
+    fs::write(
+        plugin_directory.join("fixture.toml"),
+        format!(
+            "name = \"fixture.encode\"\n\
+             semantic_version = 1\n\
+             abi_version = 3\n\
+             module = \"fixture.wasm\"\n\
+             module_content = \"{module_content}\"\n\
+             result = \"bytes\"\n\
+             [[parameters]]\n\
+             name = \"image\"\n\
+             type = \"rgba8-image\"\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join(".histima.toml"),
+        "[plugins]\nmanifests = [\"plugins/fixture.toml\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        &script,
+        format!(
+            "source = asset({source_locator:?})\n\
+             out = source | read | ppm.decode | fixture.encode#{}\n",
+            &transform_id.to_string()[..16]
+        ),
+    )
+    .unwrap();
+    assert_success(&histima(["import", text(&workspace), &source_locator]));
+
+    let first = histima(["run", text(&workspace), text(&script), "--record", "out"]);
+    assert_success(&first);
+    assert_eq!(field(&first, "result_cache_hits"), "0");
+    let recipe = field(&first, "recipe_id");
+    let content = field(&first, "content_id");
+    let trace = histima(["trace", text(&workspace), &recipe]);
+    assert_success(&trace);
+    assert!(stdout(&trace).contains("invoke fixture.encode"));
+
+    let second = histima(["run", text(&workspace), text(&script), "--record", "out"]);
+    assert_success(&second);
+    assert_eq!(field(&second, "result_cache_hits"), "1");
+    assert_eq!(field(&second, "recipe_id"), recipe);
+    assert_eq!(field(&second, "content_id"), content);
+
+    let replay = histima(["replay", text(&workspace), text(&script), &recipe]);
+    assert_success(&replay);
+    assert_eq!(field(&replay, "content_id"), content);
+    assert!(stdout(&replay).contains("invoke fixture.encode"));
+
+    let mut tampered = module.clone();
+    tampered[0] ^= 1;
+    fs::write(&module_path, tampered).unwrap();
+    let rejected = histima(["stats", text(&workspace)]);
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("expected module content"));
+
+    fs::write(&module_path, module).unwrap();
+    assert_success(&histima([
+        "replay",
+        text(&workspace),
+        text(&script),
+        &recipe,
+    ]));
+}
+
 fn histima<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_histima"))
         .args(arguments)

@@ -207,6 +207,32 @@ pub fn registered_transform_identity(name: &str, semantic_version: u32) -> Trans
     TransformIdentity(Digest::from_hasher(hasher))
 }
 
+/// Semantic identity for an explicitly registered Wasm transform contract.
+///
+/// Exact module bytes are deliberately excluded: replacing an artifact with a
+/// semantically equivalent implementation preserves this identity. Parameter
+/// names are included because they are part of outer named-call semantics.
+pub fn registered_wasm_transform_identity(
+    name: &str,
+    semantic_version: u32,
+    abi_version: u32,
+    parameters: &[(&str, u8)],
+    result: u8,
+) -> TransformIdentity {
+    let mut hasher = CanonicalHasher::new(b"tima.registered-wasm-transform");
+    hasher.u32(SEMANTIC_ID_VERSION);
+    hasher.bytes(name.as_bytes());
+    hasher.u32(semantic_version);
+    hasher.u32(abi_version);
+    hasher.u64(parameters.len() as u64);
+    for (parameter_name, parameter_type) in parameters {
+        hasher.bytes(parameter_name.as_bytes());
+        hasher.u8(*parameter_type);
+    }
+    hasher.u8(result);
+    TransformIdentity(Digest::from_hasher(hasher))
+}
+
 struct TransformIdentityResolver<'a> {
     module: &'a TypedModule,
     values: Vec<Option<TransformIdentity>>,
@@ -873,6 +899,51 @@ mod tests {
         assert_ne!(
             registered_transform_identity("ppm.decode", 1),
             registered_transform_identity("ppm.encode", 1)
+        );
+    }
+
+    #[test]
+    fn registered_wasm_semantic_identity_includes_the_manifest_contract() {
+        let base = registered_wasm_transform_identity(
+            "fixture.encode",
+            1,
+            3,
+            &[("image", 2), ("quality", 3)],
+            1,
+        );
+        assert_eq!(
+            base,
+            registered_wasm_transform_identity(
+                "fixture.encode",
+                1,
+                3,
+                &[("image", 2), ("quality", 3)],
+                1,
+            )
+        );
+        assert_ne!(
+            base,
+            registered_wasm_transform_identity(
+                "fixture.encode",
+                1,
+                3,
+                &[("input", 2), ("quality", 3)],
+                1,
+            )
+        );
+        assert_ne!(
+            base,
+            registered_wasm_transform_identity("fixture.encode", 1, 3, &[("image", 2)], 1)
+        );
+        assert_ne!(
+            base,
+            registered_wasm_transform_identity(
+                "fixture.encode",
+                2,
+                3,
+                &[("image", 2), ("quality", 3)],
+                1,
+            )
         );
     }
 
