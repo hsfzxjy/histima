@@ -10,7 +10,7 @@ const PPM_ENCODE_TRANSFORM_VERSION: u32 = 2;
 const PNG_DECODE_TRANSFORM_VERSION: u32 = 2;
 const PNG_ENCODE_TRANSFORM_VERSION: u32 = 3;
 const PNG_DEFAULT_COMPRESSION: i64 = 6;
-const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 1;
+const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 2;
 const WEBP_DEFAULT_QUALITY: i64 = 85;
 
 #[derive(Clone, Copy)]
@@ -287,47 +287,7 @@ fn encode_png(image: &ImageValue, compression: u8, span: Span) -> Result<Vec<u8>
 }
 
 fn encode_webp(image: &ImageValue, quality: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
-    const MAX_DIMENSION: usize = 16_383;
-    if image.width() == 0
-        || image.height() == 0
-        || image.width() > MAX_DIMENSION
-        || image.height() > MAX_DIMENSION
-    {
-        return Err(Diagnostic::error(
-            "webp.encode dimensions must each be from 1 through 16383",
-            span,
-        ));
-    }
-    let row_length = image
-        .width()
-        .checked_mul(4)
-        .ok_or_else(|| Diagnostic::error("webp.encode row byte length overflows usize", span))?;
-    let packed_length = row_length
-        .checked_mul(image.height())
-        .ok_or_else(|| Diagnostic::error("webp.encode image byte length overflows usize", span))?;
-    let mut packed = Vec::with_capacity(packed_length);
-    image.with_bytes(|bytes| -> Result<(), Diagnostic> {
-        for row in 0..image.height() {
-            let start = row
-                .checked_mul(image.stride())
-                .ok_or_else(|| Diagnostic::error("webp.encode row offset overflows usize", span))?;
-            packed.extend_from_slice(&bytes[start..start + row_length]);
-        }
-        Ok(())
-    })?;
-
-    let input = webp_rust::ImageBuffer {
-        width: image.width(),
-        height: image.height(),
-        rgba: packed,
-    };
-    let config = webp_rust::LossyEncodingConfig {
-        quality: f32::from(quality),
-        ..webp_rust::LossyEncodingConfig::default()
-    };
-    webp_rust::encode_lossy_with_config(&input, &config, None).map_err(|error| {
-        Diagnostic::error(format!("webp.encode could not encode image: {error}"), span)
-    })
+    crate::registered_wasm::encode_webp(image, i64::from(quality), span)
 }
 
 #[cfg(test)]
@@ -441,6 +401,23 @@ mod tests {
             byte_content_identity(&first).to_string(),
             "6400962f906dc5e89d77e8683feef279f5515e2d346423e763feffb207b22c74"
         );
+    }
+
+    #[test]
+    fn webp_encoding_handles_a_nontrivial_image_within_the_sandbox_budget() {
+        let mut pixels = Vec::with_capacity(32 * 32 * 4);
+        for y in 0..32_u8 {
+            for x in 0..32_u8 {
+                pixels.extend_from_slice(&[x.wrapping_mul(7), y.wrapping_mul(7), x ^ y, 255]);
+            }
+        }
+        let image = ImageValue::new_rgba8(32, 32, 32 * 4, pixels).unwrap();
+
+        let encoded = encode_webp(&image, 85, Span::default()).unwrap();
+        let decoded = webp_rust::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.width, 32);
+        assert_eq!(decoded.height, 32);
     }
 
     #[test]

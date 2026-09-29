@@ -29,6 +29,7 @@ const PPM_DECODE_WASM: &[u8] = include_bytes!("../../../plugins/ppm-decode/ppm_d
 const PPM_ENCODE_WASM: &[u8] = include_bytes!("../../../plugins/ppm-encode/ppm_encode.wasm");
 const PNG_DECODE_WASM: &[u8] = include_bytes!("../../../plugins/png-decode/png_decode.wasm");
 const PNG_ENCODE_WASM: &[u8] = include_bytes!("../../../plugins/png-encode/png_encode.wasm");
+const WEBP_ENCODE_WASM: &[u8] = include_bytes!("../../../plugins/webp-encode/webp_encode.wasm");
 
 struct PluginState {
     limits: StoreLimits,
@@ -437,6 +438,7 @@ static PPM_DECODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::n
 static PPM_ENCODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
 static PNG_DECODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
 static PNG_ENCODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
+static WEBP_ENCODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
 
 fn ppm_decoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
     PPM_DECODER
@@ -462,6 +464,13 @@ fn png_encoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
 fn png_decoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
     PNG_DECODER
         .get_or_init(|| RegisteredWasmPlugin::compile("png.decode", PNG_DECODE_WASM))
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn webp_encoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
+    WEBP_ENCODER
+        .get_or_init(|| RegisteredWasmPlugin::compile("webp.encode", WEBP_ENCODE_WASM))
         .as_ref()
         .map_err(String::as_str)
 }
@@ -525,6 +534,26 @@ pub(crate) fn decode_png(input: &[u8], span: Span) -> Result<ImageValue, Diagnos
     }
 }
 
+pub(crate) fn encode_webp(
+    image: &ImageValue,
+    quality: i64,
+    span: Span,
+) -> Result<Vec<u8>, Diagnostic> {
+    let plugin = webp_encoder()
+        .map_err(|error| Diagnostic::error(format!("webp.encode Wasm plugin: {error}"), span))?;
+    match plugin.invoke(
+        &[
+            PluginArgument::ImageView(image),
+            PluginArgument::I64(quality),
+        ],
+        PluginResultType::Bytes,
+        span,
+    )? {
+        PluginResult::Bytes(bytes) => Ok(bytes),
+        PluginResult::Image(_) => unreachable!(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,10 +565,12 @@ mod tests {
         let encoder = ppm_encoder().unwrap();
         let png_decoder = png_decoder().unwrap();
         let png_encoder = png_encoder().unwrap();
+        let webp_encoder = webp_encoder().unwrap();
         assert_eq!(decoder.module.imports().count(), 0);
         assert_eq!(encoder.module.imports().count(), 0);
         assert_eq!(png_decoder.module.imports().count(), 0);
         assert_eq!(png_encoder.module.imports().count(), 0);
+        assert_eq!(webp_encoder.module.imports().count(), 0);
 
         let semantic = registered_transform_identity("ppm.decode", 2);
         let artifact =
