@@ -20,7 +20,7 @@ fn run() -> Result<(), ()> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next().unwrap_or_else(|| "help".to_owned());
     if command == "help" || command == "--help" || command == "-h" {
-        eprintln!("usage: tima <check|run|emit-object> <file.tima>");
+        eprintln!("usage: tima <check|run|run-native|emit-object> <file.tima>");
         return Ok(());
     }
     let Some(path) = arguments.next() else {
@@ -52,19 +52,35 @@ fn run() -> Result<(), ()> {
                 );
             }
         }
-        "run" => {
+        "run" | "run-native" => {
             let mut result_cache = TransformResultCache::default();
             let capabilities = CliCapabilities;
-            let execution = tima::runtime::execute_cached_with_capabilities(
-                &compiled,
-                &mut result_cache,
-                &capabilities,
-            )
-            .map_err(|diagnostics| {
-                for diagnostic in diagnostics {
-                    eprint!("{}", diagnostic.render(&compiled.source));
-                }
-            })?;
+            let (execution, artifact) = if command == "run-native" {
+                let execution = tima::runtime::execute_aot_cached_with_capabilities(
+                    &compiled,
+                    &mut result_cache,
+                    &capabilities,
+                    std::path::Path::new("build").join("tima-native"),
+                )
+                .map_err(|diagnostics| {
+                    for diagnostic in diagnostics {
+                        eprint!("{}", diagnostic.render(&compiled.source));
+                    }
+                })?;
+                (execution.execution, execution.artifact)
+            } else {
+                let execution = tima::runtime::execute_cached_with_capabilities(
+                    &compiled,
+                    &mut result_cache,
+                    &capabilities,
+                )
+                .map_err(|diagnostics| {
+                    for diagnostic in diagnostics {
+                        eprint!("{}", diagnostic.render(&compiled.source));
+                    }
+                })?;
+                (execution, None)
+            };
             let unbound_trace = execution.last_value.as_ref().and_then(|last| {
                 let ValueData::Lineage(lineage) = &last.data else {
                     return None;
@@ -76,6 +92,16 @@ fn run() -> Result<(), ()> {
             }
             if let Some(lineage) = unbound_trace {
                 println!("{}", lineage.render());
+            }
+            if command == "run-native" {
+                if let Some(artifact) = artifact {
+                    println!(
+                        "native artifact = {} ({:?})",
+                        artifact.bundle_id, artifact.status
+                    );
+                } else {
+                    println!("native artifact = none (interpreter fallback)");
+                }
             }
         }
         "emit-object" => {
@@ -94,7 +120,7 @@ fn run() -> Result<(), ()> {
         }
         _ => {
             eprintln!("error: unknown command `{command}`");
-            eprintln!("usage: tima <check|run|emit-object> <file.tima>");
+            eprintln!("usage: tima <check|run|run-native|emit-object> <file.tima>");
             return Err(());
         }
     }

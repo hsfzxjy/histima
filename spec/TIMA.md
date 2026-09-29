@@ -22,7 +22,7 @@ one source language with two execution strata:
 
 - **outer code** is dynamic, immutable, and orchestration-oriented;
 - **inner code**, introduced by `transform`, is statically checked and is
-  currently executed directly from typed IR by the host runtime.
+  executed from typed IR or by the initial AOT scalar runtime.
 
 Both strata use the same lexer, parser, expression syntax tree, source spans,
 and diagnostic model. Semantic context determines which syntax and values are
@@ -36,15 +36,16 @@ Tima source
     -> inner semantic checking
     -> backend-neutral typed Tima IR
     -> typed-IR interpreter
+       or AOT Cranelift artifact
 ```
 
-The interpreter is the product execution engine in this version. The initial
-AOT Cranelift backend emits host object artifacts for a scalar subset of the
-same typed IR; native loading is not yet a product execution path. It remains
-an additive implementation of `TypedIR -> NativeArtifact`; Cranelift IR is not
-Tima's semantic IR and JIT execution is not planned. WebAssembly is reserved
-for separately registered plugin transforms, whose ABI is not yet part of this
-contract.
+The interpreter is the Histima product execution engine in this version. The
+standalone Tima runtime can emit, cache, link, load, and execute host artifacts
+for a scalar subset of the same typed IR, while interpreting unsupported
+transforms. This remains an additive implementation of `TypedIR ->
+NativeArtifact`; Cranelift IR is not Tima's semantic IR and JIT execution is
+not planned. WebAssembly is reserved for separately registered plugin
+transforms, whose ABI is not yet part of this contract.
 
 ## 2. Core invariants
 
@@ -526,10 +527,25 @@ buffers transfer from their owned `Vec` into reference-counted immutable
 storage. Lineage is attached beside the outer payload and never enters the
 inner representation.
 
-The future AOT ABI must preserve these ownership rules, use a narrow
-C-compatible descriptor surface, and must not pass Rust or dynamic outer
-objects. Its version and machine representation will belong to Artifact
-identity, not Transform identity.
+The implemented scalar AOT entry ABI is C-compatible:
+
+```c
+int32_t tima_transform_N(
+    void *runtime_context,
+    const uint64_t *arguments,
+    uint64_t *result
+);
+```
+
+The statically checked transform signature determines how each argument slot
+and the result slot are interpreted. `bool`, `u8`, and `f32` use their low
+bits; `i64` uses the complete slot. Status zero means success. The runtime
+context is currently null and reserved for later allocation, diagnostic, and
+World callbacks. No Rust object, dynamic outer tag, lineage, or cache metadata
+crosses this boundary. The initial slot ABI supports little-endian x86-64 and
+AArch64 hosts. Extending the ABI to owned/view descriptors must preserve the
+ownership rules above. ABI and backend versions are part of Artifact identity,
+not Transform identity.
 
 ## 10. Runtime-mediated capabilities
 
@@ -727,22 +743,29 @@ The backend boundary is conceptually:
 TypedIR -> NativeArtifact
 ```
 
-An initial AOT Cranelift backend emits a host relocatable object through
-`tima emit-object`. Its implemented subset is deliberately limited to leaf
-transforms whose parameters and result are `bool`, `u8`, `i64`, or `f32` and
-whose bodies use scalar constants, comparisons, control flow, and `f32`
-arithmetic. Checked `i64` arithmetic, transform calls, owned/view values, and
-World calls are rejected rather than compiled with different semantics. The
-object is not yet loaded by Histima; product execution remains interpreted.
+The AOT Cranelift backend emits a host relocatable object through `tima
+emit-object`. `tima run-native` additionally caches that object, links a host
+load image with Clang, and executes supported transforms through the scalar ABI.
+`TIMA_CLANG` may select the Clang executable; otherwise the runtime uses the
+standard LLVM installation on Windows or `clang` from `PATH`.
+
+The implemented subset is deliberately limited to leaf transforms whose
+parameters and result are `bool`, `u8`, `i64`, or `f32` and whose bodies use
+scalar constants, comparisons, control flow, and `f32` arithmetic. Checked
+`i64` arithmetic, transform calls, owned/view values, and World calls are not
+compiled. The hybrid `run-native` path interprets those transforms instead,
+without changing lineage or Recipe identity. Histima product execution remains
+interpreted until the owned/view ABI is implemented and integrated.
 
 Native artifacts are cached independently using Artifact IDs derived from the
 Transform ID plus the Cranelift/compiler version, target, inferred CPU feature
 configuration, optimization setting, and ABI version. A compilation-unit
-bundle ID includes the ordered Artifact IDs. None of these machine details
-affect semantic lineage or Recipe IDs. Extending the backend must preserve
-typed evaluation order, ownership transfer, World observations, boundary
-validation, and error behavior specified here. JIT compilation is out of
-scope.
+bundle ID includes the ordered Artifact IDs. The linked shared-library load
+image is a rebuildable execution cache derived from the validated object, not a
+second semantic artifact. None of these machine details affect semantic
+lineage or Recipe IDs. Extending the backend must preserve typed evaluation
+order, ownership transfer, World observations, boundary validation, and error
+behavior specified here. JIT compilation is out of scope.
 
 Tima does not generate or execute WebAssembly for inner-language transforms.
 WebAssembly is reserved for the separately registered plugin boundary described

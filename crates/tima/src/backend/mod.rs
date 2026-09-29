@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod cranelift;
+pub mod native;
 
 use crate::diagnostic::Diagnostic;
 use crate::ir::TypedModule;

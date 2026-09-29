@@ -1,7 +1,9 @@
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee32;
-use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, Signature, UserFuncName, types};
+use cranelift_codegen::ir::{
+    AbiParam, Function, InstBuilder, MemFlagsData, Signature, UserFuncName, types,
+};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use object::write::{Object, StandardSection, Symbol, SymbolSection};
@@ -13,7 +15,7 @@ use crate::backend::{ArtifactBackend, BackendArtifact};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Constant, Terminator, Transform, Type, TypedModule, ValueId, ValueKind};
 
-pub const CRANELIFT_BACKEND_VERSION: &str = "1";
+pub const CRANELIFT_BACKEND_VERSION: &str = "2";
 pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 
 /// Ahead-of-time native object generation from backend-neutral Tima IR.
@@ -23,6 +25,12 @@ pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 /// cover all values admitted at a call boundary.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CraneliftBackend;
+
+impl CraneliftBackend {
+    pub fn supports_transform(transform: &Transform) -> bool {
+        validate_transform(transform).is_empty()
+    }
+}
 
 impl ArtifactBackend for CraneliftBackend {
     fn emit(&self, module: &TypedModule) -> Result<BackendArtifact, Vec<Diagnostic>> {
@@ -120,61 +128,7 @@ impl ArtifactBackend for CraneliftBackend {
 fn validate_module(module: &TypedModule) -> Result<(), Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
     for transform in &module.transforms {
-        if !transform
-            .parameters
-            .iter()
-            .all(|parameter| scalar_type(parameter.ty))
-            || !scalar_type(transform.return_type)
-        {
-            diagnostics.push(
-                Diagnostic::error(
-                    format!(
-                        "Cranelift scalar AOT does not yet support the boundary of transform `{}`",
-                        transform.name
-                    ),
-                    transform.span,
-                )
-                .with_note("supported boundary types are bool, u8, i64, and f32"),
-            );
-            continue;
-        }
-        for value in &transform.values {
-            match &value.kind {
-                ValueKind::Parameter { .. }
-                | ValueKind::Constant(Constant::Bool(_) | Constant::I64(_) | Constant::F32(_)) => {}
-                ValueKind::Binary { op, left, .. }
-                    if value_type(transform, *left) == Type::I64 && op.is_arithmetic() =>
-                {
-                    diagnostics.push(
-                        Diagnostic::error(
-                            "Cranelift scalar AOT does not yet lower checked i64 arithmetic",
-                            value.span,
-                        )
-                        .with_note(
-                            "the backend must preserve Tima overflow and division diagnostics",
-                        ),
-                    );
-                }
-                ValueKind::Binary { .. } => {}
-                ValueKind::Call { .. } => diagnostics.push(
-                    Diagnostic::error(
-                        "Cranelift scalar AOT does not yet lower transform calls",
-                        value.span,
-                    )
-                    .with_note("the first native artifact slice accepts leaf transforms only"),
-                ),
-                ValueKind::Constant(Constant::String(_))
-                | ValueKind::ImageZero { .. }
-                | ValueKind::ImageFill { .. }
-                | ValueKind::ImageByteElement
-                | ValueKind::ImageByteMap { .. }
-                | ValueKind::ImageRgba8Scale { .. }
-                | ValueKind::RuntimeCall(_) => diagnostics.push(Diagnostic::error(
-                    "operation is outside the initial Cranelift scalar AOT subset",
-                    value.span,
-                )),
-            }
-        }
+        diagnostics.extend(validate_transform(transform));
     }
     if diagnostics.is_empty() {
         Ok(())
@@ -183,20 +137,78 @@ fn validate_module(module: &TypedModule) -> Result<(), Vec<Diagnostic>> {
     }
 }
 
+fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if !transform
+        .parameters
+        .iter()
+        .all(|parameter| scalar_type(parameter.ty))
+        || !scalar_type(transform.return_type)
+    {
+        diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "Cranelift scalar AOT does not yet support the boundary of transform `{}`",
+                    transform.name
+                ),
+                transform.span,
+            )
+            .with_note("supported boundary types are bool, u8, i64, and f32"),
+        );
+        return diagnostics;
+    }
+    for value in &transform.values {
+        match &value.kind {
+            ValueKind::Parameter { .. }
+            | ValueKind::Constant(Constant::Bool(_) | Constant::I64(_) | Constant::F32(_)) => {}
+            ValueKind::Binary { op, left, .. }
+                if value_type(transform, *left) == Type::I64 && op.is_arithmetic() =>
+            {
+                diagnostics.push(
+                    Diagnostic::error(
+                        "Cranelift scalar AOT does not yet lower checked i64 arithmetic",
+                        value.span,
+                    )
+                    .with_note("the backend must preserve Tima overflow and division diagnostics"),
+                );
+            }
+            ValueKind::Binary { .. } => {}
+            ValueKind::Call { .. } => diagnostics.push(
+                Diagnostic::error(
+                    "Cranelift scalar AOT does not yet lower transform calls",
+                    value.span,
+                )
+                .with_note("the first native artifact slice accepts leaf transforms only"),
+            ),
+            ValueKind::Constant(Constant::String(_))
+            | ValueKind::ImageZero { .. }
+            | ValueKind::ImageFill { .. }
+            | ValueKind::ImageByteElement
+            | ValueKind::ImageByteMap { .. }
+            | ValueKind::ImageRgba8Scale { .. }
+            | ValueKind::RuntimeCall(_) => diagnostics.push(Diagnostic::error(
+                "operation is outside the initial Cranelift scalar AOT subset",
+                value.span,
+            )),
+        }
+    }
+    diagnostics
+}
+
 fn lower_transform(
     transform: &Transform,
     index: u32,
     isa: &dyn cranelift_codegen::isa::TargetIsa,
 ) -> Result<Function, Vec<Diagnostic>> {
     let mut signature = Signature::new(isa.default_call_conv());
-    for parameter in &transform.parameters {
-        signature
-            .params
-            .push(AbiParam::new(clif_type(parameter.ty)));
-    }
-    signature
-        .returns
-        .push(AbiParam::new(clif_type(transform.return_type)));
+    let pointer_type = isa.pointer_type();
+    // Opaque runtime context, packed argument slots, and one result slot.
+    signature.params.extend([
+        AbiParam::new(pointer_type),
+        AbiParam::new(pointer_type),
+        AbiParam::new(pointer_type),
+    ]);
+    signature.returns.push(AbiParam::new(types::I32));
     let mut function = Function::with_name_signature(UserFuncName::user(0, index), signature);
     let mut frontend = FunctionBuilderContext::new();
     {
@@ -208,19 +220,31 @@ fn lower_transform(
             .collect::<Vec<_>>();
         let entry = blocks[transform.entry.0 as usize];
         builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let argument_slots = builder.block_params(entry)[1];
+        let result_slot = builder.block_params(entry)[2];
         let mut values = vec![None; transform.values.len()];
         for parameter in &transform.parameters {
             let ValueKind::Parameter { index } = transform.value(parameter.value).kind else {
                 unreachable!("typed parameters reference parameter IR values")
             };
-            values[parameter.value.0 as usize] = Some(builder.block_params(entry)[index as usize]);
+            let offset = i32::try_from(u64::from(index) * 8)
+                .expect("Tima transform parameter slots fit a Cranelift offset");
+            values[parameter.value.0 as usize] = Some(builder.ins().load(
+                clif_type(parameter.ty),
+                MemFlagsData::new(),
+                argument_slots,
+                offset,
+            ));
         }
 
         let mut order = Vec::with_capacity(blocks.len());
         order.push(transform.entry.0 as usize);
         order.extend((0..blocks.len()).filter(|index| *index != transform.entry.0 as usize));
         for block_index in order {
-            builder.switch_to_block(blocks[block_index]);
+            if block_index != transform.entry.0 as usize {
+                builder.switch_to_block(blocks[block_index]);
+            }
             for id in &transform.blocks[block_index].instructions {
                 let value = &transform.values[id.0 as usize];
                 let lowered = match &value.kind {
@@ -239,7 +263,16 @@ fn lower_transform(
             }
             match transform.blocks[block_index].terminator {
                 Terminator::Return(value) => {
-                    builder.ins().return_(&[required_value(&values, value)]);
+                    builder.ins().store(
+                        MemFlagsData::new(),
+                        required_value(&values, value),
+                        result_slot,
+                        0,
+                    );
+                    let status = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(crate::abi::ABI_STATUS_OK));
+                    builder.ins().return_(&[status]);
                 }
                 Terminator::Jump(target) => {
                     builder.ins().jump(blocks[target.0 as usize], &[]);
@@ -349,6 +382,11 @@ fn required_value(
 }
 
 fn host_object_architecture() -> Result<Architecture, Vec<Diagnostic>> {
+    if !cfg!(target_endian = "little") {
+        return Err(vec![backend_error(
+            "the initial scalar slot ABI supports little-endian hosts only",
+        )]);
+    }
     if cfg!(target_arch = "x86_64") {
         Ok(Architecture::X86_64)
     } else if cfg!(target_arch = "aarch64") {

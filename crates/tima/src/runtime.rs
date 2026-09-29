@@ -2,10 +2,13 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
+use crate::backend::cache::CachedArtifact;
+use crate::backend::native::{NativeScalar as AbiScalar, NativeScalarModule};
 use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
 use crate::diagnostic::Diagnostic;
@@ -260,6 +263,12 @@ pub struct Execution {
     pub last_value: Option<OuterValue>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AotExecution {
+    pub execution: Execution,
+    pub artifact: Option<CachedArtifact>,
+}
+
 pub fn execute(program: &CompiledProgram) -> Result<Execution, Vec<Diagnostic>> {
     let engine = IrInterpreter {
         module: &program.transforms,
@@ -300,6 +309,35 @@ pub fn execute_cached_with_capabilities(
         capabilities: Some(capabilities),
     };
     execute_with(program, &engine, BTreeMap::new(), Some(cache))
+}
+
+/// Executes AOT-compatible leaf scalar transforms from a cached native load
+/// image and falls back to the typed-IR interpreter for every other transform.
+pub fn execute_aot_cached_with_capabilities(
+    program: &CompiledProgram,
+    cache: &mut dyn ResultCache,
+    capabilities: &dyn World,
+    artifact_cache_root: impl AsRef<Path>,
+) -> Result<AotExecution, Vec<Diagnostic>> {
+    let native = NativeScalarModule::build(
+        &program.transforms,
+        &program.identities,
+        artifact_cache_root,
+    )?;
+    let artifact = native.as_ref().map(|module| module.artifact().clone());
+    let interpreter = IrInterpreter {
+        module: &program.transforms,
+        capabilities: Some(capabilities),
+    };
+    let engine = HybridAotEngine {
+        interpreter,
+        native: native.as_ref(),
+    };
+    let execution = execute_with(program, &engine, BTreeMap::new(), Some(cache))?;
+    Ok(AotExecution {
+        execution,
+        artifact,
+    })
 }
 
 /// Host hook used to validate precise external observations before replay.
@@ -1638,6 +1676,56 @@ struct IrInterpreter<'a> {
     capabilities: Option<&'a dyn World>,
 }
 
+struct HybridAotEngine<'a> {
+    interpreter: IrInterpreter<'a>,
+    native: Option<&'a NativeScalarModule>,
+}
+
+impl TransformEngine for HybridAotEngine<'_> {
+    fn invoke(
+        &self,
+        id: TransformId,
+        arguments: Vec<(OuterValue, Span)>,
+    ) -> Result<TransformOutcome, Diagnostic> {
+        let Some(native) = self.native.filter(|native| native.contains(id)) else {
+            return self.interpreter.invoke(id, arguments);
+        };
+        let transform = self.interpreter.module.get(id);
+        let arguments = transform
+            .parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, (argument, span))| {
+                let value = lower_interpreted_value(argument, parameter.ty, span)?.scalar();
+                Ok(match value {
+                    NativeScalar::Bool(value) => AbiScalar::Bool(value),
+                    NativeScalar::U8(value) => AbiScalar::U8(value),
+                    NativeScalar::I64(value) => AbiScalar::I64(value),
+                    NativeScalar::F32(value) => AbiScalar::F32(value),
+                })
+            })
+            .collect::<Result<Vec<_>, Diagnostic>>()?;
+        let value = match native.invoke(id, &arguments)? {
+            AbiScalar::Bool(value) => NativeScalar::Bool(value),
+            AbiScalar::U8(value) => NativeScalar::U8(value),
+            AbiScalar::I64(value) => NativeScalar::I64(value),
+            AbiScalar::F32(value) => NativeScalar::F32(value),
+        };
+        Ok(TransformOutcome {
+            value: freeze_scalar(value),
+            observations: Vec::new(),
+        })
+    }
+
+    fn may_observe_dependencies(&self, id: TransformId) -> bool {
+        self.interpreter.may_observe_dependencies(id)
+    }
+
+    fn capabilities(&self) -> Option<&dyn World> {
+        self.interpreter.capabilities()
+    }
+}
+
 impl IrInterpreter<'_> {
     fn invoke_at_depth(
         &self,
@@ -2104,9 +2192,9 @@ mod tests {
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
         ImageFormat, ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver,
-        TransformEngine, ValueData, execute, execute_cached, execute_cached_with_capabilities,
-        execute_with, execute_with_capabilities, replay, replay_with_capabilities,
-        replay_with_dependencies, scale_rgba8_channel,
+        TransformEngine, ValueData, execute, execute_aot_cached_with_capabilities, execute_cached,
+        execute_cached_with_capabilities, execute_with, execute_with_capabilities, replay,
+        replay_with_capabilities, replay_with_dependencies, scale_rgba8_channel,
     };
     use crate::source::Span;
 
@@ -2180,6 +2268,39 @@ mod tests {
         .unwrap();
         let execution = execute(&compiled).unwrap();
         assert_eq!(execution.bindings["out"].data, ValueData::Float(2.0));
+    }
+
+    #[test]
+    fn aot_executes_supported_scalars_and_interprets_the_rest() {
+        let compiled = crate::compile(
+            "hybrid.tima",
+            "transform scale(x: f32, factor: f32) -> f32 { return x * factor }\n\
+             transform checked(left: i64, right: i64) -> i64 { return left + right }\n\
+             native_out = scale(8.0, 0.25)\n\
+             interpreted_out = checked(20, 22)\n",
+        )
+        .unwrap();
+        let world = FixedWorld {
+            environment: BTreeMap::new(),
+            files: BTreeMap::new(),
+            urls: BTreeMap::new(),
+        };
+        let mut cache = TransformResultCache::default();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join(format!("aot-runtime-{}", std::process::id()));
+        let execution =
+            execute_aot_cached_with_capabilities(&compiled, &mut cache, &world, root).unwrap();
+        assert!(execution.artifact.is_some());
+        assert_eq!(
+            execution.execution.bindings["native_out"].data,
+            ValueData::Float(2.0)
+        );
+        assert_eq!(
+            execution.execution.bindings["interpreted_out"].data,
+            ValueData::Integer(42)
+        );
     }
 
     #[test]

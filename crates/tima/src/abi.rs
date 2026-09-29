@@ -1,7 +1,14 @@
 use crate::ir::Type;
 
-/// ABI epoch reserved for future ahead-of-time native artifacts.
+/// ABI epoch for ahead-of-time native artifacts.
 pub const TIMA_ABI_VERSION: u32 = 1;
+
+/// One scalar call-boundary slot. Statically known signature types determine
+/// how its low bits are interpreted; dynamic outer tags never enter native
+/// transform code.
+pub type AbiSlot = u64;
+
+pub const ABI_STATUS_OK: i32 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ownership {
