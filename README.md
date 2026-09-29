@@ -56,7 +56,9 @@ Catalog listings use bounded SQLite keyset pagination. `histima assets` and
 `histima recipes` accept `--limit <1-100>` and return `next_cursor` when more
 rows exist. Pass that value back with `--after <cursor>` to fetch the next
 page. Asset cursors are locators; recipe cursors are Recipe IDs. Calls without
-these options retain the existing 100-row maximum.
+these options retain the existing 100-row maximum. `assets --prefix <text>`
+filters by a case-sensitive locator prefix, while `recipes --transform <name>`
+matches an exact recorded transform name; both filters compose with cursors.
 
 `histima pipeline [workspace] <expression>` accepts exactly one outer Tima
 expression. Invocation-derived byte results are automatically recorded in

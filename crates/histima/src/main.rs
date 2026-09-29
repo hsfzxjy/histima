@@ -126,11 +126,12 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         "assets" => {
             let limit = list_limit(&mut arguments)?;
             let after = take_value_option(&mut arguments, "--after")?;
+            let prefix = take_value_option(&mut arguments, "--prefix")?;
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let page = workspace
-                .assets_page(limit, after.as_deref())
+                .assets_filtered_page(limit, after.as_deref(), prefix.as_deref())
                 .map_err(|error| error.to_string())?;
             output.emit(cli_json::assets(&page), || {
                 println!("count = {}", page.items.len());
@@ -155,11 +156,12 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                         .map_err(|error| format!("invalid Recipe cursor: {error}"))
                 })
                 .transpose()?;
+            let transform = take_value_option(&mut arguments, "--transform")?;
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
             let page = workspace
-                .recipes_page(limit, after)
+                .recipes_filtered_page(limit, after, transform.as_deref())
                 .map_err(|error| error.to_string())?;
             output.emit(cli_json::recipes(&page), || {
                 println!("count = {}", page.items.len());
@@ -666,8 +668,12 @@ fn print_usage() {
     eprintln!("  histima init [workspace]");
     eprintln!("  histima import [workspace] <source-file>");
     eprintln!("  histima stats [workspace]");
-    eprintln!("  histima assets [workspace] [--limit <1-100>] [--after <locator>]");
-    eprintln!("  histima recipes [workspace] [--limit <1-100>] [--after <recipe-id>]");
+    eprintln!(
+        "  histima assets [workspace] [--prefix <locator-prefix>] [--limit <1-100>] [--after <locator>]"
+    );
+    eprintln!(
+        "  histima recipes [workspace] [--transform <name>] [--limit <1-100>] [--after <recipe-id>]"
+    );
     eprintln!("  histima plugins [workspace]");
     eprintln!("  histima inspect content [workspace] <content-id>");
     eprintln!("  histima inspect recipe [workspace] <recipe-id>");

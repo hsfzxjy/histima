@@ -642,7 +642,16 @@ impl Workspace {
         limit: usize,
         after: Option<&str>,
     ) -> Result<CatalogPage<AssetSummary>> {
-        self.catalog.assets(limit, after)
+        self.assets_filtered_page(limit, after, None)
+    }
+
+    pub fn assets_filtered_page(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+        locator_prefix: Option<&str>,
+    ) -> Result<CatalogPage<AssetSummary>> {
+        self.catalog.assets(limit, after, locator_prefix)
     }
 
     pub fn recipes(&self) -> Result<CatalogPage<RecipeSummary>> {
@@ -654,7 +663,16 @@ impl Workspace {
         limit: usize,
         after: Option<RecipeIdentity>,
     ) -> Result<CatalogPage<RecipeSummary>> {
-        self.catalog.recipes(limit, after)
+        self.recipes_filtered_page(limit, after, None)
+    }
+
+    pub fn recipes_filtered_page(
+        &self,
+        limit: usize,
+        after: Option<RecipeIdentity>,
+        transform_name: Option<&str>,
+    ) -> Result<CatalogPage<RecipeSummary>> {
+        self.catalog.recipes(limit, after, transform_name)
     }
 
     pub fn inspect_content(&self, identity: ContentIdentity) -> Result<ContentInspection> {
@@ -1021,7 +1039,7 @@ mod tests {
         assert_eq!(
             workspace.catalog_info().unwrap(),
             CatalogInfo {
-                schema_version: 5,
+                schema_version: 6,
                 foreign_keys_enabled: true,
                 journal_mode: "wal".to_owned(),
             }

@@ -1,7 +1,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::types::Value;
+use rusqlite::{
+    Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use tima::identity::{
     ArtifactBundleIdentity, ArtifactConfiguration, ArtifactIdentity, ContentIdentity,
     DependencyIdentity, RecipeIdentity, SemanticValueIdentity, SourceIdentity, TransformIdentity,
@@ -13,7 +16,7 @@ use crate::cas::{ContentKind, StoredContent};
 use crate::error::{Error, Result};
 use crate::stored_lineage::StoredRecipe;
 
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const LATEST_SCHEMA_VERSION: i64 = 6;
 pub const CATALOG_LIST_LIMIT: usize = 100;
 
 const MIGRATION_1: &str = r#"
@@ -146,6 +149,11 @@ CREATE TABLE world_snapshots (
         ON DELETE CASCADE
 ) STRICT;
 CREATE INDEX world_snapshots_content_idx ON world_snapshots(content_id);
+"#;
+
+const MIGRATION_6: &str = r#"
+CREATE INDEX lineage_invocations_transform_name_recipe_idx
+    ON lineage_invocations(transform_name, recipe_id);
 "#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -489,28 +497,39 @@ impl Catalog {
             .transpose()
     }
 
-    pub fn assets(&self, limit: usize, after: Option<&str>) -> Result<CatalogPage<AssetSummary>> {
+    pub fn assets(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+        locator_prefix: Option<&str>,
+    ) -> Result<CatalogPage<AssetSummary>> {
         let limit = sqlite_page_limit(limit)?;
         let select = "SELECT head.locator, head.source_id, source.content_id, content.byte_length
                       FROM source_heads AS head
                       JOIN source_assets AS source
                         ON source.locator = head.locator AND source.source_id = head.source_id
                       JOIN contents AS content ON content.content_id = source.content_id";
-        let rows = if let Some(after) = after {
-            let mut statement = self.connection.prepare(&format!(
-                "{select} WHERE head.locator > ?1 ORDER BY head.locator LIMIT ?2"
-            ))?;
-            statement
-                .query_map(params![after, limit], asset_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            let mut statement = self
-                .connection
-                .prepare(&format!("{select} ORDER BY head.locator LIMIT ?1"))?;
-            statement
-                .query_map([limit], asset_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
+        let mut predicates = Vec::new();
+        let mut parameters = Vec::new();
+        if let Some(prefix) = locator_prefix.filter(|prefix| !prefix.is_empty()) {
+            predicates.push("head.locator >= ?");
+            parameters.push(Value::Text(prefix.to_owned()));
+            if let Some(upper_bound) = string_prefix_upper_bound(prefix) {
+                predicates.push("head.locator < ?");
+                parameters.push(Value::Text(upper_bound));
+            }
+        }
+        if let Some(after) = after {
+            predicates.push("head.locator > ?");
+            parameters.push(Value::Text(after.to_owned()));
+        }
+        parameters.push(Value::Integer(limit));
+        let where_clause = sql_where(&predicates);
+        let sql = format!("{select}{where_clause} ORDER BY head.locator LIMIT ?");
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(parameters.iter()), asset_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut items = rows
             .into_iter()
             .map(|(locator, source_id, content_id, byte_len)| {
@@ -544,6 +563,7 @@ impl Catalog {
         &self,
         limit: usize,
         after: Option<RecipeIdentity>,
+        transform_name: Option<&str>,
     ) -> Result<CatalogPage<RecipeSummary>> {
         let limit = sqlite_page_limit(limit)?;
         let after = after.map(|identity| identity.to_string());
@@ -552,21 +572,23 @@ impl Catalog {
                       FROM recipe_results AS result
                       JOIN lineage_invocations AS invocation USING (recipe_id)
                       JOIN contents AS content ON content.content_id = result.content_id";
-        let rows = if let Some(after) = after.as_deref() {
-            let mut statement = self.connection.prepare(&format!(
-                "{select} WHERE result.recipe_id > ?1 ORDER BY result.recipe_id LIMIT ?2"
-            ))?;
-            statement
-                .query_map(params![after, limit], recipe_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            let mut statement = self
-                .connection
-                .prepare(&format!("{select} ORDER BY result.recipe_id LIMIT ?1"))?;
-            statement
-                .query_map([limit], recipe_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
+        let mut predicates = Vec::new();
+        let mut parameters = Vec::new();
+        if let Some(transform_name) = transform_name {
+            predicates.push("invocation.transform_name = ?");
+            parameters.push(Value::Text(transform_name.to_owned()));
+        }
+        if let Some(after) = after {
+            predicates.push("result.recipe_id > ?");
+            parameters.push(Value::Text(after));
+        }
+        parameters.push(Value::Integer(limit));
+        let where_clause = sql_where(&predicates);
+        let sql = format!("{select}{where_clause} ORDER BY result.recipe_id LIMIT ?");
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(parameters.iter()), recipe_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut items = rows
             .into_iter()
             .map(
@@ -805,6 +827,29 @@ fn recipe_row(row: &Row<'_>) -> rusqlite::Result<(String, String, String, String
     ))
 }
 
+fn string_prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut characters = prefix.chars().collect::<Vec<_>>();
+    while let Some(last) = characters.pop() {
+        let mut next = u32::from(last) + 1;
+        if next == 0xd800 {
+            next = 0xe000;
+        }
+        if let Some(next) = char::from_u32(next) {
+            characters.push(next);
+            return Some(characters.into_iter().collect());
+        }
+    }
+    None
+}
+
+fn sql_where(predicates: &[&str]) -> String {
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", predicates.join(" AND "))
+    }
+}
+
 fn bounded_page<T>(
     items: &mut Vec<T>,
     sqlite_limit: i64,
@@ -1001,6 +1046,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         (3_i64, "native artifact metadata", MIGRATION_3),
         (4_i64, "backend-neutral artifact metadata", MIGRATION_4),
         (5_i64, "retained World observations", MIGRATION_5),
+        (6_i64, "recipe transform-name query index", MIGRATION_6),
     ] {
         if version <= current {
             continue;
@@ -1379,7 +1425,7 @@ mod tests {
 
         let catalog = Catalog::open(&database).unwrap();
 
-        assert_eq!(catalog.info().unwrap().schema_version, 5);
+        assert_eq!(catalog.info().unwrap().schema_version, 6);
         assert_eq!(
             catalog
                 .connection
@@ -1397,7 +1443,86 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert_eq!(
+            catalog
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'index'
+                       AND name = 'lineage_invocations_transform_name_recipe_idx'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        let plan = {
+            let mut statement = catalog
+                .connection
+                .prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT result.recipe_id, invocation.transform_id,
+                            invocation.transform_name, result.content_id, content.byte_length
+                     FROM recipe_results AS result
+                     JOIN lineage_invocations AS invocation USING (recipe_id)
+                     JOIN contents AS content ON content.content_id = result.content_id
+                     WHERE invocation.transform_name = ?1
+                     ORDER BY result.recipe_id LIMIT ?2",
+                )
+                .unwrap();
+            statement
+                .query_map(params!["ppm.encode", 10], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("lineage_invocations_transform_name_recipe_idx")),
+            "unexpected query plan: {plan:?}"
+        );
+        let asset_plan = {
+            let mut statement = catalog
+                .connection
+                .prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT head.locator, head.source_id, source.content_id, content.byte_length
+                     FROM source_heads AS head
+                     JOIN source_assets AS source
+                       ON source.locator = head.locator AND source.source_id = head.source_id
+                     JOIN contents AS content ON content.content_id = source.content_id
+                     WHERE head.locator >= ?1 AND head.locator < ?2
+                     ORDER BY head.locator LIMIT ?3",
+                )
+                .unwrap();
+            statement
+                .query_map(params!["assets/", "assets0", 10], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            asset_plan
+                .iter()
+                .any(|detail| detail.contains("sqlite_autoindex_source_heads_1")),
+            "unexpected asset query plan: {asset_plan:?}"
+        );
         drop(catalog);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn string_prefix_upper_bounds_cover_unicode_prefix_ranges() {
+        assert_eq!(
+            string_prefix_upper_bound("asset/"),
+            Some("asset0".to_owned())
+        );
+        assert_eq!(
+            string_prefix_upper_bound("a\u{d7ff}"),
+            Some("a\u{e000}".to_owned())
+        );
+        assert_eq!(string_prefix_upper_bound("\u{10ffff}"), None);
     }
 }

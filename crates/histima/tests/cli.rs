@@ -55,7 +55,7 @@ fn cli_imports_inspects_and_materializes_across_processes() {
 
     let initialized = histima(["init", text(&workspace)]);
     assert_success(&initialized);
-    assert!(stdout(&initialized).contains("schema_version = 5"));
+    assert!(stdout(&initialized).contains("schema_version = 6"));
 
     let imported = histima(["import", text(&workspace), text(&source)]);
     assert_success(&imported);
@@ -115,24 +115,38 @@ fn cli_paginates_assets_and_recipes_with_stable_cursors() {
 
     let mut locators = Vec::new();
     let mut recipe_ids = Vec::new();
+    let mut ppm_recipe_ids = Vec::new();
     for index in 0..3 {
-        let source = test.path().join(format!("asset-{index}.bin"));
+        let file_name = if index < 2 {
+            format!("group-{index}.bin")
+        } else {
+            "other.bin".to_owned()
+        };
+        let source = test.path().join(file_name);
         fs::write(&source, format!("P3\n1 1\n255\n{index} 0 0\n")).unwrap();
         let locator = portable(&source);
         assert_success(&histima(["import", text(&workspace), &locator]));
-        let expression = format!("asset({locator:?}) | read | ppm.decode | ppm.encode");
+        let encoder = if index < 2 {
+            "ppm.encode"
+        } else {
+            "webp.encode(quality=80)"
+        };
+        let expression = format!("asset({locator:?}) | read | ppm.decode | {encoder}");
         let pipeline = histima(["pipeline", text(&workspace), &expression, "--json"]);
         assert_success(&pipeline);
-        recipe_ids.push(
-            json_output(&pipeline)["stocked"]["recipe_id"]
-                .as_str()
-                .unwrap()
-                .to_owned(),
-        );
+        let recipe_id = json_output(&pipeline)["stocked"]["recipe_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        if index < 2 {
+            ppm_recipe_ids.push(recipe_id.clone());
+        }
+        recipe_ids.push(recipe_id);
         locators.push(locator);
     }
     locators.sort();
     recipe_ids.sort();
+    ppm_recipe_ids.sort();
 
     let assets = histima(["assets", text(&workspace), "--limit", "2", "--json"]);
     assert_success(&assets);
@@ -159,6 +173,40 @@ fn cli_paginates_assets_and_recipes_with_stable_cursors() {
     assert_eq!(assets_after["next_cursor"], Value::Null);
     assert_eq!(assets_after["assets"][0]["locator"], locators[2]);
 
+    let group_prefix = portable(&test.path().join("group-"));
+    let filtered_assets = histima([
+        "assets",
+        text(&workspace),
+        "--prefix",
+        &group_prefix,
+        "--limit",
+        "1",
+        "--json",
+    ]);
+    assert_success(&filtered_assets);
+    let filtered_assets = json_output(&filtered_assets);
+    assert_eq!(filtered_assets["count"], 1);
+    assert_eq!(filtered_assets["truncated"], true);
+    assert_eq!(filtered_assets["assets"][0]["locator"], locators[0]);
+    assert_eq!(filtered_assets["next_cursor"], locators[0]);
+
+    let filtered_assets_after = histima([
+        "assets",
+        text(&workspace),
+        "--prefix",
+        &group_prefix,
+        "--after",
+        &locators[0],
+        "--limit",
+        "1",
+        "--json",
+    ]);
+    assert_success(&filtered_assets_after);
+    let filtered_assets_after = json_output(&filtered_assets_after);
+    assert_eq!(filtered_assets_after["count"], 1);
+    assert_eq!(filtered_assets_after["truncated"], false);
+    assert_eq!(filtered_assets_after["assets"][0]["locator"], locators[1]);
+
     let recipes = histima(["recipes", "--limit", "2", text(&workspace), "--json"]);
     assert_success(&recipes);
     let recipes = json_output(&recipes);
@@ -183,6 +231,49 @@ fn cli_paginates_assets_and_recipes_with_stable_cursors() {
     assert_eq!(recipes_after["truncated"], false);
     assert_eq!(recipes_after["next_cursor"], Value::Null);
     assert_eq!(recipes_after["recipes"][0]["recipe_id"], recipe_ids[2]);
+
+    let filtered_recipes = histima([
+        "recipes",
+        text(&workspace),
+        "--transform",
+        "ppm.encode",
+        "--limit",
+        "1",
+        "--json",
+    ]);
+    assert_success(&filtered_recipes);
+    let filtered_recipes = json_output(&filtered_recipes);
+    assert_eq!(filtered_recipes["count"], 1);
+    assert_eq!(filtered_recipes["truncated"], true);
+    assert_eq!(
+        filtered_recipes["recipes"][0]["recipe_id"],
+        ppm_recipe_ids[0]
+    );
+    assert_eq!(filtered_recipes["next_cursor"], ppm_recipe_ids[0]);
+
+    let filtered_recipes_after = histima([
+        "recipes",
+        "--transform",
+        "ppm.encode",
+        "--after",
+        &ppm_recipe_ids[0],
+        "--limit",
+        "1",
+        text(&workspace),
+        "--json",
+    ]);
+    assert_success(&filtered_recipes_after);
+    let filtered_recipes_after = json_output(&filtered_recipes_after);
+    assert_eq!(filtered_recipes_after["count"], 1);
+    assert_eq!(filtered_recipes_after["truncated"], false);
+    assert_eq!(
+        filtered_recipes_after["recipes"][0]["recipe_id"],
+        ppm_recipe_ids[1]
+    );
+    assert_eq!(
+        filtered_recipes_after["recipes"][0]["transform_name"],
+        "ppm.encode"
+    );
 
     let invalid_limit = histima(["assets", text(&workspace), "--limit", "0"]);
     assert!(!invalid_limit.status.success());
@@ -486,7 +577,7 @@ fn cli_json_covers_the_workspace_lifecycle() {
     let initialized = histima(["--json", "init", text(&workspace)]);
     assert_success(&initialized);
     let initialized = json_output(&initialized);
-    assert_eq!(initialized["schema_version"], 5);
+    assert_eq!(initialized["schema_version"], 6);
     assert_eq!(initialized["journal_mode"], "wal");
 
     let imported = histima(["import", text(&workspace), &source_locator, "--json"]);
