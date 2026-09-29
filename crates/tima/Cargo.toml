@@ -21,5 +21,5 @@ libloading = "=0.8.9"
 object = { version = "=0.40.0", default-features = false, features = ["read", "write", "std", "coff", "elf", "macho", "pe"] }
 png = "=0.18.1"
 target-lexicon = "=0.13.5"
-wasmi = { version = "=2.0.0", default-features = false, features = ["stable", "std", "validate"] }
+wasmi = { version = "=2.0.0", default-features = false, features = ["auto-dispatch", "stable", "std", "validate"] }
 webp-rust = "=0.3.1"

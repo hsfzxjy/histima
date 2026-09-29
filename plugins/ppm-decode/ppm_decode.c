@@ -1,4 +1,4 @@
-// ASCII P3 decoder for Histima registered-Wasm plugin ABI v2.
+// ASCII P3 decoder for Histima registered-Wasm plugin ABI v3.
 
 #include "tima_plugin.h"
 

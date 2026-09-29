@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use wasmi::{
-    Config, EnforcedLimits, Engine, Instance, Memory, Module, Store, StoreLimits,
+    CompilationMode, Config, EnforcedLimits, Engine, Instance, Memory, Module, Store, StoreLimits,
     StoreLimitsBuilder, TypedFunc,
 };
 
@@ -10,13 +10,14 @@ use crate::diagnostic::Diagnostic;
 use crate::runtime::ImageValue;
 use crate::source::Span;
 
-const PLUGIN_ABI_VERSION: u32 = 2;
+const PLUGIN_ABI_VERSION: u32 = 3;
 const VALUE_WORDS: usize = 8;
 const VALUE_BYTES: usize = VALUE_WORDS * size_of::<u32>();
 const VALUE_BYTES_VIEW: u32 = 1;
 const VALUE_IMAGE_VIEW: u32 = 2;
-const VALUE_BYTES_RESULT: u32 = 3;
-const VALUE_IMAGE_RESULT: u32 = 4;
+const VALUE_I64: u32 = 3;
+const VALUE_BYTES_RESULT: u32 = 4;
+const VALUE_IMAGE_RESULT: u32 = 5;
 const VALUE_DIAGNOSTIC: u32 = 255;
 const MAX_LINEAR_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -26,6 +27,7 @@ const INVOCATION_FUEL: u64 = 100_000_000;
 
 const PPM_DECODE_WASM: &[u8] = include_bytes!("../../../plugins/ppm-decode/ppm_decode.wasm");
 const PPM_ENCODE_WASM: &[u8] = include_bytes!("../../../plugins/ppm-encode/ppm_encode.wasm");
+const PNG_ENCODE_WASM: &[u8] = include_bytes!("../../../plugins/png-encode/png_encode.wasm");
 
 struct PluginState {
     limits: StoreLimits,
@@ -34,6 +36,7 @@ struct PluginState {
 enum PluginArgument<'a> {
     BytesView(&'a [u8]),
     ImageView(&'a ImageValue),
+    I64(i64),
 }
 
 #[derive(Clone, Copy)]
@@ -49,8 +52,8 @@ enum PluginResult {
 
 /// One validated, separately compiled registered-Wasm artifact.
 ///
-/// ABI v2 admits only the concrete native-safe types exercised by the two PPM
-/// codecs: immutable byte/image views and owned byte/image results.
+/// ABI v3 admits only the concrete native-safe types exercised by the current
+/// codecs: immutable byte/image views, `i64`, and owned byte/image results.
 struct RegisteredWasmPlugin {
     name: &'static str,
     engine: Engine,
@@ -61,6 +64,8 @@ impl RegisteredWasmPlugin {
     fn compile(name: &'static str, bytes: &'static [u8]) -> Result<Self, String> {
         let mut configuration = Config::default();
         configuration.consume_fuel(true);
+        configuration.set_max_recursion_depth(32);
+        configuration.compilation_mode(CompilationMode::Eager);
         configuration.enforced_limits(EnforcedLimits::strict());
         let engine = Engine::new(&configuration);
         let module = Module::new(&engine, bytes).map_err(|error| error.to_string())?;
@@ -238,6 +243,19 @@ impl RegisteredWasmPlugin {
                     0,
                 ])
             }
+            PluginArgument::I64(value) => {
+                let bytes = value.to_le_bytes();
+                Ok([
+                    VALUE_I64,
+                    u32::from_le_bytes(bytes[..4].try_into().expect("low i64 word")),
+                    u32::from_le_bytes(bytes[4..].try_into().expect("high i64 word")),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ])
+            }
         }
     }
 
@@ -253,7 +271,7 @@ impl RegisteredWasmPlugin {
             return Err(self.diagnostic(
                 span,
                 format!(
-                    "argument is {} bytes; ABI v2 permits at most {MAX_ARGUMENT_BYTES}",
+                    "argument is {} bytes; ABI v3 permits at most {MAX_ARGUMENT_BYTES}",
                     bytes.len()
                 ),
             ));
@@ -364,7 +382,7 @@ impl RegisteredWasmPlugin {
         if length > maximum {
             return Err(self.diagnostic(
                 span,
-                format!("result is {length} bytes; ABI v2 permits at most {maximum}"),
+                format!("result is {length} bytes; ABI v3 permits at most {maximum}"),
             ));
         }
         let mut bytes = vec![0; length];
@@ -416,6 +434,7 @@ fn u32_field(
 
 static PPM_DECODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
 static PPM_ENCODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
+static PNG_ENCODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
 
 fn ppm_decoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
     PPM_DECODER
@@ -427,6 +446,13 @@ fn ppm_decoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
 fn ppm_encoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
     PPM_ENCODER
         .get_or_init(|| RegisteredWasmPlugin::compile("ppm.encode", PPM_ENCODE_WASM))
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn png_encoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
+    PNG_ENCODER
+        .get_or_init(|| RegisteredWasmPlugin::compile("png.encode", PNG_ENCODE_WASM))
         .as_ref()
         .map_err(String::as_str)
 }
@@ -457,17 +483,39 @@ pub(crate) fn encode_ppm(image: &ImageValue, span: Span) -> Result<Vec<u8>, Diag
     }
 }
 
+pub(crate) fn encode_png(
+    image: &ImageValue,
+    compression: i64,
+    span: Span,
+) -> Result<Vec<u8>, Diagnostic> {
+    let plugin = png_encoder()
+        .map_err(|error| Diagnostic::error(format!("png.encode Wasm plugin: {error}"), span))?;
+    match plugin.invoke(
+        &[
+            PluginArgument::ImageView(image),
+            PluginArgument::I64(compression),
+        ],
+        PluginResultType::Bytes,
+        span,
+    )? {
+        PluginResult::Bytes(bytes) => Ok(bytes),
+        PluginResult::Image(_) => unreachable!(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::{registered_transform_identity, registered_wasm_artifact_identity};
 
     #[test]
-    fn embedded_ppm_plugins_have_no_imports_and_module_sensitive_artifacts() {
+    fn embedded_plugins_have_no_imports_and_module_sensitive_artifacts() {
         let decoder = ppm_decoder().unwrap();
         let encoder = ppm_encoder().unwrap();
+        let png_encoder = png_encoder().unwrap();
         assert_eq!(decoder.module.imports().count(), 0);
         assert_eq!(encoder.module.imports().count(), 0);
+        assert_eq!(png_encoder.module.imports().count(), 0);
 
         let semantic = registered_transform_identity("ppm.decode", 2);
         let artifact =

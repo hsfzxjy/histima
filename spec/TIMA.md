@@ -640,10 +640,10 @@ asset capability. Tima code has no ambient OS access outside the World.
 
 Registered transforms use normal outer call and pipeline syntax. They have
 versioned semantic identities and use the same normalized arguments, lineage,
-result cache, and replay machinery as user transforms. `ppm.decode` and
-`ppm.encode` are registered-Wasm implementations; the remaining codecs are
-provisional host implementations behind the same registry. The registry is
-not general native-library FFI.
+result cache, and replay machinery as user transforms. Both PPM transforms and
+`png.encode` are registered-Wasm implementations; `png.decode` and
+`webp.encode` remain provisional host implementations behind the same
+registry. The registry is not general native-library FFI.
 
 | Transform | Parameters | Result | Contract |
 | --- | --- | --- | --- |
@@ -658,14 +658,15 @@ arguments and Recipe IDs. A registered-transform implementation change that
 can alter output must bump that transform's semantic version. WebP decoding is
 not implemented.
 
-### 11.1 Registered-Wasm ABI v2
+### 11.1 Registered-Wasm ABI v3
 
-The current ABI is intentionally the exact slice required by the PPM codecs:
-immutable bytes and image inputs, and owned bytes and image results. A module:
+The current ABI is intentionally the exact slice required by the registered
+PPM and PNG codecs: immutable bytes and image inputs, signed integer
+configuration, and owned bytes and image results. A module:
 
 - is Wasm32 and imports nothing (in particular, it has no WASI);
 - exports `memory`;
-- exports `tima_abi_version() -> i32`, which returns `2`;
+- exports `tima_abi_version() -> i32`, which returns `3`;
 - exports `tima_reset()` and `tima_alloc(length: i32) -> i32` for one
   invocation's guest arena;
 - exports `tima_transform(arguments: i32, argument_count: i32,
@@ -679,17 +680,18 @@ little-endian `u32` words. The current descriptor kinds are:
 | --- | --- | --- |
 | `1` | immutable `BytesView` argument | `[kind, data, length, 0, 0, 0, 0, 0]` |
 | `2` | immutable `ImageView` argument | `[kind, data, length, format, width, height, stride, 0]` |
-| `3` | owned `Bytes` result | `[kind, data, length, 0, 0, 0, 0, 0]` |
-| `4` | owned `Image` result | `[kind, data, length, format, width, height, stride, 0]` |
+| `3` | signed `i64` argument | `[kind, low-32, high-32, 0, 0, 0, 0, 0]` |
+| `4` | owned `Bytes` result | `[kind, data, length, 0, 0, 0, 0, 0]` |
+| `5` | owned `Image` result | `[kind, data, length, format, width, height, stride, 0]` |
 | `255` | UTF-8 diagnostic | `[kind, data, length, 0, 0, 0, 0, 0]` |
 
 Image format `1` is RGBA8. A zero `tima_transform` status means its result
 descriptor is initialized. Other statuses, kinds, formats, non-zero reserved
-words, invalid ranges, and invalid image layouts fail the invocation. Scalar
-argument descriptors are deferred until a registered codec needs them.
+words, invalid ranges, and invalid image layouts fail the invocation. The
+`i64` words encode the canonical little-endian two's-complement bit pattern.
 
 The host runs plugins in a fuel-metered interpreter, with no JIT, and limits
-linear memory to 64 MiB. ABI v2 limits each argument payload to 32 MiB, result
+linear memory to 64 MiB. ABI v3 limits each argument payload to 32 MiB, result
 bytes to 64 MiB, and diagnostic text to 4096 bytes; the combined argument,
 descriptor, scratch, and result storage must also fit the linear-memory limit.
 An immutable input crosses the sandbox boundary once into guest memory. The

@@ -9,7 +9,7 @@ use crate::source::Span;
 const PPM_DECODE_TRANSFORM_VERSION: u32 = 2;
 const PPM_ENCODE_TRANSFORM_VERSION: u32 = 2;
 const PNG_DECODE_TRANSFORM_VERSION: u32 = 1;
-const PNG_ENCODE_TRANSFORM_VERSION: u32 = 2;
+const PNG_ENCODE_TRANSFORM_VERSION: u32 = 3;
 const PNG_DEFAULT_COMPRESSION: i64 = 6;
 const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 1;
 const WEBP_DEFAULT_QUALITY: i64 = 85;
@@ -368,52 +368,7 @@ fn decode_png(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
 }
 
 fn encode_png(image: &ImageValue, compression: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
-    let width = u32::try_from(image.width())
-        .map_err(|_| Diagnostic::error("png.encode width exceeds PNG limits", span))?;
-    let height = u32::try_from(image.height())
-        .map_err(|_| Diagnostic::error("png.encode height exceeds PNG limits", span))?;
-    let row_length = image
-        .width()
-        .checked_mul(4)
-        .ok_or_else(|| Diagnostic::error("png.encode row byte length overflows usize", span))?;
-    let packed_length = row_length
-        .checked_mul(image.height())
-        .ok_or_else(|| Diagnostic::error("png.encode image byte length overflows usize", span))?;
-    let mut packed = Vec::with_capacity(packed_length);
-    image.with_bytes(|bytes| -> Result<(), Diagnostic> {
-        for row in 0..image.height() {
-            let start = row
-                .checked_mul(image.stride())
-                .ok_or_else(|| Diagnostic::error("png.encode row offset overflows usize", span))?;
-            packed.extend_from_slice(&bytes[start..start + row_length]);
-        }
-        Ok(())
-    })?;
-
-    let mut encoded = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut encoded, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_deflate_compression(png::DeflateCompression::Level(compression));
-        encoder.set_filter(png::Filter::Paeth);
-        let mut writer = encoder.write_header().map_err(|error| {
-            Diagnostic::error(
-                format!("png.encode could not write PNG header: {error}"),
-                span,
-            )
-        })?;
-        writer.write_image_data(&packed).map_err(|error| {
-            Diagnostic::error(
-                format!("png.encode could not write image data: {error}"),
-                span,
-            )
-        })?;
-        writer.finish().map_err(|error| {
-            Diagnostic::error(format!("png.encode could not finish image: {error}"), span)
-        })?;
-    }
-    Ok(encoded)
+    crate::registered_wasm::encode_png(image, i64::from(compression), span)
 }
 
 fn encode_webp(image: &ImageValue, quality: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
@@ -493,9 +448,11 @@ mod tests {
 
         let first = encode_png(&image, 6, Span::default()).unwrap();
         let second = encode_png(&image, 6, Span::default()).unwrap();
+        let low_compression = encode_png(&image, 1, Span::default()).unwrap();
         let decoded = decode_png(&first, Span::default()).unwrap();
 
         assert_eq!(first, second);
+        assert_ne!(first, low_compression);
         assert_eq!(&first[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(decoded.width(), 2);
         assert_eq!(decoded.height(), 1);

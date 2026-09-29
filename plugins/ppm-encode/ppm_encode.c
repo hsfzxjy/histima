@@ -1,4 +1,4 @@
-// Deterministic ASCII P3 encoder for Histima registered-Wasm plugin ABI v2.
+// Deterministic ASCII P3 encoder for Histima registered-Wasm plugin ABI v3.
 
 #include "tima_plugin.h"
 
