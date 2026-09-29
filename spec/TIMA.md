@@ -22,7 +22,7 @@ one source language with two execution strata:
 
 - **outer code** is dynamic, immutable, and orchestration-oriented;
 - **inner code**, introduced by `transform`, is statically checked and is
-  executed from typed IR or by the initial AOT scalar runtime.
+  executed from typed IR or by the initial AOT runtime.
 
 Both strata use the same lexer, parser, expression syntax tree, source spans,
 and diagnostic model. Semantic context determines which syntax and values are
@@ -41,11 +41,12 @@ Tima source
 
 The interpreter is the Histima product execution engine in this version. The
 standalone Tima runtime can emit, cache, link, load, and execute host artifacts
-for a scalar subset of the same typed IR, while interpreting unsupported
-transforms. This remains an additive implementation of `TypedIR ->
-NativeArtifact`; Cranelift IR is not Tima's semantic IR and JIT execution is
-not planned. WebAssembly is reserved for separately registered plugin
-transforms, whose ABI is not yet part of this contract.
+for a subset of the same typed IR, while interpreting unsupported transforms.
+The native subset includes scalar code and initial owned/view image operations.
+This remains an additive implementation of `TypedIR -> NativeArtifact`;
+Cranelift IR is not Tima's semantic IR and JIT execution is not planned.
+WebAssembly is reserved for separately registered plugin transforms, whose ABI
+is not yet part of this contract.
 
 ## 2. Core invariants
 
@@ -527,25 +528,42 @@ buffers transfer from their owned `Vec` into reference-counted immutable
 storage. Lineage is attached beside the outer payload and never enters the
 inner representation.
 
-The implemented scalar AOT entry ABI is C-compatible:
+The implemented AOT entry ABI is C-compatible. ABI version 2 uses one fixed
+descriptor per statically typed value:
 
 ```c
+typedef struct {
+    uint64_t words[8];
+} TimaAbiValue;
+
 int32_t tima_transform_N(
     void *runtime_context,
-    const uint64_t *arguments,
-    uint64_t *result
+    const TimaAbiValue *arguments,
+    TimaAbiValue *result
 );
 ```
 
-The statically checked transform signature determines how each argument slot
-and the result slot are interpreted. `bool`, `u8`, and `f32` use their low
-bits; `i64` uses the complete slot. Status zero means success. The runtime
-context is currently null and reserved for later allocation, diagnostic, and
-World callbacks. No Rust object, dynamic outer tag, lineage, or cache metadata
-crosses this boundary. The initial slot ABI supports little-endian x86-64 and
-AArch64 hosts. Extending the ABI to owned/view descriptors must preserve the
-ownership rules above. ABI and backend versions are part of Artifact identity,
-not Transform identity.
+The statically checked transform signature determines how each descriptor is
+interpreted. `bool`, `u8`, `i64`, and `f32` use word 0 with the scalar encoding
+defined by their type. An `Image` or `ImageView` uses words 0 through 6 for its
+data pointer, byte length, capacity, format, width, height, and row stride;
+views have zero capacity. Word 7 is reserved. Status zero means success.
+
+Before a native call, an owned `Image` is uniquely detached from immutable
+outer storage. Native code may mutate that allocation in place. A returned
+owned image descriptor must identify exactly one compatible owned argument;
+the host then adopts its allocation while freezing it into a new outer value.
+An `ImageView` points directly into retained immutable outer storage and a
+returned view must identify a compatible view argument. These restrictions
+make the current result path zero-copy without trusting or freeing a foreign
+allocation. Native allocation callbacks and newly allocated native results are
+not yet supported.
+
+The runtime context is currently null and reserved for later allocation,
+diagnostic, and World callbacks. No Rust object, dynamic outer tag, lineage, or
+cache metadata crosses this boundary. The ABI supports little-endian x86-64
+and AArch64 hosts. ABI and backend versions are part of Artifact identity, not
+Transform identity.
 
 ## 10. Runtime-mediated capabilities
 
@@ -745,17 +763,21 @@ TypedIR -> NativeArtifact
 
 The AOT Cranelift backend emits a host relocatable object through `tima
 emit-object`. `tima run-native` additionally caches that object, links a host
-load image with Clang, and executes supported transforms through the scalar ABI.
+load image with Clang, and executes supported transforms through the native ABI.
 `TIMA_CLANG` may select the Clang executable; otherwise the runtime uses the
 standard LLVM installation on Windows or `clang` from `PATH`.
 
-The implemented subset is deliberately limited to leaf transforms whose
-parameters and result are `bool`, `u8`, `i64`, or `f32` and whose bodies use
-scalar constants, comparisons, control flow, and `f32` arithmetic. Checked
-`i64` arithmetic, transform calls, owned/view values, and World calls are not
-compiled. The hybrid `run-native` path interprets those transforms instead,
-without changing lineage or Recipe identity. Histima product execution remains
-interpreted until the owned/view ABI is implemented and integrated.
+The implemented subset is deliberately limited to leaf transforms. Scalar
+parameters and results may be `bool`, `u8`, `i64`, or `f32`, and their bodies
+may use scalar constants, comparisons, control flow, and `f32` arithmetic.
+`Image` and `ImageView` may cross the descriptor boundary; identity returns and
+the owned `image_zero` and `image_fill` operations are compiled. Checked `i64`
+arithmetic, transform calls, byte-map loops, RGBA8 channel scaling, String and
+Bytes values, newly allocated native results, and World calls are not compiled.
+The hybrid `run-native` path interprets unsupported transforms instead, without
+changing lineage or Recipe identity. Histima product execution remains
+interpreted while the remaining buffer operations and World callbacks are
+implemented.
 
 Native artifacts are cached independently using Artifact IDs derived from the
 Transform ID plus the Cranelift/compiler version, target, inferred CPU feature

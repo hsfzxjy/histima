@@ -9,20 +9,19 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use object::write::{Object, StandardSection, Symbol, SymbolSection};
 use object::{Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope};
 
-use crate::abi::TIMA_ABI_VERSION;
+use crate::abi::{ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_VALUE_BYTES, TIMA_ABI_VERSION};
 use crate::ast::BinaryOp;
 use crate::backend::{ArtifactBackend, BackendArtifact};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{Constant, Terminator, Transform, Type, TypedModule, ValueId, ValueKind};
 
-pub const CRANELIFT_BACKEND_VERSION: &str = "2";
+pub const CRANELIFT_BACKEND_VERSION: &str = "3";
 pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 
 /// Ahead-of-time native object generation from backend-neutral Tima IR.
 ///
-/// The first slice intentionally accepts only leaf scalar transforms. The
-/// interpreter remains the execution engine until the native ABI and loader
-/// cover all values admitted at a call boundary.
+/// The initial slice accepts leaf transforms over scalars plus owned/view
+/// image identity, zero, and fill operations. Other typed IR is interpreted.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CraneliftBackend;
 
@@ -142,18 +141,18 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
     if !transform
         .parameters
         .iter()
-        .all(|parameter| scalar_type(parameter.ty))
-        || !scalar_type(transform.return_type)
+        .all(|parameter| native_boundary_type(parameter.ty))
+        || !native_boundary_type(transform.return_type)
     {
         diagnostics.push(
             Diagnostic::error(
                 format!(
-                    "Cranelift scalar AOT does not yet support the boundary of transform `{}`",
+                    "Cranelift AOT does not yet support the boundary of transform `{}`",
                     transform.name
                 ),
                 transform.span,
             )
-            .with_note("supported boundary types are bool, u8, i64, and f32"),
+            .with_note("supported boundary types are bool, u8, i64, f32, Image, and ImageView"),
         );
         return diagnostics;
     }
@@ -166,7 +165,7 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
             {
                 diagnostics.push(
                     Diagnostic::error(
-                        "Cranelift scalar AOT does not yet lower checked i64 arithmetic",
+                        "Cranelift AOT does not yet lower checked i64 arithmetic",
                         value.span,
                     )
                     .with_note("the backend must preserve Tima overflow and division diagnostics"),
@@ -175,19 +174,18 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
             ValueKind::Binary { .. } => {}
             ValueKind::Call { .. } => diagnostics.push(
                 Diagnostic::error(
-                    "Cranelift scalar AOT does not yet lower transform calls",
+                    "Cranelift AOT does not yet lower transform calls",
                     value.span,
                 )
                 .with_note("the first native artifact slice accepts leaf transforms only"),
             ),
+            ValueKind::ImageZero { .. } | ValueKind::ImageFill { .. } => {}
             ValueKind::Constant(Constant::String(_))
-            | ValueKind::ImageZero { .. }
-            | ValueKind::ImageFill { .. }
             | ValueKind::ImageByteElement
             | ValueKind::ImageByteMap { .. }
             | ValueKind::ImageRgba8Scale { .. }
             | ValueKind::RuntimeCall(_) => diagnostics.push(Diagnostic::error(
-                "operation is outside the initial Cranelift scalar AOT subset",
+                "operation is outside the initial Cranelift AOT subset",
                 value.span,
             )),
         }
@@ -202,7 +200,7 @@ fn lower_transform(
 ) -> Result<Function, Vec<Diagnostic>> {
     let mut signature = Signature::new(isa.default_call_conv());
     let pointer_type = isa.pointer_type();
-    // Opaque runtime context, packed argument slots, and one result slot.
+    // Opaque runtime context, fixed-width argument descriptors, and one result descriptor.
     signature.params.extend([
         AbiParam::new(pointer_type),
         AbiParam::new(pointer_type),
@@ -221,19 +219,19 @@ fn lower_transform(
         let entry = blocks[transform.entry.0 as usize];
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
-        let argument_slots = builder.block_params(entry)[1];
-        let result_slot = builder.block_params(entry)[2];
+        let arguments = builder.block_params(entry)[1];
+        let result = builder.block_params(entry)[2];
         let mut values = vec![None; transform.values.len()];
         for parameter in &transform.parameters {
             let ValueKind::Parameter { index } = transform.value(parameter.value).kind else {
                 unreachable!("typed parameters reference parameter IR values")
             };
-            let offset = i32::try_from(u64::from(index) * 8)
-                .expect("Tima transform parameter slots fit a Cranelift offset");
-            values[parameter.value.0 as usize] = Some(builder.ins().load(
-                clif_type(parameter.ty),
-                MemFlagsData::new(),
-                argument_slots,
+            let offset = i32::try_from(u64::from(index) * ABI_VALUE_BYTES as u64)
+                .expect("Tima transform arguments fit a Cranelift offset");
+            values[parameter.value.0 as usize] = Some(lower_parameter(
+                &mut builder,
+                arguments,
+                parameter.ty,
                 offset,
             ));
         }
@@ -249,26 +247,37 @@ fn lower_transform(
                 let value = &transform.values[id.0 as usize];
                 let lowered = match &value.kind {
                     ValueKind::Parameter { .. } => continue,
-                    ValueKind::Constant(constant) => lower_constant(&mut builder, constant),
-                    ValueKind::Binary { op, left, right } => lower_binary(
+                    ValueKind::Constant(constant) => {
+                        LoweredValue::Scalar(lower_constant(&mut builder, constant, value.ty))
+                    }
+                    ValueKind::Binary { op, left, right } => LoweredValue::Scalar(lower_binary(
                         &mut builder,
                         *op,
-                        required_value(&values, *left),
-                        required_value(&values, *right),
+                        required_scalar(&values, *left),
+                        required_scalar(&values, *right),
                         transform.value(*left).ty,
-                    ),
-                    _ => unreachable!("validation rejects non-scalar operations"),
+                    )),
+                    ValueKind::ImageZero { image } => {
+                        let image = required_image(&values, *image);
+                        emit_image_fill(&mut builder, image, None);
+                        LoweredValue::Image(image)
+                    }
+                    ValueKind::ImageFill { image, value } => {
+                        let image = required_image(&values, *image);
+                        emit_image_fill(
+                            &mut builder,
+                            image,
+                            Some(required_scalar(&values, *value)),
+                        );
+                        LoweredValue::Image(image)
+                    }
+                    _ => unreachable!("validation rejects unsupported operations"),
                 };
                 values[id.0 as usize] = Some(lowered);
             }
             match transform.blocks[block_index].terminator {
                 Terminator::Return(value) => {
-                    builder.ins().store(
-                        MemFlagsData::new(),
-                        required_value(&values, value),
-                        result_slot,
-                        0,
-                    );
+                    store_result(&mut builder, result, required_value(&values, value));
                     let status = builder
                         .ins()
                         .iconst(types::I32, i64::from(crate::abi::ABI_STATUS_OK));
@@ -283,7 +292,7 @@ fn lower_transform(
                     else_block,
                 } => {
                     builder.ins().brif(
-                        required_value(&values, condition),
+                        required_scalar(&values, condition),
                         blocks[then_block.0 as usize],
                         &[],
                         blocks[else_block.0 as usize],
@@ -298,12 +307,99 @@ fn lower_transform(
     Ok(function)
 }
 
+#[derive(Clone, Copy)]
+enum LoweredValue {
+    Scalar(cranelift_codegen::ir::Value),
+    Image([cranelift_codegen::ir::Value; 7]),
+}
+
+fn lower_parameter(
+    builder: &mut FunctionBuilder<'_>,
+    arguments: cranelift_codegen::ir::Value,
+    ty: Type,
+    base: i32,
+) -> LoweredValue {
+    if scalar_type(ty) {
+        return LoweredValue::Scalar(builder.ins().load(
+            clif_type(ty),
+            MemFlagsData::new(),
+            arguments,
+            base,
+        ));
+    }
+    debug_assert!(matches!(ty, Type::Image | Type::ImageView));
+    LoweredValue::Image(std::array::from_fn(|word| {
+        builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            base + i32::try_from(word * 8).unwrap(),
+        )
+    }))
+}
+
+fn store_result(
+    builder: &mut FunctionBuilder<'_>,
+    result: cranelift_codegen::ir::Value,
+    value: LoweredValue,
+) {
+    match value {
+        LoweredValue::Scalar(value) => {
+            builder.ins().store(MemFlagsData::new(), value, result, 0);
+        }
+        LoweredValue::Image(words) => {
+            for (word, value) in words.into_iter().enumerate() {
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    result,
+                    i32::try_from(word * 8).unwrap(),
+                );
+            }
+        }
+    }
+}
+
+fn emit_image_fill(
+    builder: &mut FunctionBuilder<'_>,
+    image: [cranelift_codegen::ir::Value; 7],
+    fill: Option<cranelift_codegen::ir::Value>,
+) {
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(header, types::I64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(header, &[zero.into()]);
+
+    builder.switch_to_block(header);
+    let index = builder.block_params(header)[0];
+    let finished = builder.ins().icmp(
+        IntCC::UnsignedGreaterThanOrEqual,
+        index,
+        image[ABI_LENGTH_WORD],
+    );
+    builder.ins().brif(finished, done, &[], body, &[]);
+
+    builder.switch_to_block(body);
+    let address = builder.ins().iadd(image[ABI_POINTER_WORD], index);
+    let fill = fill.unwrap_or_else(|| builder.ins().iconst(types::I8, 0));
+    builder.ins().store(MemFlagsData::new(), fill, address, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let next = builder.ins().iadd(index, one);
+    builder.ins().jump(header, &[next.into()]);
+
+    builder.switch_to_block(done);
+}
+
 fn lower_constant(
     builder: &mut FunctionBuilder<'_>,
     constant: &Constant,
+    ty: Type,
 ) -> cranelift_codegen::ir::Value {
     match constant {
         Constant::Bool(value) => builder.ins().iconst(types::I8, i64::from(*value)),
+        Constant::I64(value) if ty == Type::U8 => builder.ins().iconst(types::I8, *value),
         Constant::I64(value) => builder.ins().iconst(types::I64, *value),
         Constant::F32(value) => builder.ins().f32const(Ieee32::with_bits(value.to_bits())),
         Constant::String(_) => unreachable!("validation rejects string constants"),
@@ -361,6 +457,10 @@ fn scalar_type(ty: Type) -> bool {
     matches!(ty, Type::Bool | Type::U8 | Type::I64 | Type::F32)
 }
 
+fn native_boundary_type(ty: Type) -> bool {
+    scalar_type(ty) || matches!(ty, Type::Image | Type::ImageView)
+}
+
 fn clif_type(ty: Type) -> cranelift_codegen::ir::Type {
     match ty {
         Type::Bool | Type::U8 => types::I8,
@@ -374,17 +474,31 @@ fn value_type(transform: &Transform, id: ValueId) -> Type {
     transform.values[id.0 as usize].ty
 }
 
-fn required_value(
-    values: &[Option<cranelift_codegen::ir::Value>],
-    id: ValueId,
-) -> cranelift_codegen::ir::Value {
+fn required_value(values: &[Option<LoweredValue>], id: ValueId) -> LoweredValue {
     values[id.0 as usize].expect("typed IR values dominate their uses")
+}
+
+fn required_scalar(values: &[Option<LoweredValue>], id: ValueId) -> cranelift_codegen::ir::Value {
+    let LoweredValue::Scalar(value) = required_value(values, id) else {
+        unreachable!("typed scalar operation has a scalar operand")
+    };
+    value
+}
+
+fn required_image(
+    values: &[Option<LoweredValue>],
+    id: ValueId,
+) -> [cranelift_codegen::ir::Value; 7] {
+    let LoweredValue::Image(value) = required_value(values, id) else {
+        unreachable!("typed image operation has an image operand")
+    };
+    value
 }
 
 fn host_object_architecture() -> Result<Architecture, Vec<Diagnostic>> {
     if !cfg!(target_endian = "little") {
         return Err(vec![backend_error(
-            "the initial scalar slot ABI supports little-endian hosts only",
+            "the initial native value ABI supports little-endian hosts only",
         )]);
     }
     if cfg!(target_arch = "x86_64") {
@@ -453,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_semantics_not_yet_preserved_by_the_scalar_backend() {
+    fn rejects_semantics_not_yet_preserved_by_the_native_backend() {
         let checked_integer = crate::compile(
             "integer.tima",
             "transform add(left: i64, right: i64) -> i64 { return left + right }\n",
@@ -464,12 +578,14 @@ mod tests {
             .unwrap_err();
         assert!(diagnostics[0].message.contains("checked i64 arithmetic"));
 
-        let owned = crate::compile(
+        let unsupported_boundary = crate::compile(
             "owned.tima",
-            "transform own(img: Image) -> Image { return img }\n",
+            "transform own(bytes: Bytes) -> Bytes { return bytes }\n",
         )
         .unwrap();
-        let diagnostics = CraneliftBackend.emit(&owned.transforms).unwrap_err();
+        let diagnostics = CraneliftBackend
+            .emit(&unsupported_boundary.transforms)
+            .unwrap_err();
         assert!(
             diagnostics[0]
                 .message

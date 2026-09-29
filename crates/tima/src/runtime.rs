@@ -8,7 +8,10 @@ use std::sync::Arc;
 use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::cache::CachedArtifact;
-use crate::backend::native::{NativeScalar as AbiScalar, NativeScalarModule};
+use crate::backend::native::{
+    NativeArgument, NativeImage, NativeImageView, NativeModule, NativeResult,
+    NativeScalar as AbiScalar,
+};
 use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
 use crate::diagnostic::Diagnostic;
@@ -70,11 +73,11 @@ pub struct AssetValue {
 }
 
 #[derive(Clone, Debug)]
-struct ImageStorage(Arc<[u8]>);
+struct ImageStorage(Arc<Vec<u8>>);
 
 impl ImageStorage {
     fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes.into())
+        Self(Arc::new(bytes))
     }
 
     fn len(&self) -> usize {
@@ -82,17 +85,21 @@ impl ImageStorage {
     }
 
     fn with_bytes<R>(&self, operation: impl FnOnce(&[u8]) -> R) -> R {
-        operation(&self.0)
+        operation(self.0.as_slice())
     }
 
     fn to_vec(&self) -> Vec<u8> {
         self.with_bytes(<[u8]>::to_vec)
     }
+
+    fn into_vec(self) -> Vec<u8> {
+        Arc::try_unwrap(self.0).unwrap_or_else(|shared| (*shared).clone())
+    }
 }
 
 impl PartialEq for ImageStorage {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.0.as_slice() == other.0.as_slice()
     }
 }
 
@@ -196,6 +203,10 @@ impl ImageValue {
 
     pub fn with_bytes<R>(&self, operation: impl FnOnce(&[u8]) -> R) -> R {
         self.storage.with_bytes(operation)
+    }
+
+    fn byte_slice(&self) -> &[u8] {
+        self.storage.0.as_slice()
     }
 
     pub fn to_vec(&self) -> Vec<u8> {
@@ -311,15 +322,15 @@ pub fn execute_cached_with_capabilities(
     execute_with(program, &engine, BTreeMap::new(), Some(cache))
 }
 
-/// Executes AOT-compatible leaf scalar transforms from a cached native load
-/// image and falls back to the typed-IR interpreter for every other transform.
+/// Executes AOT-compatible transforms from a cached native load image and
+/// falls back to the typed-IR interpreter for every other transform.
 pub fn execute_aot_cached_with_capabilities(
     program: &CompiledProgram,
     cache: &mut dyn ResultCache,
     capabilities: &dyn World,
     artifact_cache_root: impl AsRef<Path>,
 ) -> Result<AotExecution, Vec<Diagnostic>> {
-    let native = NativeScalarModule::build(
+    let native = NativeModule::build(
         &program.transforms,
         &program.identities,
         artifact_cache_root,
@@ -1678,7 +1689,13 @@ struct IrInterpreter<'a> {
 
 struct HybridAotEngine<'a> {
     interpreter: IrInterpreter<'a>,
-    native: Option<&'a NativeScalarModule>,
+    native: Option<&'a NativeModule>,
+}
+
+enum PreparedNativeArgument {
+    Scalar(AbiScalar),
+    Image(NativeImage),
+    ImageView(Arc<ImageValue>),
 }
 
 impl TransformEngine for HybridAotEngine<'_> {
@@ -1691,28 +1708,57 @@ impl TransformEngine for HybridAotEngine<'_> {
             return self.interpreter.invoke(id, arguments);
         };
         let transform = self.interpreter.module.get(id);
-        let arguments = transform
+        let mut prepared = transform
             .parameters
             .iter()
             .zip(arguments)
             .map(|(parameter, (argument, span))| {
-                let value = lower_interpreted_value(argument, parameter.ty, span)?.scalar();
-                Ok(match value {
-                    NativeScalar::Bool(value) => AbiScalar::Bool(value),
-                    NativeScalar::U8(value) => AbiScalar::U8(value),
-                    NativeScalar::I64(value) => AbiScalar::I64(value),
-                    NativeScalar::F32(value) => AbiScalar::F32(value),
-                })
+                prepare_native_argument(argument, parameter.ty, span)
             })
             .collect::<Result<Vec<_>, Diagnostic>>()?;
-        let value = match native.invoke(id, &arguments)? {
-            AbiScalar::Bool(value) => NativeScalar::Bool(value),
-            AbiScalar::U8(value) => NativeScalar::U8(value),
-            AbiScalar::I64(value) => NativeScalar::I64(value),
-            AbiScalar::F32(value) => NativeScalar::F32(value),
+        let mut native_arguments = prepared
+            .iter_mut()
+            .map(|argument| match argument {
+                PreparedNativeArgument::Scalar(value) => NativeArgument::Scalar(*value),
+                PreparedNativeArgument::Image(image) => NativeArgument::Image(image),
+                PreparedNativeArgument::ImageView(image) => {
+                    NativeArgument::ImageView(NativeImageView {
+                        bytes: image.byte_slice(),
+                        format: image.format().abi_tag(),
+                        width: image.width(),
+                        height: image.height(),
+                        stride: image.stride(),
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+        let result = native.invoke(id, &mut native_arguments)?;
+        drop(native_arguments);
+        let value = match result {
+            NativeResult::Scalar(AbiScalar::Bool(value)) => {
+                freeze_scalar(NativeScalar::Bool(value))
+            }
+            NativeResult::Scalar(AbiScalar::U8(value)) => freeze_scalar(NativeScalar::U8(value)),
+            NativeResult::Scalar(AbiScalar::I64(value)) => freeze_scalar(NativeScalar::I64(value)),
+            NativeResult::Scalar(AbiScalar::F32(value)) => freeze_scalar(NativeScalar::F32(value)),
+            NativeResult::OwnedImageArgument(index) => {
+                let PreparedNativeArgument::Image(image) = std::mem::replace(
+                    &mut prepared[index],
+                    PreparedNativeArgument::Scalar(AbiScalar::Bool(false)),
+                ) else {
+                    unreachable!("native owned image result identifies an owned image argument")
+                };
+                freeze_native_image(image)
+            }
+            NativeResult::ImageViewArgument(index) => {
+                let PreparedNativeArgument::ImageView(image) = &prepared[index] else {
+                    unreachable!("native image view result identifies a view argument")
+                };
+                OuterValue::plain(ValueData::Image(image.clone()))
+            }
         };
         Ok(TransformOutcome {
-            value: freeze_scalar(value),
+            value,
             observations: Vec::new(),
         })
     }
@@ -1724,6 +1770,68 @@ impl TransformEngine for HybridAotEngine<'_> {
     fn capabilities(&self) -> Option<&dyn World> {
         self.interpreter.capabilities()
     }
+}
+
+fn prepare_native_argument(
+    value: OuterValue,
+    expected: Type,
+    span: Span,
+) -> Result<PreparedNativeArgument, Diagnostic> {
+    if matches!(expected, Type::Bool | Type::U8 | Type::I64 | Type::F32) {
+        let scalar = lower_interpreted_value(value, expected, span)?.scalar();
+        return Ok(PreparedNativeArgument::Scalar(match scalar {
+            NativeScalar::Bool(value) => AbiScalar::Bool(value),
+            NativeScalar::U8(value) => AbiScalar::U8(value),
+            NativeScalar::I64(value) => AbiScalar::I64(value),
+            NativeScalar::F32(value) => AbiScalar::F32(value),
+        }));
+    }
+    match (expected, value.data) {
+        (Type::Image, ValueData::Image(image)) => {
+            let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
+            let ImageValue {
+                storage,
+                format,
+                width,
+                height,
+                stride,
+            } = image;
+            let bytes = match Arc::try_unwrap(storage) {
+                Ok(storage) => storage.into_vec(),
+                Err(shared) => shared.to_vec(),
+            };
+            Ok(PreparedNativeArgument::Image(NativeImage {
+                bytes,
+                format: format.abi_tag(),
+                width,
+                height,
+                stride,
+            }))
+        }
+        (Type::ImageView, ValueData::Image(image)) => Ok(PreparedNativeArgument::ImageView(image)),
+        (expected, _) => Err(Diagnostic::error(
+            format!(
+                "outer value cannot cross into native parameter type {}",
+                expected.name()
+            ),
+            span,
+        )),
+    }
+}
+
+fn freeze_native_image(image: NativeImage) -> OuterValue {
+    let format = match image.format {
+        0 => ImageFormat::OpaqueBytes,
+        1 => ImageFormat::Rgba8,
+        _ => unreachable!("native image descriptors preserve validated input metadata"),
+    };
+    OuterValue::image(ImageValue {
+        storage: Arc::new(ImageStorage::new(image.bytes)),
+        format,
+        width: image.width,
+        height: image.height,
+        stride: image.stride,
+    })
 }
 
 impl IrInterpreter<'_> {
@@ -2026,7 +2134,7 @@ fn lower_interpreted_value(
                 stride,
             } = image;
             let storage = match Arc::try_unwrap(storage) {
-                Ok(storage) => storage.to_vec(),
+                Ok(storage) => storage.into_vec(),
                 Err(shared) => shared.to_vec(),
             };
             Ok(InterpretedValue::Image(InterpretedImage {
@@ -2185,16 +2293,18 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Arc;
 
+    use crate::backend::native::NativeModule;
     use crate::cache::TransformResultCache;
     use crate::capability::RuntimeCapabilities;
     use crate::identity::{ContentIdentity, byte_content_identity};
     use crate::ir::TransformId;
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
-        ImageFormat, ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver,
-        TransformEngine, ValueData, execute, execute_aot_cached_with_capabilities, execute_cached,
-        execute_cached_with_capabilities, execute_with, execute_with_capabilities, replay,
-        replay_with_capabilities, replay_with_dependencies, scale_rgba8_channel,
+        HybridAotEngine, ImageFormat, ImageValue, IrInterpreter, OuterValue,
+        ReplayDependencyResolver, TransformEngine, ValueData, execute,
+        execute_aot_cached_with_capabilities, execute_cached, execute_cached_with_capabilities,
+        execute_with, execute_with_capabilities, replay, replay_with_capabilities,
+        replay_with_dependencies, scale_rgba8_channel,
     };
     use crate::source::Span;
 
@@ -2835,6 +2945,56 @@ mod tests {
         assert_eq!(original.bytes(), &[1, 2, 3, 4]);
         assert_eq!(cleared.bytes(), &[0, 0, 0, 0]);
         assert!(!original.shares_storage_with(cleared));
+        assert!(original.shares_storage_with(viewed));
+    }
+
+    #[test]
+    fn native_owned_images_detach_while_views_alias() {
+        let compiled = crate::compile(
+            "native-images.tima",
+            "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n\
+             transform view(img: ImageView) -> ImageView { return img }\n\
+             filled = fill(img, 7)\n\
+             viewed = view(img)\n",
+        )
+        .unwrap();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join(format!("native-image-runtime-{}", std::process::id()));
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, root)
+            .unwrap()
+            .unwrap();
+        let engine = HybridAotEngine {
+            interpreter: IrInterpreter {
+                module: &compiled.transforms,
+                capabilities: None,
+            },
+            native: Some(&native),
+        };
+        let execution = execute_with(
+            &compiled,
+            &engine,
+            BTreeMap::from([(
+                "img".to_owned(),
+                OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap()),
+            )]),
+            None,
+        )
+        .unwrap();
+        let ValueData::Image(original) = &execution.bindings["img"].data else {
+            panic!("expected original image")
+        };
+        let ValueData::Image(filled) = &execution.bindings["filled"].data else {
+            panic!("expected owned result image")
+        };
+        let ValueData::Image(viewed) = &execution.bindings["viewed"].data else {
+            panic!("expected image view")
+        };
+
+        assert_eq!(original.bytes(), &[1, 2, 3, 4]);
+        assert_eq!(filled.bytes(), &[7, 7, 7, 7]);
+        assert!(!original.shares_storage_with(filled));
         assert!(original.shares_storage_with(viewed));
     }
 

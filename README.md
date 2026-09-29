@@ -25,10 +25,12 @@ registered plugin transforms whose ABI is still deferred. Tima does not
 generate or execute WebAssembly for inner-language transforms.
 
 The AOT Cranelift slice can emit a host relocatable object with `cargo run -p
-tima -- emit-object program.tima`, or link and execute supported leaf scalar
-transforms with `cargo run -p tima -- run-native program.tima`. The latter is a
-hybrid path: unsupported transforms remain interpreted. Histima still uses the
-interpreter until the full owned/view ABI is implemented.
+tima -- emit-object program.tima`, or link and execute supported scalar and
+image transforms with `cargo run -p tima -- run-native program.tima`. The
+latter is a hybrid path: unsupported transforms remain interpreted. Its native
+ABI supports zero-copy immutable image views and ownership transfer for image
+identity, zero, and fill operations. Histima still uses the interpreter while
+the remaining buffer operations and World callbacks are implemented.
 
 ## Build and try it
 

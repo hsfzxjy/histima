@@ -1,12 +1,26 @@
 use crate::ir::Type;
 
 /// ABI epoch for ahead-of-time native artifacts.
-pub const TIMA_ABI_VERSION: u32 = 1;
+pub const TIMA_ABI_VERSION: u32 = 2;
 
-/// One scalar call-boundary slot. Statically known signature types determine
-/// how its low bits are interpreted; dynamic outer tags never enter native
-/// transform code.
-pub type AbiSlot = u64;
+pub const ABI_VALUE_WORDS: usize = 8;
+pub const ABI_VALUE_BYTES: usize = ABI_VALUE_WORDS * size_of::<u64>();
+
+/// Fixed-width call-boundary storage. Statically known signature types decide
+/// which words are meaningful; this is an ABI carrier, not a dynamic object.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AbiValue {
+    pub words: [u64; ABI_VALUE_WORDS],
+}
+
+pub const ABI_POINTER_WORD: usize = 0;
+pub const ABI_LENGTH_WORD: usize = 1;
+pub const ABI_CAPACITY_WORD: usize = 2;
+pub const ABI_IMAGE_FORMAT_WORD: usize = 3;
+pub const ABI_IMAGE_WIDTH_WORD: usize = 4;
+pub const ABI_IMAGE_HEIGHT_WORD: usize = 5;
+pub const ABI_IMAGE_STRIDE_WORD: usize = 6;
 
 pub const ABI_STATUS_OK: i32 = 0;
 

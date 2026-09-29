@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use libloading::Library;
 
-use crate::abi::{ABI_STATUS_OK, AbiSlot};
+use crate::abi::{
+    ABI_CAPACITY_WORD, ABI_IMAGE_FORMAT_WORD, ABI_IMAGE_HEIGHT_WORD, ABI_IMAGE_STRIDE_WORD,
+    ABI_IMAGE_WIDTH_WORD, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_OK, AbiValue,
+};
 use crate::backend::ArtifactBackend;
 use crate::backend::cache::{CachedArtifact, NativeArtifactCache};
 use crate::backend::cranelift::CraneliftBackend;
@@ -17,7 +20,7 @@ use crate::source::Span;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(0);
 
-type NativeEntry = unsafe extern "C" fn(*mut c_void, *const AbiSlot, *mut AbiSlot) -> i32;
+type NativeEntry = unsafe extern "C" fn(*mut c_void, *const AbiValue, *mut AbiValue) -> i32;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NativeScalar {
@@ -37,24 +40,112 @@ impl NativeScalar {
         }
     }
 
-    const fn encode(self) -> AbiSlot {
-        match self {
-            Self::Bool(value) => value as AbiSlot,
-            Self::U8(value) => value as AbiSlot,
-            Self::I64(value) => value as AbiSlot,
-            Self::F32(value) => value.to_bits() as AbiSlot,
-        }
+    fn encode(self) -> AbiValue {
+        let mut encoded = AbiValue::default();
+        encoded.words[0] = match self {
+            Self::Bool(value) => value as u64,
+            Self::U8(value) => value as u64,
+            Self::I64(value) => value as u64,
+            Self::F32(value) => value.to_bits() as u64,
+        };
+        encoded
     }
 
-    fn decode(slot: AbiSlot, ty: Type) -> Self {
+    fn decode(value: AbiValue, ty: Type) -> Self {
+        let slot = value.words[0];
         match ty {
             Type::Bool => Self::Bool(slot != 0),
             Type::U8 => Self::U8(slot as u8),
             Type::I64 => Self::I64(slot as i64),
             Type::F32 => Self::F32(f32::from_bits(slot as u32)),
-            _ => unreachable!("native scalar modules only contain scalar signatures"),
+            _ => unreachable!("native scalar result has a scalar signature"),
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeImage {
+    pub bytes: Vec<u8>,
+    pub format: u32,
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeImageView<'a> {
+    pub bytes: &'a [u8],
+    pub format: u32,
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+}
+
+pub(crate) enum NativeArgument<'a> {
+    Scalar(NativeScalar),
+    Image(&'a mut NativeImage),
+    ImageView(NativeImageView<'a>),
+}
+
+impl NativeArgument<'_> {
+    fn ty(&self) -> Type {
+        match self {
+            Self::Scalar(value) => value.ty(),
+            Self::Image(_) => Type::Image,
+            Self::ImageView(_) => Type::ImageView,
+        }
+    }
+
+    fn encode(&self) -> AbiValue {
+        match self {
+            Self::Scalar(value) => value.encode(),
+            Self::Image(image) => image_value(
+                image.bytes.as_ptr(),
+                image.bytes.len(),
+                image.bytes.capacity(),
+                image.format,
+                image.width,
+                image.height,
+                image.stride,
+            ),
+            Self::ImageView(image) => image_value(
+                image.bytes.as_ptr(),
+                image.bytes.len(),
+                0,
+                image.format,
+                image.width,
+                image.height,
+                image.stride,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum NativeResult {
+    Scalar(NativeScalar),
+    OwnedImageArgument(usize),
+    ImageViewArgument(usize),
+}
+
+fn image_value(
+    pointer: *const u8,
+    length: usize,
+    capacity: usize,
+    format: u32,
+    width: usize,
+    height: usize,
+    stride: usize,
+) -> AbiValue {
+    let mut value = AbiValue::default();
+    value.words[ABI_POINTER_WORD] = pointer as usize as u64;
+    value.words[ABI_LENGTH_WORD] = length as u64;
+    value.words[ABI_CAPACITY_WORD] = capacity as u64;
+    value.words[ABI_IMAGE_FORMAT_WORD] = u64::from(format);
+    value.words[ABI_IMAGE_WIDTH_WORD] = width as u64;
+    value.words[ABI_IMAGE_HEIGHT_WORD] = height as u64;
+    value.words[ABI_IMAGE_STRIDE_WORD] = stride as u64;
+    value
 }
 
 #[derive(Clone, Debug)]
@@ -69,16 +160,16 @@ struct LoadedTransform {
     entry: NativeEntry,
 }
 
-/// A loadable AOT module for the transforms admitted by the initial scalar
-/// backend. Transform IDs absent from this module must be interpreted.
-pub struct NativeScalarModule {
+/// A loadable AOT module for transforms admitted by the current backend.
+/// Transform IDs absent from this module must be interpreted.
+pub struct NativeModule {
     _library: Library,
     transforms: Vec<Option<LoadedTransform>>,
     signatures: Vec<Option<NativeSignature>>,
     artifact: CachedArtifact,
 }
 
-impl NativeScalarModule {
+impl NativeModule {
     pub fn build(
         module: &TypedModule,
         identities: &TransformIdentities,
@@ -173,14 +264,30 @@ impl NativeScalarModule {
         &self.artifact
     }
 
-    pub fn invoke(
+    pub fn invoke_scalars(
         &self,
         id: TransformId,
         arguments: &[NativeScalar],
     ) -> Result<NativeScalar, Diagnostic> {
+        let mut arguments = arguments
+            .iter()
+            .copied()
+            .map(NativeArgument::Scalar)
+            .collect::<Vec<_>>();
+        let NativeResult::Scalar(result) = self.invoke(id, &mut arguments)? else {
+            unreachable!("scalar signatures return scalar results")
+        };
+        Ok(result)
+    }
+
+    pub(crate) fn invoke(
+        &self,
+        id: TransformId,
+        arguments: &mut [NativeArgument<'_>],
+    ) -> Result<NativeResult, Diagnostic> {
         let Some(signature) = self.signatures.get(id.0 as usize).and_then(Option::as_ref) else {
             return Err(native_error(format!(
-                "transform {} is not present in the native scalar module",
+                "transform {} is not present in the native module",
                 id.0
             )));
         };
@@ -208,24 +315,51 @@ impl NativeScalarModule {
                 ));
             }
         }
-        let slots = arguments
+        let encoded = arguments
             .iter()
             .map(|argument| argument.encode())
             .collect::<Vec<_>>();
-        let mut result = 0;
+        let mut result = AbiValue::default();
         let entry = self.transforms[id.0 as usize]
             .expect("native signature and entry tables agree")
             .entry;
-        // SAFETY: argument/result slots match the statically checked signature,
-        // and the library handle outlives this copied function pointer.
-        let status = unsafe { entry(std::ptr::null_mut(), slots.as_ptr(), &mut result) };
+        // SAFETY: argument/result descriptors match the statically checked
+        // signature, borrowed buffers outlive the call, and the library handle
+        // outlives this copied function pointer.
+        let status = unsafe { entry(std::ptr::null_mut(), encoded.as_ptr(), &mut result) };
         if status != ABI_STATUS_OK {
             return Err(Diagnostic::error(
                 format!("native transform returned ABI status {status}"),
                 signature.span,
             ));
         }
-        Ok(NativeScalar::decode(result, signature.result))
+        if matches!(
+            signature.result,
+            Type::Bool | Type::U8 | Type::I64 | Type::F32
+        ) {
+            return Ok(NativeResult::Scalar(NativeScalar::decode(
+                result,
+                signature.result,
+            )));
+        }
+        for (index, argument) in arguments.iter().enumerate() {
+            if argument.encode() != result {
+                continue;
+            }
+            return match (signature.result, argument) {
+                (Type::Image, NativeArgument::Image(_)) => {
+                    Ok(NativeResult::OwnedImageArgument(index))
+                }
+                (Type::ImageView, NativeArgument::ImageView(_)) => {
+                    Ok(NativeResult::ImageViewArgument(index))
+                }
+                _ => continue,
+            };
+        }
+        Err(Diagnostic::error(
+            "native transform returned an image descriptor that does not identify a compatible input",
+            signature.span,
+        ))
     }
 }
 
@@ -346,7 +480,9 @@ fn native_error(message: impl Into<String>) -> Diagnostic {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{NativeScalar, NativeScalarModule};
+    use super::{
+        NativeArgument, NativeImage, NativeImageView, NativeModule, NativeResult, NativeScalar,
+    };
     use crate::backend::cache::ArtifactCacheStatus;
     use crate::ir::TransformId;
 
@@ -357,7 +493,7 @@ mod tests {
             .join("../..")
             .join("build")
             .join(format!(
-                "native-scalar-loader-{}-{}",
+                "native-loader-{}-{}",
                 std::process::id(),
                 NEXT_TEST.fetch_add(1, Ordering::Relaxed)
             ))
@@ -385,13 +521,13 @@ mod tests {
         )
         .unwrap();
         let root = cache_root();
-        let native = NativeScalarModule::build(&compiled.transforms, &compiled.identities, &root)
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, &root)
             .unwrap()
             .unwrap();
         assert_eq!(native.artifact().status, ArtifactCacheStatus::Miss);
         assert_eq!(
             native
-                .invoke(
+                .invoke_scalars(
                     TransformId(0),
                     &[NativeScalar::F32(8.0), NativeScalar::F32(3.0)]
                 )
@@ -400,25 +536,25 @@ mod tests {
         );
         assert_eq!(
             native
-                .invoke(TransformId(1), &[NativeScalar::U8(2), NativeScalar::U8(3)])
+                .invoke_scalars(TransformId(1), &[NativeScalar::U8(2), NativeScalar::U8(3)])
                 .unwrap(),
             NativeScalar::Bool(true)
         );
         assert_eq!(
             native
-                .invoke(TransformId(3), &[NativeScalar::I64(-9_223_372_036)])
+                .invoke_scalars(TransformId(3), &[NativeScalar::I64(-9_223_372_036)])
                 .unwrap(),
             NativeScalar::I64(-9_223_372_036)
         );
         assert_eq!(
             native
-                .invoke(TransformId(4), &[NativeScalar::U8(255)])
+                .invoke_scalars(TransformId(4), &[NativeScalar::U8(255)])
                 .unwrap(),
             NativeScalar::U8(255)
         );
         assert_eq!(
             native
-                .invoke(
+                .invoke_scalars(
                     TransformId(2),
                     &[NativeScalar::F32(f32::NAN), NativeScalar::F32(1.0)]
                 )
@@ -427,7 +563,7 @@ mod tests {
         );
         drop(native);
 
-        let cached = NativeScalarModule::build(&compiled.transforms, &compiled.identities, &root)
+        let cached = NativeModule::build(&compiled.transforms, &compiled.identities, &root)
             .unwrap()
             .unwrap();
         assert_eq!(cached.artifact().status, ArtifactCacheStatus::Hit);
@@ -441,12 +577,76 @@ mod tests {
              transform checked(left: i64, right: i64) -> i64 { return left + right }\n",
         )
         .unwrap();
-        let native =
-            NativeScalarModule::build(&compiled.transforms, &compiled.identities, cache_root())
-                .unwrap()
-                .unwrap();
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
+            .unwrap()
+            .unwrap();
         assert!(native.contains(TransformId(0)));
         assert!(!native.contains(TransformId(1)));
+    }
+
+    #[test]
+    fn mutates_owned_images_and_returns_views_through_descriptors() {
+        let compiled = crate::compile(
+            "images.tima",
+            "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n\
+             transform view(img: ImageView) -> ImageView { return img }\n\
+             transform zero(img: Image) -> Image { return image_zero(img) }\n",
+        )
+        .unwrap();
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
+            .unwrap()
+            .unwrap();
+
+        let mut image = NativeImage {
+            bytes: vec![1, 2, 3, 4],
+            format: 0,
+            width: 2,
+            height: 2,
+            stride: 2,
+        };
+        let owned_pointer = image.bytes.as_ptr();
+        {
+            let mut arguments = [
+                NativeArgument::Image(&mut image),
+                NativeArgument::Scalar(NativeScalar::U8(7)),
+            ];
+            assert_eq!(
+                native.invoke(TransformId(0), &mut arguments).unwrap(),
+                NativeResult::OwnedImageArgument(0)
+            );
+        }
+        assert_eq!(image.bytes, vec![7, 7, 7, 7]);
+        assert_eq!(image.bytes.as_ptr(), owned_pointer);
+
+        let bytes = vec![9, 8, 7, 6];
+        let mut arguments = [NativeArgument::ImageView(NativeImageView {
+            bytes: &bytes,
+            format: 0,
+            width: 2,
+            height: 2,
+            stride: 2,
+        })];
+        assert_eq!(
+            native.invoke(TransformId(1), &mut arguments).unwrap(),
+            NativeResult::ImageViewArgument(0)
+        );
+        assert_eq!(bytes, vec![9, 8, 7, 6]);
+
+        let mut image = NativeImage {
+            bytes: vec![5, 4, 3, 2],
+            format: 0,
+            width: 2,
+            height: 2,
+            stride: 2,
+        };
+        {
+            let mut arguments = [NativeArgument::Image(&mut image)];
+            assert_eq!(
+                native.invoke(TransformId(2), &mut arguments).unwrap(),
+                NativeResult::OwnedImageArgument(0)
+            );
+        }
+        assert_eq!(image.bytes, vec![0, 0, 0, 0]);
     }
 
     #[test]
@@ -457,7 +657,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            NativeScalarModule::build(&compiled.transforms, &compiled.identities, cache_root())
+            NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
                 .unwrap()
                 .is_none()
         );
