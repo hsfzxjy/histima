@@ -1779,6 +1779,9 @@ impl TransformEngine for HybridAotEngine<'_> {
                 };
                 OuterValue::plain(ValueData::String(value.clone()))
             }
+            NativeResult::CopiedStringView(value) => {
+                OuterValue::plain(ValueData::String(Arc::new(value)))
+            }
             NativeResult::OwnedBytesArgument(index) => {
                 let PreparedNativeArgument::Bytes(buffer) = std::mem::replace(
                     &mut prepared[index],
@@ -2494,11 +2497,12 @@ mod tests {
     fn aot_world_reads_preserve_observations_and_freeze_host_allocations() {
         let compiled = crate::compile(
             "native-world.tima",
-            "transform load(path: StringView) -> Bytes uses file.read {
-                 return file.read(path)
+            "transform load() -> Bytes uses file.read {
+                 return file.read(\"asset.bin\")
              }
-             path = \"asset.bin\"
-             out = load(path)
+             transform label() -> StringView { return \"native\" }
+             out = load()
+             name = label()
 ",
         )
         .unwrap();
@@ -2518,6 +2522,10 @@ mod tests {
         assert_eq!(
             execution.execution.bindings["out"].data,
             ValueData::Bytes(Arc::new(vec![1, 2, 3, 4]))
+        );
+        assert_eq!(
+            execution.execution.bindings["name"].data,
+            ValueData::String(Arc::new("native".to_owned()))
         );
         let lineage = execution.execution.bindings["out"]
             .lineage

@@ -559,6 +559,12 @@ pointer, byte length, and capacity. Views have zero capacity. String bytes are
 UTF-8; the host validates an owned String again when it freezes a native
 result. Remaining words are reserved and zero in the current ABI.
 
+Inner string literals are emitted as immutable local object data and lowered to
+zero-capacity `StringView` descriptors. Passing a literal to native code does
+not allocate at runtime. If a literal-derived view is returned to the outer
+layer, the host copies it into immutable outer storage before the native module
+can be unloaded; artifact memory never becomes outer value storage.
+
 Before a native call, an owned String, Bytes, or Image value is uniquely
 detached from immutable outer storage. Native code may mutate owned allocations
 in place subject to the statically known value type. A returned owned
@@ -800,24 +806,25 @@ once per storage byte, including calls. Native RGBA8 operations validate the
 runtime format before addressing pixels and preserve the scalar conversion and
 row-padding semantics in section 8.5.
 
-Checked `i64` arithmetic, string literals and operations, newly allocated
-native images, and `environment_i64` are not compiled. `env.read`, `file.read`,
-and `http.get` are compiled when their key is supplied by a `StringView`
-parameter or another native-compatible value. They call the host through the
-runtime context, retain precise observations, propagate source-spanned errors,
-and return registered host allocations for zero-copy freeze. Because static
-string data is not emitted yet, a transform containing a string literal remains
-interpreted. A transform also remains interpreted when any transitive callee
-uses unsupported behavior. The hybrid `run-native` path makes that decision per
-outer invocation without changing lineage or Recipe identity. Histima product
-execution remains interpreted while the native path matures.
+Checked `i64` arithmetic, general string operations, newly allocated native
+images, and `environment_i64` are not compiled. String literals are emitted as
+read-only object data. `env.read`, `file.read`, and `http.get` are therefore
+compiled for both literal keys and keys supplied by native-compatible
+`StringView` values. They call the host through the runtime context, retain
+precise observations, propagate source-spanned errors, and return registered
+host allocations for zero-copy freeze. A transform remains interpreted when
+any transitive callee uses unsupported behavior. The hybrid `run-native` path
+makes that decision per outer invocation without changing lineage or Recipe
+identity. Histima product execution remains interpreted while the native path
+matures.
 
 Native artifacts are cached independently using Artifact IDs derived from the
 Transform ID plus the Cranelift/compiler version, target, inferred CPU feature
 configuration, optimization setting, and ABI version. A compilation-unit
 bundle ID includes the ordered Artifact IDs. The linked shared-library load
 image is a rebuildable execution cache derived from the validated object, not a
-second semantic artifact. None of these machine details affect semantic
+second semantic artifact. Artifact metadata reports the total source byte size
+of emitted string data. None of these machine details affect semantic
 lineage or Recipe IDs. Extending the backend must preserve typed evaluation
 order, ownership transfer, World observations, boundary validation, and error
 behavior specified here. JIT compilation is out of scope.

@@ -1,12 +1,12 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee32;
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind,
-    UserFuncName, types,
+    AbiParam, Function, GlobalValue, InstBuilder, MemFlagsData, Signature, StackSlotData,
+    StackSlotKind, UserFuncName, types,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::abi::{
@@ -23,7 +23,7 @@ use crate::ir::{
     Constant, RuntimeCall, Terminator, Transform, Type, TypedModule, ValueId, ValueKind,
 };
 
-pub const CRANELIFT_BACKEND_VERSION: &str = "7";
+pub const CRANELIFT_BACKEND_VERSION: &str = "8";
 pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 
 /// Ahead-of-time native object generation from backend-neutral Tima IR.
@@ -78,6 +78,7 @@ impl ArtifactBackend for CraneliftBackend {
                 ))]
             })?;
         let mut object = ObjectModule::new(object_builder);
+        let (static_strings, static_size) = define_static_strings(&mut object, module)?;
         let signature = native_signature(&object);
         let mut function_ids = Vec::with_capacity(module.transforms.len());
         for index in 0..module.transforms.len() {
@@ -96,7 +97,13 @@ impl ArtifactBackend for CraneliftBackend {
             );
         }
         for (index, transform) in module.transforms.iter().enumerate() {
-            let function = lower_transform(transform, index as u32, &mut object, &function_ids)?;
+            let function = lower_transform(
+                transform,
+                index as u32,
+                &mut object,
+                &function_ids,
+                &static_strings[index],
+            )?;
             let mut context = cranelift_codegen::Context::for_function(function);
             object
                 .define_function(function_ids[index], &mut context)
@@ -124,9 +131,76 @@ impl ArtifactBackend for CraneliftBackend {
             optimization: CRANELIFT_OPTIMIZATION,
             abi_version: TIMA_ABI_VERSION,
             bytes,
-            static_size: 0,
+            static_size,
         })
     }
+}
+
+#[derive(Clone, Copy)]
+struct StaticString {
+    data: Option<DataId>,
+    length: u64,
+}
+
+#[derive(Clone, Copy)]
+struct LoweredStaticString {
+    data: Option<GlobalValue>,
+    length: u64,
+}
+
+type StaticStringTable = Vec<Vec<Option<StaticString>>>;
+
+fn define_static_strings(
+    object: &mut ObjectModule,
+    module: &TypedModule,
+) -> Result<(StaticStringTable, u64), Vec<Diagnostic>> {
+    let mut total_size = 0u64;
+    let mut strings = Vec::with_capacity(module.transforms.len());
+    for (transform_index, transform) in module.transforms.iter().enumerate() {
+        let mut values = vec![None; transform.values.len()];
+        for (value_index, value) in transform.values.iter().enumerate() {
+            let ValueKind::Constant(Constant::String(text)) = &value.kind else {
+                continue;
+            };
+            let length = u64::try_from(text.len()).map_err(|_| {
+                vec![Diagnostic::error(
+                    "string literal is too large for the native ABI",
+                    value.span,
+                )]
+            })?;
+            total_size = total_size.checked_add(length).ok_or_else(|| {
+                vec![Diagnostic::error(
+                    "native static data size overflowed u64",
+                    value.span,
+                )]
+            })?;
+            let data = if text.is_empty() {
+                None
+            } else {
+                let name = format!("tima_string_{transform_index}_{value_index}");
+                let data = object
+                    .declare_data(&name, Linkage::Local, false, false)
+                    .map_err(|error| {
+                        vec![Diagnostic::error(
+                            format!("could not declare native string literal: {error}"),
+                            value.span,
+                        )]
+                    })?;
+                let mut description = DataDescription::new();
+                description.define(text.as_bytes().into());
+                object.define_data(data, &description).map_err(|error| {
+                    vec![Diagnostic::error(
+                        format!("could not define native string literal: {error}"),
+                        value.span,
+                    )]
+                })?;
+                Some(data)
+            };
+            values[value_index] = Some(StaticString { data, length });
+        }
+        strings.push(values);
+    }
+    Ok((strings, total_size))
 }
 
 fn validate_module(module: &TypedModule) -> Result<(), Vec<Diagnostic>> {
@@ -233,8 +307,7 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
     }
     for value in &transform.values {
         match &value.kind {
-            ValueKind::Parameter { .. }
-            | ValueKind::Constant(Constant::Bool(_) | Constant::I64(_) | Constant::F32(_)) => {}
+            ValueKind::Parameter { .. } | ValueKind::Constant(_) => {}
             ValueKind::Binary { op, left, .. }
                 if value_type(transform, *left) == Type::I64 && op.is_arithmetic() =>
             {
@@ -258,8 +331,7 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
                 | RuntimeCall::FileRead { .. }
                 | RuntimeCall::HttpGet { .. },
             ) => {}
-            ValueKind::Constant(Constant::String(_))
-            | ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { .. }) => {
+            ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { .. }) => {
                 diagnostics.push(Diagnostic::error(
                     "operation is outside the initial Cranelift AOT subset",
                     value.span,
@@ -275,6 +347,7 @@ fn lower_transform(
     index: u32,
     module: &mut ObjectModule,
     function_ids: &[FuncId],
+    static_strings: &[Option<StaticString>],
 ) -> Result<Function, Vec<Diagnostic>> {
     let signature = native_signature(module);
     let world_call_signature = world_call_signature(module);
@@ -284,6 +357,17 @@ fn lower_transform(
     let function_refs = function_ids
         .iter()
         .map(|callee| module.declare_func_in_func(*callee, &mut function))
+        .collect::<Vec<_>>();
+    let static_strings = static_strings
+        .iter()
+        .map(|value| {
+            value.map(|value| LoweredStaticString {
+                data: value
+                    .data
+                    .map(|data| module.declare_data_in_func(data, &mut function)),
+                length: value.length,
+            })
+        })
         .collect::<Vec<_>>();
     let mut frontend = FunctionBuilderContext::new();
     {
@@ -325,6 +409,11 @@ fn lower_transform(
                 let value = &transform.values[id.0 as usize];
                 let lowered = match &value.kind {
                     ValueKind::Parameter { .. } => continue,
+                    ValueKind::Constant(Constant::String(_)) => lower_static_string(
+                        &mut builder,
+                        static_strings[id.0 as usize]
+                            .expect("string constants have declared object data"),
+                    ),
                     ValueKind::Constant(constant) => {
                         LoweredValue::Scalar(lower_constant(&mut builder, constant, value.ty))
                     }
@@ -915,8 +1004,21 @@ fn lower_constant(
         Constant::I64(value) if ty == Type::U8 => builder.ins().iconst(types::I8, *value),
         Constant::I64(value) => builder.ins().iconst(types::I64, *value),
         Constant::F32(value) => builder.ins().f32const(Ieee32::with_bits(value.to_bits())),
-        Constant::String(_) => unreachable!("validation rejects string constants"),
+        Constant::String(_) => unreachable!("string constants use object data lowering"),
     }
+}
+
+fn lower_static_string(
+    builder: &mut FunctionBuilder<'_>,
+    string: LoweredStaticString,
+) -> LoweredValue {
+    let pointer = match string.data {
+        Some(data) => builder.ins().symbol_value(types::I64, data),
+        None => builder.ins().iconst(types::I64, 0),
+    };
+    let length = builder.ins().iconst(types::I64, string.length as i64);
+    let capacity = builder.ins().iconst(types::I64, 0);
+    LoweredValue::Buffer([pointer, length, capacity])
 }
 
 fn lower_binary(
@@ -1109,7 +1211,7 @@ mod tests {
 
         let unsupported_world_call = crate::compile(
             "world.tima",
-            "transform read() -> Bytes uses file.read { return file.read(\"asset.bin\") }\n",
+            "transform read() -> i64 uses env.read { return environment_i64(\"MODE\") }\n",
         )
         .unwrap();
         let diagnostics = CraneliftBackend
@@ -1120,5 +1222,27 @@ mod tests {
                 .message
                 .contains("outside the initial Cranelift AOT subset")
         );
+    }
+
+    #[test]
+    fn emits_deterministic_read_only_string_data() {
+        let compiled = crate::compile(
+            "strings.tima",
+            "transform read() -> Bytes uses file.read { return file.read(\"asset.bin\") }\n\
+             transform label() -> StringView { return \"ready\" }\n",
+        )
+        .unwrap();
+        let first = CraneliftBackend.emit(&compiled.transforms).unwrap();
+        let second = CraneliftBackend.emit(&compiled.transforms).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.static_size, 14);
+
+        let object = object::File::parse(first.bytes.as_slice()).unwrap();
+        let symbols = object
+            .symbols()
+            .filter_map(|symbol| symbol.name().ok())
+            .collect::<Vec<_>>();
+        assert!(symbols.contains(&"tima_string_0_0"));
+        assert!(symbols.contains(&"tima_string_1_0"));
     }
 }

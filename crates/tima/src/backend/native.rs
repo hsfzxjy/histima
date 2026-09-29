@@ -158,6 +158,7 @@ pub(crate) enum NativeResult {
     OwnedStringArgument(usize),
     OwnedStringAllocation(NativeBuffer),
     StringViewArgument(usize),
+    CopiedStringView(String),
     OwnedBytesArgument(usize),
     OwnedBytesAllocation(NativeBuffer),
     BytesViewArgument(usize),
@@ -653,11 +654,51 @@ impl NativeModule {
             }
             _ => {}
         }
+        if signature.result == Type::StringView {
+            return copy_string_view(result, signature.span).map(NativeResult::CopiedStringView);
+        }
         Err(Diagnostic::error(
             "native transform returned a descriptor that does not identify a compatible input",
             signature.span,
         ))
     }
+}
+
+fn copy_string_view(descriptor: AbiValue, span: Span) -> Result<String, Diagnostic> {
+    if descriptor.words[ABI_CAPACITY_WORD] != 0
+        || descriptor.words[ABI_IMAGE_FORMAT_WORD..]
+            .iter()
+            .any(|word| *word != 0)
+    {
+        return Err(Diagnostic::error(
+            "native transform returned an invalid static StringView descriptor",
+            span,
+        ));
+    }
+    let length = usize::try_from(descriptor.words[ABI_LENGTH_WORD]).map_err(|_| {
+        Diagnostic::error(
+            "native StringView length does not fit the host address space",
+            span,
+        )
+    })?;
+    let bytes = if length == 0 {
+        &[]
+    } else {
+        let pointer = descriptor.words[ABI_POINTER_WORD] as usize as *const u8;
+        if pointer.is_null() {
+            return Err(Diagnostic::error(
+                "native StringView has a null pointer with nonzero length",
+                span,
+            ));
+        }
+        // SAFETY: only the validated Cranelift backend can produce a
+        // non-argument StringView result; its object data remains live while
+        // this module owns the loaded library. We copy before returning.
+        unsafe { std::slice::from_raw_parts(pointer, length) }
+    };
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| Diagnostic::error("native StringView result is not valid UTF-8", span))
 }
 
 fn reachable_rgba8_span(
@@ -1017,15 +1058,28 @@ mod tests {
              transform file_through_call(path: StringView) -> Bytes uses file.read {
                  return file(path)
              }
+             transform literal_file() -> Bytes uses file.read {
+                 return file.read(\"literal.bin\")
+             }
+             transform literal_string() -> StringView { return \"hello\" }
+             transform empty_string() -> StringView { return \"\" }
+             transform view_identity(value: StringView) -> StringView { return value }
+             transform literal_through_call() -> StringView {
+                 return view_identity(\"nested literal\")
+             }
 ",
         )
         .unwrap();
         let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
             .unwrap()
             .unwrap();
-        for id in 0..4 {
+        for id in 0..9 {
             assert!(native.contains(TransformId(id)));
         }
+        assert_eq!(
+            native.artifact().artifact.static_size,
+            ("literal.bin".len() + "hello".len() + "nested literal".len()) as u64
+        );
 
         let world = FixedWorld;
         let mut capabilities = CapabilitySession::new(Some(&world));
@@ -1052,8 +1106,27 @@ mod tests {
             };
             assert_eq!(bytes, expected);
         }
+        let mut arguments = [];
+        let NativeResult::OwnedBytesAllocation(buffer) = native
+            .invoke_with_capabilities(TransformId(4), &mut arguments, &mut capabilities)
+            .unwrap()
+        else {
+            panic!("expected allocated literal-key file result")
+        };
+        assert_eq!(buffer.bytes, b"file:literal.bin");
+
+        for (id, expected) in [(5, "hello"), (6, ""), (8, "nested literal")] {
+            let mut arguments = [];
+            assert_eq!(
+                native
+                    .invoke_with_capabilities(TransformId(id), &mut arguments, &mut capabilities)
+                    .unwrap(),
+                NativeResult::CopiedStringView(expected.to_owned())
+            );
+        }
+
         let observations = capabilities.finish();
-        assert_eq!(observations.len(), 4);
+        assert_eq!(observations.len(), 5);
         assert!(
             observations.iter().all(|observation| matches!(
                 observation.node(),
