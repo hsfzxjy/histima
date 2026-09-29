@@ -12,5 +12,10 @@ name = "tima"
 path = "src/main.rs"
 
 [dependencies]
+cranelift-codegen = "=0.136.1"
+cranelift-frontend = "=0.136.1"
+cranelift-native = "=0.136.1"
+object = { version = "=0.40.0", default-features = false, features = ["read", "write", "std", "coff", "elf", "macho", "pe"] }
 png = "=0.18.1"
+target-lexicon = "=0.13.5"
 webp-rust = "=0.3.1"

@@ -19,10 +19,15 @@ The repository currently provides:
 - a CLI for import, execution, recording, query, trace, replay, and
   materialization.
 
-The typed IR is the semantic compiler boundary. The planned native backend is
+The typed IR is the semantic compiler boundary. Native compilation uses
 ahead-of-time Cranelift, not JIT. WebAssembly is reserved for separately
 registered plugin transforms whose ABI is still deferred. Tima does not
 generate or execute WebAssembly for inner-language transforms.
+
+The first AOT Cranelift slice can emit a host relocatable object for leaf
+scalar transforms with `cargo run -p tima -- emit-object program.tima`. Histima
+still executes typed IR with the interpreter until the native loader and full
+owned/view ABI are implemented.
 
 ## Build and try it
 
@@ -155,9 +160,8 @@ file.
 
 Tima keeps distinct hash domains for Transform ID, Recipe ID, Content ID,
 Source ID, Dependency ID, and Artifact ID. Backend choice, cache hits, and
-execution timestamps never alter semantic derivation lineage. A future
-Cranelift artifact cache will remain independent from the existing Recipe-ID
-result cache.
+execution timestamps never alter semantic derivation lineage. The Cranelift
+artifact cache remains independent from the existing Recipe-ID result cache.
 
 The normative implemented contract is [`spec/TIMA.md`](spec/TIMA.md). Local
 design rationale and work plans live under `agents/` as required by

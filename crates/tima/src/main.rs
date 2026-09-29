@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
+use tima::backend::ArtifactBackend;
+use tima::backend::cranelift::{CraneliftBackend, host_object_file_name};
 use tima::cache::TransformResultCache;
 use tima::capability::World;
 use tima::runtime::{OuterValue, ValueData};
@@ -18,7 +20,7 @@ fn run() -> Result<(), ()> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next().unwrap_or_else(|| "help".to_owned());
     if command == "help" || command == "--help" || command == "-h" {
-        eprintln!("usage: tima <check|run> <file.tima>");
+        eprintln!("usage: tima <check|run|emit-object> <file.tima>");
         return Ok(());
     }
     let Some(path) = arguments.next() else {
@@ -76,9 +78,23 @@ fn run() -> Result<(), ()> {
                 println!("{}", lineage.render());
             }
         }
+        "emit-object" => {
+            let artifact = CraneliftBackend
+                .emit(&compiled.transforms)
+                .map_err(|diagnostics| {
+                    for diagnostic in diagnostics {
+                        eprint!("{}", diagnostic.render(&compiled.source));
+                    }
+                })?;
+            let output = host_object_file_name();
+            fs::write(output, artifact.bytes).map_err(|error| {
+                eprintln!("error: could not write {output}: {error}");
+            })?;
+            println!("wrote {output} for {}", artifact.target);
+        }
         _ => {
             eprintln!("error: unknown command `{command}`");
-            eprintln!("usage: tima <check|run> <file.tima>");
+            eprintln!("usage: tima <check|run|emit-object> <file.tima>");
             return Err(());
         }
     }

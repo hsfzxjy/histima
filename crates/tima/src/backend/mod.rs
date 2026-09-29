@@ -1,3 +1,6 @@
+pub mod cache;
+pub mod cranelift;
+
 use crate::diagnostic::Diagnostic;
 use crate::ir::TypedModule;
 
@@ -9,6 +12,10 @@ use crate::ir::TypedModule;
 pub struct BackendArtifact {
     pub backend: &'static str,
     pub backend_version: &'static str,
+    pub compiler_version: &'static str,
+    pub target: String,
+    pub cpu_features: Vec<String>,
+    pub optimization: &'static str,
     pub abi_version: u32,
     pub bytes: Vec<u8>,
     /// Bytes occupied by immutable data segments before dynamic allocations.

@@ -38,12 +38,13 @@ Tima source
     -> typed-IR interpreter
 ```
 
-The interpreter is the product execution engine in this version. A future
-native backend is planned to compile the same typed IR ahead of time with
-Cranelift. It must remain an additive implementation of `TypedIR ->
-NativeArtifact`; Cranelift IR is not Tima's semantic IR and JIT execution is not
-planned. WebAssembly is reserved for separately registered plugin transforms,
-whose ABI is not yet part of this contract.
+The interpreter is the product execution engine in this version. The initial
+AOT Cranelift backend emits host object artifacts for a scalar subset of the
+same typed IR; native loading is not yet a product execution path. It remains
+an additive implementation of `TypedIR -> NativeArtifact`; Cranelift IR is not
+Tima's semantic IR and JIT execution is not planned. WebAssembly is reserved
+for separately registered plugin transforms, whose ABI is not yet part of this
+contract.
 
 ## 2. Core invariants
 
@@ -647,11 +648,12 @@ not interchangeable: distinct recipes may produce identical content.
 
 ### 12.3 Result and artifact caches
 
-The interpreter does not produce an Artifact ID or artifact cache entry.
-Artifact records remain a separate namespace for the future AOT Cranelift
-backend and for migration/inspection of older workspaces. A future artifact's
-identity must include backend, compiler version, target, CPU features,
-optimization configuration, and ABI version independently from Transform ID.
+The interpreter does not produce an Artifact ID or artifact cache entry. The
+AOT Cranelift backend uses a separate filesystem artifact cache; Artifact IDs
+include backend, compiler version, target, CPU features, optimization
+configuration, and ABI version independently from Transform ID. Histima's
+SQLite artifact records remain available for later product integration and
+for migration/inspection of older workspaces.
 
 Transform results are cached by Recipe ID and validated against immutable
 content.
@@ -725,10 +727,22 @@ The backend boundary is conceptually:
 TypedIR -> NativeArtifact
 ```
 
-A future native backend will use AOT Cranelift compilation and must preserve
+An initial AOT Cranelift backend emits a host relocatable object through
+`tima emit-object`. Its implemented subset is deliberately limited to leaf
+transforms whose parameters and result are `bool`, `u8`, `i64`, or `f32` and
+whose bodies use scalar constants, comparisons, control flow, and `f32`
+arithmetic. Checked `i64` arithmetic, transform calls, owned/view values, and
+World calls are rejected rather than compiled with different semantics. The
+object is not yet loaded by Histima; product execution remains interpreted.
+
+Native artifacts are cached independently using Artifact IDs derived from the
+Transform ID plus the Cranelift/compiler version, target, inferred CPU feature
+configuration, optimization setting, and ABI version. A compilation-unit
+bundle ID includes the ordered Artifact IDs. None of these machine details
+affect semantic lineage or Recipe IDs. Extending the backend must preserve
 typed evaluation order, ownership transfer, World observations, boundary
-validation, and error behavior specified here. Backend selection and machine
-details must not affect semantic lineage. JIT compilation is out of scope.
+validation, and error behavior specified here. JIT compilation is out of
+scope.
 
 Tima does not generate or execute WebAssembly for inner-language transforms.
 WebAssembly is reserved for the separately registered plugin boundary described
