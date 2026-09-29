@@ -7,7 +7,7 @@ use crate::runtime::{ImageFormat, ImageValue, OuterValue, ValueData};
 use crate::source::Span;
 
 const PPM_DECODE_TRANSFORM_VERSION: u32 = 2;
-const PPM_ENCODE_TRANSFORM_VERSION: u32 = 1;
+const PPM_ENCODE_TRANSFORM_VERSION: u32 = 2;
 const PNG_DECODE_TRANSFORM_VERSION: u32 = 1;
 const PNG_ENCODE_TRANSFORM_VERSION: u32 = 2;
 const PNG_DEFAULT_COMPRESSION: i64 = 6;
@@ -229,9 +229,8 @@ fn execute_encode_ppm(
     let ValueData::Image(image) = &arguments[0].0.data else {
         unreachable!()
     };
-    Ok(OuterValue::plain(ValueData::Bytes(Arc::new(encode_ppm(
-        image,
-    )))))
+    encode_ppm(image, arguments[0].1)
+        .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::new(bytes))))
 }
 
 fn execute_decode_png(
@@ -276,23 +275,8 @@ fn decode_ppm(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
     crate::registered_wasm::decode_ppm(bytes, span)
 }
 
-fn encode_ppm(image: &ImageValue) -> Vec<u8> {
-    let mut output = format!("P3\n{} {}\n255\n", image.width(), image.height());
-    image.with_bytes(|bytes| {
-        for y in 0..image.height() {
-            for x in 0..image.width() {
-                let pixel = y * image.stride() + x * 4;
-                output.push_str(&format!(
-                    "{} {} {}{}",
-                    bytes[pixel],
-                    bytes[pixel + 1],
-                    bytes[pixel + 2],
-                    if x + 1 == image.width() { "\n" } else { " " }
-                ));
-            }
-        }
-    });
-    output.into_bytes()
+fn encode_ppm(image: &ImageValue, span: Span) -> Result<Vec<u8>, Diagnostic> {
+    crate::registered_wasm::encode_ppm(image, span)
 }
 
 fn decode_png(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
@@ -496,7 +480,10 @@ mod tests {
     fn ppm_encoding_ignores_alpha_and_row_padding() {
         let image = ImageValue::new_rgba8(1, 1, 6, vec![1, 2, 3, 4, 99, 100]).unwrap();
 
-        assert_eq!(encode_ppm(&image), b"P3\n1 1\n255\n1 2 3\n");
+        assert_eq!(
+            encode_ppm(&image, Span::default()).unwrap(),
+            b"P3\n1 1\n255\n1 2 3\n"
+        );
     }
 
     #[test]

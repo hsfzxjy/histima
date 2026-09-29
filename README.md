@@ -93,8 +93,8 @@ owned byte loops, `image_zero`, `image_fill`, and constrained RGBA8 channel
 scaling. Registered deterministic codecs currently include PPM and PNG
 decode/encode and WebP encode. They use the same Transform/Recipe/Content
 identity, lineage, cache, and replay model as user transforms. `ppm.decode`
-runs as the first fuel- and memory-bounded registered-Wasm plugin; the other
-codec implementations remain provisional host implementations.
+and `ppm.encode` run as the first fuel- and memory-bounded registered-Wasm
+plugins; the PNG and WebP implementations remain provisional host code.
 
 Transform references can assert semantic identity as `name#hash`, where `hash`
 is a full Transform ID or lowercase prefix. The assertion does not itself
