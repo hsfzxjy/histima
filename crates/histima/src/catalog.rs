@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use tima::identity::{
     ArtifactBundleIdentity, ArtifactConfiguration, ArtifactIdentity, ContentIdentity,
     DependencyIdentity, RecipeIdentity, SemanticValueIdentity, SourceIdentity, TransformIdentity,
@@ -177,6 +177,7 @@ pub struct ArtifactInfo {
 pub struct CatalogPage<T> {
     pub items: Vec<T>,
     pub truncated: bool,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -488,28 +489,28 @@ impl Catalog {
             .transpose()
     }
 
-    pub fn assets(&self) -> Result<CatalogPage<AssetSummary>> {
-        let mut statement = self.connection.prepare(
-            "SELECT head.locator, head.source_id, source.content_id, content.byte_length
-             FROM source_heads AS head
-             JOIN source_assets AS source
-               ON source.locator = head.locator AND source.source_id = head.source_id
-             JOIN contents AS content ON content.content_id = source.content_id
-             ORDER BY head.locator
-             LIMIT ?1",
-        )?;
-        let limit = i64::try_from(CATALOG_LIST_LIMIT + 1)
-            .map_err(|_| Error::catalog("catalog listing limit does not fit SQLite INTEGER"))?;
-        let rows = statement
-            .query_map([limit], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+    pub fn assets(&self, limit: usize, after: Option<&str>) -> Result<CatalogPage<AssetSummary>> {
+        let limit = sqlite_page_limit(limit)?;
+        let select = "SELECT head.locator, head.source_id, source.content_id, content.byte_length
+                      FROM source_heads AS head
+                      JOIN source_assets AS source
+                        ON source.locator = head.locator AND source.source_id = head.source_id
+                      JOIN contents AS content ON content.content_id = source.content_id";
+        let rows = if let Some(after) = after {
+            let mut statement = self.connection.prepare(&format!(
+                "{select} WHERE head.locator > ?1 ORDER BY head.locator LIMIT ?2"
+            ))?;
+            statement
+                .query_map(params![after, limit], asset_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let mut statement = self
+                .connection
+                .prepare(&format!("{select} ORDER BY head.locator LIMIT ?1"))?;
+            statement
+                .query_map([limit], asset_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
         let mut items = rows
             .into_iter()
             .map(|(locator, source_id, content_id, byte_len)| {
@@ -536,32 +537,36 @@ impl Catalog {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(bounded_page(&mut items))
+        Ok(bounded_page(&mut items, limit, |item| item.locator.clone()))
     }
 
-    pub fn recipes(&self) -> Result<CatalogPage<RecipeSummary>> {
-        let mut statement = self.connection.prepare(
-            "SELECT result.recipe_id, invocation.transform_id,
-                    invocation.transform_name, result.content_id, content.byte_length
-             FROM recipe_results AS result
-             JOIN lineage_invocations AS invocation USING (recipe_id)
-             JOIN contents AS content ON content.content_id = result.content_id
-             ORDER BY result.recipe_id
-             LIMIT ?1",
-        )?;
-        let limit = i64::try_from(CATALOG_LIST_LIMIT + 1)
-            .map_err(|_| Error::catalog("catalog listing limit does not fit SQLite INTEGER"))?;
-        let rows = statement
-            .query_map([limit], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+    pub fn recipes(
+        &self,
+        limit: usize,
+        after: Option<RecipeIdentity>,
+    ) -> Result<CatalogPage<RecipeSummary>> {
+        let limit = sqlite_page_limit(limit)?;
+        let after = after.map(|identity| identity.to_string());
+        let select = "SELECT result.recipe_id, invocation.transform_id,
+                             invocation.transform_name, result.content_id, content.byte_length
+                      FROM recipe_results AS result
+                      JOIN lineage_invocations AS invocation USING (recipe_id)
+                      JOIN contents AS content ON content.content_id = result.content_id";
+        let rows = if let Some(after) = after.as_deref() {
+            let mut statement = self.connection.prepare(&format!(
+                "{select} WHERE result.recipe_id > ?1 ORDER BY result.recipe_id LIMIT ?2"
+            ))?;
+            statement
+                .query_map(params![after, limit], recipe_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let mut statement = self
+                .connection
+                .prepare(&format!("{select} ORDER BY result.recipe_id LIMIT ?1"))?;
+            statement
+                .query_map([limit], recipe_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
         let mut items = rows
             .into_iter()
             .map(
@@ -599,7 +604,9 @@ impl Catalog {
                 },
             )
             .collect::<Result<Vec<_>>>()?;
-        Ok(bounded_page(&mut items))
+        Ok(bounded_page(&mut items, limit, |item| {
+            item.recipe_id.to_string()
+        }))
     }
 
     pub fn content_reference_counts(&self, identity: ContentIdentity) -> Result<(u64, u64)> {
@@ -670,7 +677,7 @@ impl Catalog {
             .collect::<Result<Vec<_>>>()?;
         Ok(CatalogArtifactInspection {
             artifact,
-            bundles: bounded_page(&mut bundles),
+            bundles: bounded_page(&mut bundles, limit, |bundle| bundle.bundle_id.to_string()),
         })
     }
 
@@ -774,12 +781,45 @@ impl Catalog {
     }
 }
 
-fn bounded_page<T>(items: &mut Vec<T>) -> CatalogPage<T> {
-    let truncated = items.len() > CATALOG_LIST_LIMIT;
-    items.truncate(CATALOG_LIST_LIMIT);
+fn sqlite_page_limit(limit: usize) -> Result<i64> {
+    if !(1..=CATALOG_LIST_LIMIT).contains(&limit) {
+        return Err(Error::catalog(format!(
+            "catalog listing limit must be between 1 and {CATALOG_LIST_LIMIT}"
+        )));
+    }
+    i64::try_from(limit + 1)
+        .map_err(|_| Error::catalog("catalog listing limit does not fit SQLite INTEGER"))
+}
+
+fn asset_row(row: &Row<'_>) -> rusqlite::Result<(String, String, String, i64)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+fn recipe_row(row: &Row<'_>) -> rusqlite::Result<(String, String, String, String, i64)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn bounded_page<T>(
+    items: &mut Vec<T>,
+    sqlite_limit: i64,
+    cursor: impl FnOnce(&T) -> String,
+) -> CatalogPage<T> {
+    let page_limit =
+        usize::try_from(sqlite_limit - 1).expect("validated SQLite page limit fits usize");
+    let truncated = items.len() > page_limit;
+    items.truncate(page_limit);
+    let next_cursor =
+        truncated.then(|| cursor(items.last().expect("a truncated page is non-empty")));
     CatalogPage {
         items: std::mem::take(items),
         truncated,
+        next_cursor,
     }
 }
 

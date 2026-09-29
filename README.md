@@ -52,6 +52,12 @@ the current directory to the nearest ancestor containing `.histima.sql3`.
 Opening an older workspace migrates `catalog.sqlite3` to that hidden name.
 Add `--json` anywhere for structured output.
 
+Catalog listings use bounded SQLite keyset pagination. `histima assets` and
+`histima recipes` accept `--limit <1-100>` and return `next_cursor` when more
+rows exist. Pass that value back with `--after <cursor>` to fetch the next
+page. Asset cursors are locators; recipe cursors are Recipe IDs. Calls without
+these options retain the existing 100-row maximum.
+
 `histima pipeline [workspace] <expression>` accepts exactly one outer Tima
 expression. Invocation-derived byte results are automatically recorded in
 workspace stock, so a later process can reuse them. Custom `transform`

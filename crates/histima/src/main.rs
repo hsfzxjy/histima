@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use histima::{ReplayPolicy, RunError, Workspace};
+use histima::{CATALOG_LIST_LIMIT, ReplayPolicy, RunError, Workspace};
 use tima::identity::{ArtifactIdentity, ContentIdentity, RecipeIdentity, content_identity};
 use tima::lineage::{LineageNode, RecordedValue};
 use tima::runtime::{OuterValue, ValueData};
@@ -124,13 +124,20 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             })?;
         }
         "assets" => {
+            let limit = list_limit(&mut arguments)?;
+            let after = take_value_option(&mut arguments, "--after")?;
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
-            let page = workspace.assets().map_err(|error| error.to_string())?;
+            let page = workspace
+                .assets_page(limit, after.as_deref())
+                .map_err(|error| error.to_string())?;
             output.emit(cli_json::assets(&page), || {
                 println!("count = {}", page.items.len());
                 println!("truncated = {}", page.truncated);
+                if let Some(cursor) = &page.next_cursor {
+                    println!("next_cursor = {cursor}");
+                }
                 for (index, asset) in page.items.iter().enumerate() {
                     println!("asset[{index}].locator = {}", asset.locator);
                     println!("asset[{index}].source_id = {}", asset.source_id);
@@ -140,13 +147,26 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             })?;
         }
         "recipes" => {
+            let limit = list_limit(&mut arguments)?;
+            let after = take_value_option(&mut arguments, "--after")?
+                .map(|value| {
+                    value
+                        .parse::<RecipeIdentity>()
+                        .map_err(|error| format!("invalid Recipe cursor: {error}"))
+                })
+                .transpose()?;
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
             let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
-            let page = workspace.recipes().map_err(|error| error.to_string())?;
+            let page = workspace
+                .recipes_page(limit, after)
+                .map_err(|error| error.to_string())?;
             output.emit(cli_json::recipes(&page), || {
                 println!("count = {}", page.items.len());
                 println!("truncated = {}", page.truncated);
+                if let Some(cursor) = &page.next_cursor {
+                    println!("next_cursor = {cursor}");
+                }
                 for (index, recipe) in page.items.iter().enumerate() {
                     println!("recipe[{index}].recipe_id = {}", recipe.recipe_id);
                     println!("recipe[{index}].transform_id = {}", recipe.transform_id);
@@ -590,6 +610,43 @@ fn take_flag(arguments: &mut VecDeque<String>, flag: &str) -> Result<bool, Strin
     Ok(count == 1)
 }
 
+fn take_value_option(
+    arguments: &mut VecDeque<String>,
+    option: &str,
+) -> Result<Option<String>, String> {
+    let positions = arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (argument == option).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err(format!("{option} may be supplied only once"));
+    }
+    let Some(position) = positions.first().copied() else {
+        return Ok(None);
+    };
+    if position + 1 >= arguments.len() {
+        return Err(format!("{option} requires a value"));
+    }
+    arguments.remove(position);
+    Ok(arguments.remove(position))
+}
+
+fn list_limit(arguments: &mut VecDeque<String>) -> Result<usize, String> {
+    let Some(value) = take_value_option(arguments, "--limit")? else {
+        return Ok(CATALOG_LIST_LIMIT);
+    };
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid list limit {value:?}; expected an integer"))?;
+    if !(1..=CATALOG_LIST_LIMIT).contains(&limit) {
+        return Err(format!(
+            "list limit must be between 1 and {CATALOG_LIST_LIMIT}"
+        ));
+    }
+    Ok(limit)
+}
+
 fn required(arguments: &mut VecDeque<String>, name: &str) -> Result<String, String> {
     arguments
         .pop_front()
@@ -609,8 +666,8 @@ fn print_usage() {
     eprintln!("  histima init [workspace]");
     eprintln!("  histima import [workspace] <source-file>");
     eprintln!("  histima stats [workspace]");
-    eprintln!("  histima assets [workspace]");
-    eprintln!("  histima recipes [workspace]");
+    eprintln!("  histima assets [workspace] [--limit <1-100>] [--after <locator>]");
+    eprintln!("  histima recipes [workspace] [--limit <1-100>] [--after <recipe-id>]");
     eprintln!("  histima plugins [workspace]");
     eprintln!("  histima inspect content [workspace] <content-id>");
     eprintln!("  histima inspect recipe [workspace] <recipe-id>");

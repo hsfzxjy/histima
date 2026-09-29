@@ -46,6 +46,7 @@ pub fn assets(page: &CatalogPage<AssetSummary>) -> Value {
     json!({
         "count": page.items.len(),
         "truncated": page.truncated,
+        "next_cursor": page.next_cursor,
         "assets": page.items.iter().map(|asset| json!({
             "locator": asset.locator,
             "source_id": asset.source_id.to_string(),
@@ -59,6 +60,7 @@ pub fn recipes(page: &CatalogPage<RecipeSummary>) -> Value {
     json!({
         "count": page.items.len(),
         "truncated": page.truncated,
+        "next_cursor": page.next_cursor,
         "recipes": page.items.iter().map(|recipe| json!({
             "recipe_id": recipe.recipe_id.to_string(),
             "transform_id": recipe.transform_id.to_string(),

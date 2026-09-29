@@ -108,6 +108,92 @@ fn cli_imports_inspects_and_materializes_across_processes() {
 }
 
 #[test]
+fn cli_paginates_assets_and_recipes_with_stable_cursors() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    assert_success(&histima(["init", text(&workspace)]));
+
+    let mut locators = Vec::new();
+    let mut recipe_ids = Vec::new();
+    for index in 0..3 {
+        let source = test.path().join(format!("asset-{index}.bin"));
+        fs::write(&source, format!("P3\n1 1\n255\n{index} 0 0\n")).unwrap();
+        let locator = portable(&source);
+        assert_success(&histima(["import", text(&workspace), &locator]));
+        let expression = format!("asset({locator:?}) | read | ppm.decode | ppm.encode");
+        let pipeline = histima(["pipeline", text(&workspace), &expression, "--json"]);
+        assert_success(&pipeline);
+        recipe_ids.push(
+            json_output(&pipeline)["stocked"]["recipe_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+        locators.push(locator);
+    }
+    locators.sort();
+    recipe_ids.sort();
+
+    let assets = histima(["assets", text(&workspace), "--limit", "2", "--json"]);
+    assert_success(&assets);
+    let assets = json_output(&assets);
+    assert_eq!(assets["count"], 2);
+    assert_eq!(assets["truncated"], true);
+    assert_eq!(assets["assets"][0]["locator"], locators[0]);
+    assert_eq!(assets["assets"][1]["locator"], locators[1]);
+    assert_eq!(assets["next_cursor"], locators[1]);
+
+    let assets_after = histima([
+        "assets",
+        "--after",
+        &locators[1],
+        "--limit",
+        "2",
+        text(&workspace),
+        "--json",
+    ]);
+    assert_success(&assets_after);
+    let assets_after = json_output(&assets_after);
+    assert_eq!(assets_after["count"], 1);
+    assert_eq!(assets_after["truncated"], false);
+    assert_eq!(assets_after["next_cursor"], Value::Null);
+    assert_eq!(assets_after["assets"][0]["locator"], locators[2]);
+
+    let recipes = histima(["recipes", "--limit", "2", text(&workspace), "--json"]);
+    assert_success(&recipes);
+    let recipes = json_output(&recipes);
+    assert_eq!(recipes["count"], 2);
+    assert_eq!(recipes["truncated"], true);
+    assert_eq!(recipes["recipes"][0]["recipe_id"], recipe_ids[0]);
+    assert_eq!(recipes["recipes"][1]["recipe_id"], recipe_ids[1]);
+    assert_eq!(recipes["next_cursor"], recipe_ids[1]);
+
+    let recipes_after = histima([
+        "recipes",
+        text(&workspace),
+        "--after",
+        &recipe_ids[1],
+        "--limit",
+        "2",
+        "--json",
+    ]);
+    assert_success(&recipes_after);
+    let recipes_after = json_output(&recipes_after);
+    assert_eq!(recipes_after["count"], 1);
+    assert_eq!(recipes_after["truncated"], false);
+    assert_eq!(recipes_after["next_cursor"], Value::Null);
+    assert_eq!(recipes_after["recipes"][0]["recipe_id"], recipe_ids[2]);
+
+    let invalid_limit = histima(["assets", text(&workspace), "--limit", "0"]);
+    assert!(!invalid_limit.status.success());
+    assert!(stderr(&invalid_limit).contains("list limit must be between 1 and 100"));
+
+    let invalid_cursor = histima(["recipes", text(&workspace), "--after", "not-an-id"]);
+    assert!(!invalid_cursor.status.success());
+    assert!(stderr(&invalid_cursor).contains("invalid Recipe cursor"));
+}
+
+#[test]
 fn cli_executes_and_strictly_replays_workspace_world_file_reads() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");

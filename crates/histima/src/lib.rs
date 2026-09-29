@@ -634,11 +634,27 @@ impl Workspace {
     }
 
     pub fn assets(&self) -> Result<CatalogPage<AssetSummary>> {
-        self.catalog.assets()
+        self.assets_page(CATALOG_LIST_LIMIT, None)
+    }
+
+    pub fn assets_page(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<CatalogPage<AssetSummary>> {
+        self.catalog.assets(limit, after)
     }
 
     pub fn recipes(&self) -> Result<CatalogPage<RecipeSummary>> {
-        self.catalog.recipes()
+        self.recipes_page(CATALOG_LIST_LIMIT, None)
+    }
+
+    pub fn recipes_page(
+        &self,
+        limit: usize,
+        after: Option<RecipeIdentity>,
+    ) -> Result<CatalogPage<RecipeSummary>> {
+        self.catalog.recipes(limit, after)
     }
 
     pub fn inspect_content(&self, identity: ContentIdentity) -> Result<ContentInspection> {
@@ -777,6 +793,7 @@ impl Workspace {
             bundles: CatalogPage {
                 items: bundles,
                 truncated: catalog.bundles.truncated,
+                next_cursor: catalog.bundles.next_cursor,
             },
         })
     }
@@ -1193,8 +1210,16 @@ mod tests {
 
         assert_eq!(page.items.len(), CATALOG_LIST_LIMIT);
         assert!(page.truncated);
+        assert_eq!(page.next_cursor.as_deref(), Some("asset-099"));
         assert_eq!(page.items.first().unwrap().locator, "asset-000");
         assert_eq!(page.items.last().unwrap().locator, "asset-099");
+        let remainder = workspace
+            .assets_page(10, page.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(remainder.items.len(), 1);
+        assert!(!remainder.truncated);
+        assert_eq!(remainder.next_cursor, None);
+        assert_eq!(remainder.items[0].locator, "asset-100");
         let inspection = workspace.inspect_content(page.items[0].content_id).unwrap();
         assert!(inspection.valid);
         assert_eq!(inspection.kind, "raw");
