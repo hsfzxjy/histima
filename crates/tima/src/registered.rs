@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::diagnostic::Diagnostic;
@@ -8,7 +7,7 @@ use crate::source::Span;
 
 const PPM_DECODE_TRANSFORM_VERSION: u32 = 2;
 const PPM_ENCODE_TRANSFORM_VERSION: u32 = 2;
-const PNG_DECODE_TRANSFORM_VERSION: u32 = 1;
+const PNG_DECODE_TRANSFORM_VERSION: u32 = 2;
 const PNG_ENCODE_TRANSFORM_VERSION: u32 = 3;
 const PNG_DEFAULT_COMPRESSION: i64 = 6;
 const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 1;
@@ -280,91 +279,7 @@ fn encode_ppm(image: &ImageValue, span: Span) -> Result<Vec<u8>, Diagnostic> {
 }
 
 fn decode_png(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
-    let mut decoder = png::Decoder::new(Cursor::new(bytes));
-    decoder.set_transformations(png::Transformations::normalize_to_color8());
-    let mut reader = decoder.read_info().map_err(|error| {
-        Diagnostic::error(
-            format!("png.decode could not read PNG metadata: {error}"),
-            span,
-        )
-    })?;
-    if reader.info().animation_control.is_some() {
-        return Err(Diagnostic::error(
-            "png.decode does not support animated PNG images",
-            span,
-        ));
-    }
-    let buffer_size = reader.output_buffer_size().ok_or_else(|| {
-        Diagnostic::error("png.decode image dimensions exceed this runtime", span)
-    })?;
-    let mut decoded = vec![0; buffer_size];
-    let output = reader.next_frame(&mut decoded).map_err(|error| {
-        Diagnostic::error(
-            format!("png.decode could not decode image data: {error}"),
-            span,
-        )
-    })?;
-    if output.bit_depth != png::BitDepth::Eight {
-        return Err(Diagnostic::error(
-            format!(
-                "png.decode produced unsupported {:?} channel depth",
-                output.bit_depth
-            ),
-            span,
-        ));
-    }
-    let width = usize::try_from(output.width)
-        .map_err(|_| Diagnostic::error("png.decode width exceeds usize", span))?;
-    let height = usize::try_from(output.height)
-        .map_err(|_| Diagnostic::error("png.decode height exceeds usize", span))?;
-    let pixels = width
-        .checked_mul(height)
-        .ok_or_else(|| Diagnostic::error("png.decode pixel count overflows usize", span))?;
-    let rgba_length = pixels
-        .checked_mul(4)
-        .ok_or_else(|| Diagnostic::error("png.decode RGBA byte length overflows usize", span))?;
-    let channels = output.color_type.samples();
-    let expected_line = width
-        .checked_mul(channels)
-        .ok_or_else(|| Diagnostic::error("png.decode row byte length overflows usize", span))?;
-    if output.line_size != expected_line {
-        return Err(Diagnostic::error(
-            "png.decode returned an inconsistent row layout",
-            span,
-        ));
-    }
-    let decoded = &decoded[..output.buffer_size()];
-    let mut rgba = Vec::with_capacity(rgba_length);
-    for pixel in decoded.chunks_exact(channels) {
-        match output.color_type {
-            png::ColorType::Grayscale => {
-                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 255])
-            }
-            png::ColorType::GrayscaleAlpha => {
-                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]])
-            }
-            png::ColorType::Rgb => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]),
-            png::ColorType::Rgba => rgba.extend_from_slice(pixel),
-            png::ColorType::Indexed => {
-                return Err(Diagnostic::error(
-                    "png.decode palette expansion did not produce RGB pixels",
-                    span,
-                ));
-            }
-        }
-    }
-    if rgba.len() != rgba_length {
-        return Err(Diagnostic::error(
-            "png.decode returned an incomplete pixel buffer",
-            span,
-        ));
-    }
-    let stride = width
-        .checked_mul(4)
-        .ok_or_else(|| Diagnostic::error("png.decode RGBA stride overflows usize", span))?;
-    ImageValue::new_rgba8(width, height, stride, rgba).map_err(|error| {
-        Diagnostic::error(format!("png.decode produced invalid image: {error}"), span)
-    })
+    crate::registered_wasm::decode_png(bytes, span)
 }
 
 fn encode_png(image: &ImageValue, compression: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
@@ -581,6 +496,26 @@ mod tests {
 
         assert_eq!(decoded.format(), ImageFormat::Rgba8);
         assert_eq!(decoded.bytes(), &[5, 5, 5, 255, 200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn png_decoding_expands_palette_transparency_to_rgba8() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 2, 1);
+            encoder.set_color(png::ColorType::Indexed);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_palette(&[10, 20, 30, 200, 150, 100]);
+            encoder.set_trns(&[7, 255]);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0, 1]).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let decoded = decode_png(&encoded, Span::default()).unwrap();
+
+        assert_eq!(decoded.format(), ImageFormat::Rgba8);
+        assert_eq!(decoded.bytes(), &[10, 20, 30, 7, 200, 150, 100, 255]);
     }
 
     #[test]

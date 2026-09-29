@@ -640,10 +640,10 @@ asset capability. Tima code has no ambient OS access outside the World.
 
 Registered transforms use normal outer call and pipeline syntax. They have
 versioned semantic identities and use the same normalized arguments, lineage,
-result cache, and replay machinery as user transforms. Both PPM transforms and
-`png.encode` are registered-Wasm implementations; `png.decode` and
-`webp.encode` remain provisional host implementations behind the same
-registry. The registry is not general native-library FFI.
+result cache, and replay machinery as user transforms. Both PPM and PNG
+transforms are registered-Wasm implementations; `webp.encode` remains a
+provisional host implementation behind the same registry. The registry is not
+general native-library FFI.
 
 | Transform | Parameters | Result | Contract |
 | --- | --- | --- | --- |
@@ -662,7 +662,9 @@ not implemented.
 
 The current ABI is intentionally the exact slice required by the registered
 PPM and PNG codecs: immutable bytes and image inputs, signed integer
-configuration, and owned bytes and image results. A module:
+configuration, and owned bytes and image results. PNG decoding normalizes
+supported still-image color forms to RGBA8 inside the sandbox and rejects
+APNG. A module:
 
 - is Wasm32 and imports nothing (in particular, it has no WASI);
 - exports `memory`;
