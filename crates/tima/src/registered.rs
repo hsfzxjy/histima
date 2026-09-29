@@ -1,7 +1,6 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::backend::wasm_runtime::WasmSession;
 use crate::diagnostic::Diagnostic;
 use crate::identity::{TransformIdentity, registered_transform_identity};
 use crate::runtime::{ImageFormat, ImageValue, OuterValue, ValueData};
@@ -20,8 +19,7 @@ enum DefaultValue {
 }
 
 type Validator = fn(&[(OuterValue, Span)], Span) -> Result<(), Diagnostic>;
-type Executor =
-    fn(&[(OuterValue, Span)], Span, Option<&WasmSession>) -> Result<OuterValue, Diagnostic>;
+type Executor = fn(&[(OuterValue, Span)], Span) -> Result<OuterValue, Diagnostic>;
 
 /// A deterministic transform supplied by Tima's standard registry rather than
 /// authored as inner Tima code. The runtime treats descriptors uniformly for
@@ -124,8 +122,8 @@ pub(crate) struct PreparedRegisteredInvocation {
 }
 
 impl PreparedRegisteredInvocation {
-    pub(crate) fn execute(self, wasm: Option<&WasmSession>) -> Result<OuterValue, Diagnostic> {
-        (self.transform.execute)(&self.arguments, self.call_span, wasm)
+    pub(crate) fn execute(self) -> Result<OuterValue, Diagnostic> {
+        (self.transform.execute)(&self.arguments, self.call_span)
     }
 }
 
@@ -216,18 +214,16 @@ fn validate_webp_encode(arguments: &[(OuterValue, Span)], span: Span) -> Result<
 fn execute_decode_ppm(
     arguments: &[(OuterValue, Span)],
     _span: Span,
-    wasm: Option<&WasmSession>,
 ) -> Result<OuterValue, Diagnostic> {
     let ValueData::Bytes(bytes) = &arguments[0].0.data else {
         unreachable!()
     };
-    decode_ppm(bytes, arguments[0].1, wasm).map(OuterValue::image)
+    decode_ppm(bytes, arguments[0].1).map(OuterValue::image)
 }
 
 fn execute_encode_ppm(
     arguments: &[(OuterValue, Span)],
     _span: Span,
-    _wasm: Option<&WasmSession>,
 ) -> Result<OuterValue, Diagnostic> {
     let ValueData::Image(image) = &arguments[0].0.data else {
         unreachable!()
@@ -240,18 +236,16 @@ fn execute_encode_ppm(
 fn execute_decode_png(
     arguments: &[(OuterValue, Span)],
     _span: Span,
-    wasm: Option<&WasmSession>,
 ) -> Result<OuterValue, Diagnostic> {
     let ValueData::Bytes(bytes) = &arguments[0].0.data else {
         unreachable!()
     };
-    decode_png(bytes, arguments[0].1, wasm).map(OuterValue::image)
+    decode_png(bytes, arguments[0].1).map(OuterValue::image)
 }
 
 fn execute_encode_png(
     arguments: &[(OuterValue, Span)],
     _span: Span,
-    _wasm: Option<&WasmSession>,
 ) -> Result<OuterValue, Diagnostic> {
     let ValueData::Image(image) = &arguments[0].0.data else {
         unreachable!()
@@ -266,7 +260,6 @@ fn execute_encode_png(
 fn execute_encode_webp(
     arguments: &[(OuterValue, Span)],
     _span: Span,
-    _wasm: Option<&WasmSession>,
 ) -> Result<OuterValue, Diagnostic> {
     let ValueData::Image(image) = &arguments[0].0.data else {
         unreachable!()
@@ -278,11 +271,7 @@ fn execute_encode_webp(
         .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::from(bytes))))
 }
 
-fn decode_ppm(
-    bytes: &[u8],
-    span: Span,
-    wasm: Option<&WasmSession>,
-) -> Result<ImageValue, Diagnostic> {
+fn decode_ppm(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         Diagnostic::error("ppm.decode currently requires ASCII P3 data", span)
             .with_note("binary P6 support is deferred")
@@ -352,7 +341,7 @@ fn decode_ppm(
             rgba.push(255);
         }
     }
-    ImageValue::new_rgba8_in(wasm, width, height, stride, rgba).map_err(|error| {
+    ImageValue::new_rgba8(width, height, stride, rgba).map_err(|error| {
         Diagnostic::error(format!("ppm.decode produced invalid image: {error}"), span)
     })
 }
@@ -382,11 +371,7 @@ fn encode_ppm(image: &ImageValue) -> Vec<u8> {
     output.into_bytes()
 }
 
-fn decode_png(
-    bytes: &[u8],
-    span: Span,
-    wasm: Option<&WasmSession>,
-) -> Result<ImageValue, Diagnostic> {
+fn decode_png(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(|error| {
@@ -469,7 +454,7 @@ fn decode_png(
     let stride = width
         .checked_mul(4)
         .ok_or_else(|| Diagnostic::error("png.decode RGBA stride overflows usize", span))?;
-    ImageValue::new_rgba8_in(wasm, width, height, stride, rgba).map_err(|error| {
+    ImageValue::new_rgba8(width, height, stride, rgba).map_err(|error| {
         Diagnostic::error(format!("png.decode produced invalid image: {error}"), span)
     })
 }
@@ -574,7 +559,7 @@ mod tests {
 
     #[test]
     fn ppm_codec_rejects_incomplete_pixels() {
-        let diagnostic = decode_ppm(b"P3\n1 1\n255\n1 2\n", Span::default(), None).unwrap_err();
+        let diagnostic = decode_ppm(b"P3\n1 1\n255\n1 2\n", Span::default()).unwrap_err();
 
         assert!(diagnostic.message.contains("expected 3 channel samples"));
     }
@@ -593,7 +578,7 @@ mod tests {
 
         let first = encode_png(&image, 6, Span::default()).unwrap();
         let second = encode_png(&image, 6, Span::default()).unwrap();
-        let decoded = decode_png(&first, Span::default(), None).unwrap();
+        let decoded = decode_png(&first, Span::default()).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(&first[..8], b"\x89PNG\r\n\x1a\n");
@@ -720,7 +705,7 @@ mod tests {
             writer.finish().unwrap();
         }
 
-        let decoded = decode_png(&encoded, Span::default(), None).unwrap();
+        let decoded = decode_png(&encoded, Span::default()).unwrap();
 
         assert_eq!(decoded.format(), ImageFormat::Rgba8);
         assert_eq!(decoded.bytes(), &[5, 5, 5, 255, 200, 200, 200, 255]);
@@ -728,7 +713,7 @@ mod tests {
 
     #[test]
     fn png_decoding_reports_invalid_input() {
-        let diagnostic = decode_png(b"not a PNG", Span::default(), None).unwrap_err();
+        let diagnostic = decode_png(b"not a PNG", Span::default()).unwrap_err();
 
         assert!(
             diagnostic
@@ -751,7 +736,7 @@ mod tests {
             writer.finish().unwrap();
         }
 
-        let diagnostic = decode_png(&encoded, Span::default(), None).unwrap_err();
+        let diagnostic = decode_png(&encoded, Span::default()).unwrap_err();
 
         assert!(diagnostic.message.contains("does not support animated PNG"));
     }

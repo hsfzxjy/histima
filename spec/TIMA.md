@@ -730,10 +730,9 @@ typed evaluation order, ownership transfer, World observations, boundary
 validation, and error behavior specified here. Backend selection and machine
 details must not affect semantic lineage. JIT compilation is out of scope.
 
-The repository may temporarily retain a legacy generated-Wasm implementation
-for regression tests over the older scalar/image subset. Histima does not use
-it for product execution, it rejects the new World string/byte operations, and
-its behavior is not a current language/backend contract.
+Tima does not generate or execute WebAssembly for inner-language transforms.
+WebAssembly is reserved for the separately registered plugin boundary described
+in section 11.
 
 ## 15. Deliberately unsupported in v0
 

@@ -14,5 +14,3 @@ path = "src/main.rs"
 [dependencies]
 png = "=0.18.1"
 webp-rust = "=0.3.1"
-wasm-encoder = "=0.259.0"
-wasmtime = { version = "=49.0.1", default-features = false, features = ["cache", "cranelift", "runtime"] }

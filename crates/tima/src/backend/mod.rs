@@ -1,6 +1,3 @@
-pub mod wasm;
-pub mod wasm_runtime;
-
 use crate::diagnostic::Diagnostic;
 use crate::ir::TypedModule;
 

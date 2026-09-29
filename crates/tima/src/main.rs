@@ -2,8 +2,6 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use tima::backend::ArtifactBackend;
-use tima::backend::wasm::WasmBackend;
 use tima::cache::TransformResultCache;
 use tima::capability::World;
 use tima::runtime::{OuterValue, ValueData};
@@ -20,7 +18,7 @@ fn run() -> Result<(), ()> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next().unwrap_or_else(|| "help".to_owned());
     if command == "help" || command == "--help" || command == "-h" {
-        eprintln!("usage: tima <check|run|emit-wasm> <file.tima>");
+        eprintln!("usage: tima <check|run> <file.tima>");
         return Ok(());
     }
     let Some(path) = arguments.next() else {
@@ -78,22 +76,9 @@ fn run() -> Result<(), ()> {
                 println!("{}", lineage.render());
             }
         }
-        "emit-wasm" => {
-            let artifact = WasmBackend
-                .emit(&compiled.transforms)
-                .map_err(|diagnostics| {
-                    for diagnostic in diagnostics {
-                        eprint!("{}", diagnostic.render(&compiled.source));
-                    }
-                })?;
-            fs::write("module.wasm", artifact.bytes).map_err(|error| {
-                eprintln!("error: could not write module.wasm: {error}");
-            })?;
-            println!("wrote module.wasm");
-        }
         _ => {
             eprintln!("error: unknown command `{command}`");
-            eprintln!("usage: tima <check|run|emit-wasm> <file.tima>");
+            eprintln!("usage: tima <check|run> <file.tima>");
             return Err(());
         }
     }

@@ -1,16 +1,11 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::ffi::c_void;
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use crate::CompiledProgram;
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
-use crate::backend::wasm_runtime::{
-    InvocationBridge, WasmBuffer, WasmImage, WasmInvokeError, WasmSession, WasmValue,
-};
 use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
 use crate::diagnostic::Diagnostic;
@@ -72,28 +67,19 @@ pub struct AssetValue {
 }
 
 #[derive(Clone, Debug)]
-enum ImageStorage {
-    Host(Arc<[u8]>),
-    Wasm(WasmBuffer),
-}
+struct ImageStorage(Arc<[u8]>);
 
 impl ImageStorage {
     fn new(bytes: Vec<u8>) -> Self {
-        Self::Host(bytes.into())
+        Self(bytes.into())
     }
 
     fn len(&self) -> usize {
-        match self {
-            Self::Host(bytes) => bytes.len(),
-            Self::Wasm(bytes) => bytes.len() as usize,
-        }
+        self.0.len()
     }
 
     fn with_bytes<R>(&self, operation: impl FnOnce(&[u8]) -> R) -> R {
-        match self {
-            Self::Host(bytes) => operation(bytes),
-            Self::Wasm(bytes) => bytes.with_bytes(operation),
-        }
+        operation(&self.0)
     }
 
     fn to_vec(&self) -> Vec<u8> {
@@ -103,16 +89,7 @@ impl ImageStorage {
 
 impl PartialEq for ImageStorage {
     fn eq(&self, other: &Self) -> bool {
-        if let (Self::Wasm(left), Self::Wasm(right)) = (self, other)
-            && left.same_allocation(right)
-        {
-            return true;
-        }
-        if self.len() != other.len() {
-            return false;
-        }
-        let left = self.to_vec();
-        other.with_bytes(|right| left == right)
+        self.0 == other.0
     }
 }
 
@@ -133,14 +110,6 @@ pub enum ImageFormat {
 impl ImageFormat {
     pub(crate) const fn abi_tag(self) -> u32 {
         self as u32
-    }
-
-    fn from_abi(tag: u32) -> Option<Self> {
-        match tag {
-            0 => Some(Self::OpaqueBytes),
-            1 => Some(Self::Rgba8),
-            _ => None,
-        }
     }
 }
 
@@ -183,32 +152,6 @@ impl ImageValue {
         bytes: Vec<u8>,
     ) -> Result<Self, ImageLayoutError> {
         Self::with_format(ImageFormat::Rgba8, width, height, stride, bytes)
-    }
-
-    pub(crate) fn new_rgba8_in(
-        session: Option<&WasmSession>,
-        width: usize,
-        height: usize,
-        stride: usize,
-        bytes: Vec<u8>,
-    ) -> Result<Self, ImageLayoutError> {
-        validate_image_layout(ImageFormat::Rgba8, width, height, stride, bytes.len())?;
-        let storage = match session {
-            Some(session) => session
-                .allocate_copy(&bytes)
-                .map(ImageStorage::Wasm)
-                .map_err(|error| ImageLayoutError {
-                    message: error.to_string(),
-                })?,
-            None => ImageStorage::new(bytes),
-        };
-        Ok(Self {
-            storage: Arc::new(storage),
-            format: ImageFormat::Rgba8,
-            width,
-            height,
-            stride,
-        })
     }
 
     fn with_format(
@@ -263,11 +206,6 @@ impl ImageValue {
 
     pub fn shares_storage_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.storage, &other.storage)
-            || matches!(
-                (&*self.storage, &*other.storage),
-                (ImageStorage::Wasm(left), ImageStorage::Wasm(right))
-                    if left.same_allocation(right)
-            )
     }
 }
 
@@ -364,154 +302,6 @@ pub fn execute_cached_with_capabilities(
     execute_with(program, &engine, BTreeMap::new(), Some(cache))
 }
 
-/// Executes outer code while dispatching checked inner transforms to the
-/// program's WebAssembly session.
-pub fn execute_wasm(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: None,
-    };
-    execute_with(program, &engine, BTreeMap::new(), None)
-}
-
-pub fn execute_wasm_cached(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    cache: &mut dyn ResultCache,
-) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: None,
-    };
-    execute_with(program, &engine, BTreeMap::new(), Some(cache))
-}
-
-pub fn execute_wasm_with_capabilities(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    capabilities: &dyn World,
-) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: Some(capabilities),
-    };
-    execute_with(program, &engine, BTreeMap::new(), None)
-}
-
-pub fn execute_wasm_cached_with_capabilities(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    cache: &mut dyn ResultCache,
-    capabilities: &dyn World,
-) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: Some(capabilities),
-    };
-    execute_with(program, &engine, BTreeMap::new(), Some(cache))
-}
-
-/// Runs a program with immutable values supplied by the Histima host runtime.
-/// This is the initial integration point for materialized asset-native values;
-/// it avoids inventing source-language image literal semantics.
-pub fn execute_wasm_with_bindings(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    bindings: BTreeMap<String, OuterValue>,
-) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: None,
-    };
-    execute_with(program, &engine, bindings, None)
-}
-
-pub fn execute_wasm_with_bindings_cached(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    bindings: BTreeMap<String, OuterValue>,
-    cache: &mut dyn ResultCache,
-) -> Result<Execution, Vec<Diagnostic>> {
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: None,
-    };
-    execute_with(program, &engine, bindings, Some(cache))
-}
-
-/// Invokes one checked transform with owned outer arguments. This makes the
-/// ownership transition directly usable by Histima and testable independently
-/// of outer binding liveness.
-pub fn invoke_wasm_transform(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    transform: TransformId,
-    arguments: Vec<OuterValue>,
-) -> Result<OuterValue, Diagnostic> {
-    let definition = program.transforms.get(transform);
-    if arguments.len() != definition.parameters.len() {
-        return Err(Diagnostic::error(
-            format!(
-                "transform `{}` expects {} arguments, but {} were supplied",
-                definition.name,
-                definition.parameters.len(),
-                arguments.len()
-            ),
-            definition.span,
-        ));
-    }
-    let arguments = arguments
-        .into_iter()
-        .map(|value| (value, definition.span))
-        .collect();
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: None,
-    };
-    invoke_transform_with_lineage(program, &engine, transform, arguments, None)
-}
-
-pub fn invoke_wasm_transform_cached(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    transform: TransformId,
-    arguments: Vec<OuterValue>,
-    cache: &mut dyn ResultCache,
-) -> Result<OuterValue, Diagnostic> {
-    let definition = program.transforms.get(transform);
-    if arguments.len() != definition.parameters.len() {
-        return Err(Diagnostic::error(
-            format!(
-                "transform `{}` expects {} arguments, but {} were supplied",
-                definition.name,
-                definition.parameters.len(),
-                arguments.len()
-            ),
-            definition.span,
-        ));
-    }
-    let arguments = arguments
-        .into_iter()
-        .map(|value| (value, definition.span))
-        .collect();
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: None,
-    };
-    invoke_transform_with_lineage(program, &engine, transform, arguments, Some(cache))
-}
-
 /// Host hook used to validate precise external observations before replay.
 /// Replay without external observations does not require a resolver.
 pub trait ReplayDependencyResolver {
@@ -575,60 +365,6 @@ pub fn replay_with_capabilities(
     )
 }
 
-pub fn replay_wasm(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    target: &OuterValue,
-    cache: &mut dyn ResultCache,
-) -> Result<OuterValue, Diagnostic> {
-    replay_wasm_with_dependencies(program, wasm, target, cache, None)
-}
-
-pub fn replay_wasm_with_dependencies(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    target: &OuterValue,
-    cache: &mut dyn ResultCache,
-    dependencies: Option<&dyn ReplayDependencyResolver>,
-) -> Result<OuterValue, Diagnostic> {
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: None,
-    };
-    replay_with(
-        program,
-        &engine,
-        target,
-        cache,
-        dependencies,
-        Span::default(),
-    )
-}
-
-pub fn replay_wasm_with_capabilities(
-    program: &CompiledProgram,
-    wasm: &WasmSession,
-    target: &OuterValue,
-    cache: &mut dyn ResultCache,
-    capabilities: &dyn World,
-) -> Result<OuterValue, Diagnostic> {
-    let engine = WasmEngine {
-        module: &program.transforms,
-        wasm,
-        capabilities: Some(capabilities),
-    };
-    let resolver = CapabilityReplayResolver(capabilities);
-    replay_with(
-        program,
-        &engine,
-        target,
-        cache,
-        Some(&resolver),
-        Span::default(),
-    )
-}
-
 fn execute_with<'cache>(
     program: &CompiledProgram,
     engine: &dyn TransformEngine,
@@ -660,10 +396,6 @@ trait TransformEngine {
     }
 
     fn capabilities(&self) -> Option<&dyn World> {
-        None
-    }
-
-    fn wasm_session(&self) -> Option<&WasmSession> {
         None
     }
 }
@@ -764,7 +496,6 @@ fn invoke_registered_transform_with_lineage<'cache>(
     transform: &'static RegisteredTransform,
     arguments: Vec<(OuterValue, Span)>,
     mut cache: Option<&mut (dyn ResultCache + 'cache)>,
-    wasm: Option<&WasmSession>,
     span: Span,
 ) -> Result<OuterValue, Diagnostic> {
     let prepared = prepare_registered_invocation(transform, arguments, span)?;
@@ -812,7 +543,7 @@ fn invoke_registered_transform_with_lineage<'cache>(
         value.lineage = Some(lineage);
         return Ok(value);
     }
-    let mut value = prepared.execute(wasm)?;
+    let mut value = prepared.execute()?;
     if let Some(cache) = cache {
         cache
             .store(recipe, &value)
@@ -984,7 +715,7 @@ fn replay_lineage(
             let lineage =
                 Lineage::invocation(registered.name(), registered.identity(), arguments, vec![])
                     .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-            (prepared.execute(engine.wasm_session())?, lineage)
+            (prepared.execute()?, lineage)
         }
     };
     let observed_recipe = observed_lineage
@@ -1443,7 +1174,6 @@ impl Interpreter<'_, '_, '_> {
                     Some(cache) => Some(&mut **cache),
                     None => None,
                 },
-                self.engine.wasm_session(),
                 span,
             );
         }
@@ -2151,135 +1881,6 @@ impl TransformEngine for IrInterpreter<'_> {
     }
 }
 
-struct WasmEngine<'a> {
-    module: &'a crate::ir::TypedModule,
-    wasm: &'a WasmSession,
-    capabilities: Option<&'a dyn World>,
-}
-
-impl TransformEngine for WasmEngine<'_> {
-    fn invoke(
-        &self,
-        id: TransformId,
-        arguments: Vec<(OuterValue, Span)>,
-    ) -> Result<TransformOutcome, Diagnostic> {
-        self.validate_path(id, &mut BTreeSet::new(), &mut BTreeSet::new())?;
-        let transform = self.module.get(id);
-        let mut lowered = Vec::with_capacity(arguments.len());
-        for (parameter, (argument, span)) in transform.parameters.iter().zip(arguments) {
-            lowered.push(lower_wasm_argument(
-                self.wasm,
-                argument,
-                parameter.ty,
-                span,
-            )?);
-        }
-        let wasm_arguments = lowered
-            .iter()
-            .map(|argument| argument.value)
-            .collect::<Vec<_>>();
-        let mut capability_context = WasmCapabilityContext {
-            session: CapabilitySession::new(self.capabilities),
-            module: self.module,
-        };
-        let bridge = InvocationBridge {
-            context: (&mut capability_context as *mut WasmCapabilityContext<'_>).cast(),
-            environment_i64: wasm_environment_i64,
-        };
-        let result = match self.wasm.invoke(id, &wasm_arguments, Some(bridge)) {
-            Ok(result) => result,
-            Err(WasmInvokeError::Diagnostic(error)) => return Err(error),
-            Err(WasmInvokeError::Fault((1, fault_transform, fault_value))) => {
-                let span = self
-                    .module
-                    .transforms
-                    .get(fault_transform as usize)
-                    .and_then(|transform| transform.values.get(fault_value as usize))
-                    .map_or(transform.span, |value| value.span);
-                return Err(
-                    Diagnostic::error("image pixel iteration requires RGBA8 format", span)
-                        .with_note("opaque byte images have no pixel channel interpretation"),
-                );
-            }
-            Err(WasmInvokeError::Fault((code, _, _))) => {
-                return Err(Diagnostic::error(
-                    format!("Wasm transform reported runtime fault {code}"),
-                    transform.span,
-                ));
-            }
-            Err(WasmInvokeError::Runtime(error)) => {
-                return Err(Diagnostic::error(
-                    format!("Wasm transform failed: {error}"),
-                    transform.span,
-                ));
-            }
-        };
-        let observations = capability_context.session.finish();
-        Ok(TransformOutcome {
-            value: freeze_wasm_result(result, transform.return_type, &mut lowered, transform.span)?,
-            observations,
-        })
-    }
-
-    fn may_observe_dependencies(&self, id: TransformId) -> bool {
-        transform_may_observe_dependencies(self.module, id)
-    }
-
-    fn capabilities(&self) -> Option<&dyn World> {
-        self.capabilities
-    }
-
-    fn wasm_session(&self) -> Option<&WasmSession> {
-        Some(self.wasm)
-    }
-}
-
-struct WasmCapabilityContext<'a> {
-    session: CapabilitySession<'a>,
-    module: &'a crate::ir::TypedModule,
-}
-
-unsafe fn wasm_environment_i64(
-    context: *mut c_void,
-    transform: u32,
-    callsite: u32,
-    name: &[u8],
-) -> Result<i64, Diagnostic> {
-    if context.is_null() {
-        return Err(Diagnostic::error(
-            "Wasm capability bridge is unavailable",
-            Span::default(),
-        ));
-    }
-    // SAFETY: WasmSession uses the bridge only for this synchronous invocation.
-    let context = unsafe { &mut *context.cast::<WasmCapabilityContext<'_>>() };
-    let span = context
-        .module
-        .transforms
-        .get(transform as usize)
-        .and_then(|transform| transform.values.get(callsite as usize))
-        .map_or(Span::default(), |value| value.span);
-    let name = match std::str::from_utf8(name) {
-        Ok(name) => name,
-        Err(_) => {
-            return Err(Diagnostic::error(
-                "Wasm transform requested an invalid UTF-8 environment name",
-                span,
-            ));
-        }
-    };
-    match catch_unwind(AssertUnwindSafe(|| {
-        context.session.environment_i64(name, span)
-    })) {
-        Ok(result) => result,
-        Err(_) => Err(Diagnostic::error(
-            format!("environment capability panicked while reading `{name}`"),
-            span,
-        )
-        .with_note("runtime capability providers must not unwind across the Wasm host boundary")),
-    }
-}
-
 fn transform_may_observe_dependencies(module: &crate::ir::TypedModule, root: TransformId) -> bool {
     fn visit(
         module: &crate::ir::TypedModule,
@@ -2299,297 +1900,6 @@ fn transform_may_observe_dependencies(module: &crate::ir::TypedModule, root: Tra
     }
 
     visit(module, root, &mut BTreeSet::new())
-}
-
-impl WasmEngine<'_> {
-    fn validate_path(
-        &self,
-        id: TransformId,
-        visiting: &mut BTreeSet<u32>,
-        visited: &mut BTreeSet<u32>,
-    ) -> Result<(), Diagnostic> {
-        if visited.contains(&id.0) {
-            return Ok(());
-        }
-        let transform = self.module.get(id);
-        if !visiting.insert(id.0) {
-            return Err(Diagnostic::error(
-                "recursive transform calls are not executable in the initial Wasm runtime",
-                transform.span,
-            )
-            .with_note("the reference interpreter retains a bounded recursion guard"));
-        }
-        for value in &transform.values {
-            match &value.kind {
-                ValueKind::Binary { .. } if value.ty == Type::I64 => {
-                    return Err(
-                        Diagnostic::error(
-                            "i64 arithmetic is not executable in the initial Wasm runtime",
-                            value.span,
-                        )
-                        .with_note(
-                            "Tima integer overflow and division-error semantics must be chosen before mapping them to WebAssembly",
-                        ),
-                    );
-                }
-                ValueKind::Call {
-                    transform: callee, ..
-                } => self.validate_path(*callee, visiting, visited)?,
-                _ => {}
-            }
-        }
-        visiting.remove(&id.0);
-        visited.insert(id.0);
-        Ok(())
-    }
-}
-
-struct LoweredArgument {
-    value: WasmValue,
-    keep_alive: BoundaryStorage,
-}
-
-enum BoundaryStorage {
-    Scalar,
-    Owned(Option<WasmBuffer>),
-    View(WasmBuffer),
-}
-
-fn lower_wasm_argument(
-    session: &WasmSession,
-    value: OuterValue,
-    expected: Type,
-    span: Span,
-) -> Result<LoweredArgument, Diagnostic> {
-    match (expected, value.data) {
-        (Type::Bool, ValueData::Bool(value)) => Ok(LoweredArgument {
-            value: WasmValue::Bool(value),
-            keep_alive: BoundaryStorage::Scalar,
-        }),
-        (Type::U8, ValueData::Integer(value)) => Ok(LoweredArgument {
-            value: WasmValue::U8(checked_u8(value, span)?),
-            keep_alive: BoundaryStorage::Scalar,
-        }),
-        (Type::I64, ValueData::Integer(value)) => Ok(LoweredArgument {
-            value: WasmValue::I64(value),
-            keep_alive: BoundaryStorage::Scalar,
-        }),
-        (Type::F32, ValueData::Float(value)) => Ok(LoweredArgument {
-            value: WasmValue::F32(value),
-            keep_alive: BoundaryStorage::Scalar,
-        }),
-        (Type::Image, ValueData::Image(image)) => {
-            let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
-            let ImageValue {
-                storage,
-                format,
-                width,
-                height,
-                stride,
-            } = image;
-            let storage = match Arc::try_unwrap(storage) {
-                Ok(ImageStorage::Wasm(buffer))
-                    if buffer.same_session(session) && buffer.is_unique() =>
-                {
-                    Ok(buffer)
-                }
-                Ok(ImageStorage::Wasm(buffer)) if buffer.same_session(session) => {
-                    session.copy_buffer(&buffer)
-                }
-                Ok(storage) => session.allocate_copy(&storage.to_vec()),
-                Err(shared) => match &*shared {
-                    ImageStorage::Wasm(buffer) if buffer.same_session(session) => {
-                        session.copy_buffer(buffer)
-                    }
-                    storage => storage.with_bytes(|bytes| session.allocate_copy(bytes)),
-                },
-            }
-            .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-            let descriptor = wasm_image(&storage, format, width, height, stride, span)?;
-            Ok(LoweredArgument {
-                value: WasmValue::Image(descriptor),
-                keep_alive: BoundaryStorage::Owned(Some(storage)),
-            })
-        }
-        (Type::ImageView, ValueData::Image(image)) => {
-            let buffer = match &*image.storage {
-                ImageStorage::Wasm(buffer) if buffer.same_session(session) => buffer.clone(),
-                storage => {
-                    let identity = Arc::as_ptr(&image.storage) as usize;
-                    storage
-                        .with_bytes(|bytes| session.mirror_host(identity, bytes))
-                        .map_err(|error| Diagnostic::error(error.to_string(), span))?
-                }
-            };
-            Ok(LoweredArgument {
-                value: WasmValue::Image(wasm_image(
-                    &buffer,
-                    image.format,
-                    image.width,
-                    image.height,
-                    image.stride,
-                    span,
-                )?),
-                keep_alive: BoundaryStorage::View(buffer),
-            })
-        }
-        (expected, _) => Err(Diagnostic::error(
-            format!(
-                "outer value cannot cross into native parameter type {}",
-                expected.name()
-            ),
-            span,
-        )),
-    }
-}
-
-fn wasm_image(
-    buffer: &WasmBuffer,
-    format: ImageFormat,
-    width: usize,
-    height: usize,
-    stride: usize,
-    span: Span,
-) -> Result<WasmImage, Diagnostic> {
-    Ok(WasmImage {
-        offset: buffer.offset(),
-        byte_len: buffer.len(),
-        width: u64::try_from(width)
-            .map_err(|_| Diagnostic::error("image width exceeds Wasm ABI range", span))?,
-        height: u64::try_from(height)
-            .map_err(|_| Diagnostic::error("image height exceeds Wasm ABI range", span))?,
-        stride: u64::try_from(stride)
-            .map_err(|_| Diagnostic::error("image stride exceeds Wasm ABI range", span))?,
-        format: format.abi_tag(),
-    })
-}
-
-fn freeze_wasm_result(
-    result: WasmValue,
-    ty: Type,
-    arguments: &mut [LoweredArgument],
-    span: Span,
-) -> Result<OuterValue, Diagnostic> {
-    match (ty, result) {
-        (Type::Bool, WasmValue::Bool(value)) => Ok(freeze_scalar(NativeScalar::Bool(value))),
-        (Type::U8, WasmValue::U8(value)) => Ok(freeze_scalar(NativeScalar::U8(value))),
-        (Type::I64, WasmValue::I64(value)) => Ok(freeze_scalar(NativeScalar::I64(value))),
-        (Type::F32, WasmValue::F32(value)) => Ok(freeze_scalar(NativeScalar::F32(value))),
-        (Type::Image, WasmValue::Image(image)) => freeze_owned_image(image, arguments, span),
-        (Type::ImageView, WasmValue::Image(image)) => freeze_image_view(image, arguments, span),
-        _ => Err(Diagnostic::error(
-            "Wasm transform returned the wrong ABI type",
-            span,
-        )),
-    }
-}
-
-fn freeze_owned_image(
-    returned: WasmImage,
-    arguments: &mut [LoweredArgument],
-    span: Span,
-) -> Result<OuterValue, Diagnostic> {
-    for argument in arguments {
-        let BoundaryStorage::Owned(owned) = &mut argument.keep_alive else {
-            continue;
-        };
-        let Some(candidate) = owned.as_ref() else {
-            continue;
-        };
-        if candidate.offset() != returned.offset || candidate.len() != returned.byte_len {
-            continue;
-        }
-        let width = usize::try_from(returned.width)
-            .map_err(|_| Diagnostic::error("returned image width exceeds host range", span))?;
-        let height = usize::try_from(returned.height)
-            .map_err(|_| Diagnostic::error("returned image height exceeds host range", span))?;
-        let stride = usize::try_from(returned.stride)
-            .map_err(|_| Diagnostic::error("returned image stride exceeds host range", span))?;
-        let format = validate_returned_layout(
-            returned.format,
-            width,
-            height,
-            stride,
-            candidate.len() as usize,
-            span,
-        )?;
-        let owned = owned.take().expect("matched owned image remains available");
-        return Ok(OuterValue::image(ImageValue {
-            storage: Arc::new(ImageStorage::Wasm(owned)),
-            format,
-            width,
-            height,
-            stride,
-        }));
-    }
-    Err(Diagnostic::error(
-        "returned owned image does not reference storage acquired by this invocation",
-        span,
-    )
-    .with_note("native allocation will require an explicit runtime allocator capability"))
-}
-
-fn freeze_image_view(
-    returned: WasmImage,
-    arguments: &mut [LoweredArgument],
-    span: Span,
-) -> Result<OuterValue, Diagnostic> {
-    for argument in arguments {
-        let BoundaryStorage::View(buffer) = &argument.keep_alive else {
-            continue;
-        };
-        if buffer.offset() != returned.offset || buffer.len() != returned.byte_len {
-            continue;
-        }
-        let width = usize::try_from(returned.width)
-            .map_err(|_| Diagnostic::error("returned image width exceeds host range", span))?;
-        let height = usize::try_from(returned.height)
-            .map_err(|_| Diagnostic::error("returned image height exceeds host range", span))?;
-        let stride = usize::try_from(returned.stride)
-            .map_err(|_| Diagnostic::error("returned image stride exceeds host range", span))?;
-        let format = validate_returned_layout(
-            returned.format,
-            width,
-            height,
-            stride,
-            buffer.len() as usize,
-            span,
-        )?;
-        return Ok(OuterValue::image(ImageValue {
-            storage: Arc::new(ImageStorage::Wasm(buffer.clone())),
-            format,
-            width,
-            height,
-            stride,
-        }));
-    }
-    Err(Diagnostic::error(
-        "returned image view does not reference a live input view",
-        span,
-    ))
-}
-
-fn validate_returned_layout(
-    format: u32,
-    width: usize,
-    height: usize,
-    stride: usize,
-    byte_len: usize,
-    span: Span,
-) -> Result<ImageFormat, Diagnostic> {
-    let format = ImageFormat::from_abi(format).ok_or_else(|| {
-        Diagnostic::error(
-            format!("Wasm transform returned unknown image format tag {format}"),
-            span,
-        )
-    })?;
-    validate_image_layout(format, width, height, stride, byte_len).map_err(|error| {
-        Diagnostic::error(
-            format!("Wasm transform returned an invalid image: {error}"),
-            span,
-        )
-    })?;
-    Ok(format)
 }
 
 fn lower_interpreted_value(
@@ -2786,46 +2096,19 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::backend::ArtifactBackend;
-    use crate::backend::wasm::WasmBackend;
-    use crate::backend::wasm_runtime::{DEFAULT_MEMORY_LIMIT, WasmArtifactCache, WasmSession};
     use crate::cache::TransformResultCache;
     use crate::capability::RuntimeCapabilities;
-    use crate::identity::{ContentIdentity, byte_content_identity, content_identity};
-    use crate::ir::{TransformId, Type};
+    use crate::identity::{ContentIdentity, byte_content_identity};
+    use crate::ir::TransformId;
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
-        ImageFormat, ImageStorage, ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver,
-        TransformEngine, ValueData, WasmValue, execute, execute_cached,
-        execute_cached_with_capabilities, execute_wasm, execute_wasm_cached_with_capabilities,
-        execute_wasm_with_bindings_cached, execute_with, execute_with_capabilities,
-        invoke_wasm_transform, lower_wasm_argument, replay, replay_wasm,
-        replay_wasm_with_capabilities, replay_with_capabilities, replay_with_dependencies,
-        scale_rgba8_channel, validate_returned_layout,
+        ImageFormat, ImageValue, IrInterpreter, OuterValue, ReplayDependencyResolver,
+        TransformEngine, ValueData, execute, execute_cached, execute_cached_with_capabilities,
+        execute_with, execute_with_capabilities, replay, replay_with_capabilities,
+        replay_with_dependencies, scale_rgba8_channel,
     };
     use crate::source::Span;
-
-    static NEXT_WASM_TEST: AtomicU64 = AtomicU64::new(0);
-
-    fn compile_wasm(program: &crate::CompiledProgram) -> WasmSession {
-        let generated = WasmBackend.emit(&program.transforms).unwrap();
-        let sequence = NEXT_WASM_TEST.fetch_add(1, Ordering::Relaxed);
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build")
-            .join(format!(
-                "wasm-runtime-test-{}-{sequence}",
-                std::process::id()
-            ));
-        let identities = program.identities.iter().collect::<Vec<_>>();
-        let cached = WasmArtifactCache
-            .store(&generated, &identities, root)
-            .unwrap();
-        WasmSession::instantiate(&cached.artifact, &program.transforms, DEFAULT_MEMORY_LIMIT)
-            .unwrap()
-    }
 
     struct FixedEnvironment(BTreeMap<String, Vec<u8>>);
 
@@ -2885,40 +2168,6 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .ok_or_else(|| "no value remains".to_owned())
-        }
-    }
-
-    struct FixedAssets {
-        inputs: BTreeMap<String, Vec<u8>>,
-        outputs: RefCell<Vec<(String, Vec<u8>)>>,
-    }
-
-    impl FixedAssets {
-        fn one(locator: &str, bytes: &[u8]) -> Self {
-            Self {
-                inputs: BTreeMap::from([(locator.to_owned(), bytes.to_vec())]),
-                outputs: RefCell::default(),
-            }
-        }
-    }
-
-    impl RuntimeCapabilities for FixedAssets {
-        fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
-            Err(format!("environment value `{name}` is unavailable"))
-        }
-
-        fn read_asset(&self, locator: &str) -> Result<Vec<u8>, String> {
-            self.inputs
-                .get(locator)
-                .cloned()
-                .ok_or_else(|| format!("asset `{locator}` is unavailable"))
-        }
-
-        fn write_asset(&self, locator: &str, bytes: &[u8]) -> Result<(), String> {
-            self.outputs
-                .borrow_mut()
-                .push((locator.to_owned(), bytes.to_vec()));
-            Ok(())
         }
     }
 
@@ -3394,869 +2643,6 @@ mod tests {
     }
 
     #[test]
-    fn registered_ppm_pipeline_runs_wasm_transform_with_lineage_cache_and_replay() {
-        let compiled = crate::compile(
-            "pipeline.tima",
-            "source = asset(\"cat.ppm\")\n\
-             transform darken(img: Image, factor: f32) -> Image {\n\
-                 for p in img.pixels {\n\
-                     p.r *= factor\n\
-                     p.g *= factor\n\
-                     p.b *= factor\n\
-                 }\n\
-                 return img\n\
-             }\n\
-             decoded = source | read | ppm.decode\n\
-             darkened = decoded | darken(0.5)\n\
-             out = darkened | ppm.encode\n\
-             saved = out | save(\"cat-dark.ppm\")\n\
-             replayed = replay(saved)\n\
-             derivation = trace(saved)\n",
-        )
-        .unwrap();
-        let wasm = compile_wasm(&compiled);
-        let assets = FixedAssets::one("cat.ppm", b"P3\n2 1\n255\n100 50 20 200 100 50\n");
-        let mut cache = TransformResultCache::default();
-        let execution =
-            execute_wasm_cached_with_capabilities(&compiled, &wasm, &mut cache, &assets).unwrap();
-
-        let ValueData::Bytes(encoded) = &execution.bindings["out"].data else {
-            panic!("expected encoded bytes")
-        };
-        assert_eq!(encoded.as_ref(), b"P3\n2 1\n255\n50 25 10 100 50 25\n");
-        assert_eq!(execution.bindings["saved"], execution.bindings["out"]);
-        assert_eq!(
-            assets.outputs.borrow().as_slice(),
-            &[("cat-dark.ppm".to_owned(), encoded.to_vec())]
-        );
-        assert_eq!(
-            execution.bindings["replayed"].data,
-            execution.bindings["out"].data
-        );
-        let ValueData::Lineage(lineage) = &execution.bindings["derivation"].data else {
-            panic!("expected lineage")
-        };
-        let rendered = lineage.render();
-        assert!(rendered.contains("source \"cat.ppm\" content="));
-        assert!(rendered.contains("invoke ppm.decode"));
-        assert!(rendered.contains("invoke darken"));
-        assert!(rendered.contains("invoke ppm.encode"));
-
-        let replayed = replay_wasm_with_capabilities(
-            &compiled,
-            &wasm,
-            &execution.bindings["saved"],
-            &mut TransformResultCache::default(),
-            &assets,
-        )
-        .unwrap();
-        assert_eq!(replayed.data, execution.bindings["out"].data);
-        assert_eq!(assets.outputs.borrow().len(), 1);
-
-        let changed_assets = FixedAssets::one("cat.ppm", b"P3\n2 1\n255\n101 50 20 200 100 50\n");
-        let diagnostic = replay_wasm_with_capabilities(
-            &compiled,
-            &wasm,
-            &execution.bindings["saved"],
-            &mut cache,
-            &changed_assets,
-        )
-        .unwrap_err();
-        assert!(diagnostic.message.contains("expected source"));
-    }
-
-    #[test]
-    fn registered_png_pipeline_runs_wasm_transform_with_lineage_and_replay() {
-        let compiled = crate::compile(
-            "pipeline.tima",
-            "source = asset(\"cat.png\")\n\
-             transform darken(img: Image, factor: f32) -> Image {\n\
-                 for p in img.pixels {\n\
-                     p.r *= factor\n\
-                     p.g *= factor\n\
-                     p.b *= factor\n\
-                 }\n\
-                 return img\n\
-             }\n\
-             decoded = source | read | png.decode\n\
-             darkened = decoded | darken(0.5)\n\
-             out = darkened | png.encode\n\
-             explicit_default = darkened | png.encode(compression=6)\n\
-             fast = darkened | png.encode(compression=1)\n\
-             webp_default = darkened | webp.encode\n\
-             webp_explicit = darkened | webp.encode(quality=85)\n\
-             webp_low = darkened | webp.encode(quality=25)\n\
-             replayed = replay(out)\n\
-             replayed_fast = replay(fast)\n\
-             replayed_webp = replay(webp_low)\n\
-             derivation = trace(out)\n\
-             webp_derivation = trace(webp_default)\n",
-        )
-        .unwrap();
-        let wasm = compile_wasm(&compiled);
-        let input = encode_test_png(2, 1, &[100, 50, 20, 255, 200, 100, 50, 128]);
-        let assets = FixedAssets::one("cat.png", &input);
-        let mut cache = TransformResultCache::default();
-
-        let execution =
-            execute_wasm_cached_with_capabilities(&compiled, &wasm, &mut cache, &assets).unwrap();
-
-        let ValueData::Bytes(encoded) = &execution.bindings["out"].data else {
-            panic!("expected encoded bytes")
-        };
-        assert_eq!(
-            decode_test_png(encoded),
-            vec![50, 25, 10, 255, 100, 50, 25, 128]
-        );
-        assert_eq!(
-            execution.bindings["replayed"].data,
-            execution.bindings["out"].data
-        );
-        assert_eq!(
-            execution.bindings["explicit_default"].data,
-            execution.bindings["out"].data
-        );
-        assert_eq!(
-            execution.bindings["replayed_fast"].data,
-            execution.bindings["fast"].data
-        );
-        let LineageNode::Invocation(defaulted) = execution.bindings["out"]
-            .lineage
-            .as_ref()
-            .expect("encoded output has lineage")
-            .node()
-        else {
-            panic!("expected invocation lineage")
-        };
-        let LineageNode::Invocation(explicit) = execution.bindings["explicit_default"]
-            .lineage
-            .as_ref()
-            .expect("encoded output has lineage")
-            .node()
-        else {
-            panic!("expected invocation lineage")
-        };
-        let LineageNode::Invocation(fast) = execution.bindings["fast"]
-            .lineage
-            .as_ref()
-            .expect("encoded output has lineage")
-            .node()
-        else {
-            panic!("expected invocation lineage")
-        };
-        assert_eq!(defaulted.recipe_id, explicit.recipe_id);
-        assert_ne!(defaulted.recipe_id, fast.recipe_id);
-        assert_eq!(defaulted.arguments.len(), 2);
-        assert_eq!(defaulted.arguments[1].name.as_ref(), "compression");
-        assert_eq!(defaulted.arguments[1].value, RecordedValue::Integer(6));
-        assert_eq!(fast.arguments[1].value, RecordedValue::Integer(1));
-        let ValueData::Bytes(webp_bytes) = &execution.bindings["webp_default"].data else {
-            panic!("expected WebP bytes")
-        };
-        assert_eq!(&webp_bytes[..4], b"RIFF");
-        assert_eq!(&webp_bytes[8..12], b"WEBP");
-        let decoded_webp = webp_rust::decode(webp_bytes).unwrap();
-        assert_eq!(decoded_webp.width, 2);
-        assert_eq!(decoded_webp.height, 1);
-        assert_eq!(decoded_webp.rgba[3], 255);
-        assert_eq!(decoded_webp.rgba[7], 128);
-        assert_eq!(
-            execution.bindings["replayed_webp"].data,
-            execution.bindings["webp_low"].data
-        );
-        let LineageNode::Invocation(webp_default) = execution.bindings["webp_default"]
-            .lineage
-            .as_ref()
-            .expect("WebP output has lineage")
-            .node()
-        else {
-            panic!("expected invocation lineage")
-        };
-        let LineageNode::Invocation(webp_explicit) = execution.bindings["webp_explicit"]
-            .lineage
-            .as_ref()
-            .expect("WebP output has lineage")
-            .node()
-        else {
-            panic!("expected invocation lineage")
-        };
-        let LineageNode::Invocation(webp_low) = execution.bindings["webp_low"]
-            .lineage
-            .as_ref()
-            .expect("WebP output has lineage")
-            .node()
-        else {
-            panic!("expected invocation lineage")
-        };
-        assert_eq!(webp_default.recipe_id, webp_explicit.recipe_id);
-        assert_ne!(webp_default.recipe_id, webp_low.recipe_id);
-        assert_eq!(webp_default.arguments[1].name.as_ref(), "quality");
-        assert_eq!(webp_default.arguments[1].value, RecordedValue::Integer(85));
-        assert_eq!(webp_low.arguments[1].value, RecordedValue::Integer(25));
-        let ValueData::Lineage(webp_lineage) = &execution.bindings["webp_derivation"].data else {
-            panic!("expected lineage")
-        };
-        assert!(webp_lineage.render().contains("invoke webp.encode"));
-        let ValueData::Lineage(lineage) = &execution.bindings["derivation"].data else {
-            panic!("expected lineage")
-        };
-        let rendered = lineage.render();
-        assert!(rendered.contains("source \"cat.png\" content="));
-        assert!(rendered.contains("invoke png.decode"));
-        assert!(rendered.contains("invoke darken"));
-        assert!(rendered.contains("invoke png.encode"));
-
-        let replayed = replay_wasm_with_capabilities(
-            &compiled,
-            &wasm,
-            &execution.bindings["out"],
-            &mut TransformResultCache::default(),
-            &assets,
-        )
-        .unwrap();
-        assert_eq!(replayed.data, execution.bindings["out"].data);
-    }
-
-    fn encode_test_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
-        let mut encoded = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut encoded, width, height);
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder.write_header().unwrap();
-            writer.write_image_data(rgba).unwrap();
-            writer.finish().unwrap();
-        }
-        encoded
-    }
-
-    fn decode_test_png(encoded: &[u8]) -> Vec<u8> {
-        let decoder = png::Decoder::new(std::io::Cursor::new(encoded));
-        let mut reader = decoder.read_info().unwrap();
-        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
-        let output = reader.next_frame(&mut pixels).unwrap();
-        assert_eq!(output.color_type, png::ColorType::Rgba);
-        assert_eq!(output.bit_depth, png::BitDepth::Eight);
-        pixels.truncate(output.buffer_size());
-        pixels
-    }
-
-    #[test]
-    fn compiles_loads_and_runs_nested_transforms_as_wasm() {
-        let compiled = crate::compile(
-            "test.tima",
-            "transform double(x: f32) -> f32 {\n doubled = x * 2.0\n return doubled\n}\n\
-             transform scale_twice(x: f32, factor: f32) -> f32 { return double(x * factor) }\n\
-             transform keep_i64(x: i64) -> i64 { return x }\n\
-             transform keep_bool(x: bool) -> bool { return x }\n\
-             transform choose(flag: bool, left: f32, right: f32) -> f32 {\n\
-                 if flag { return left } else {}\n\
-                 return right\n\
-             }\n\
-             transform minimum(left: f32, right: f32) -> f32 {\n\
-                 if left < right { return left } else { return right }\n\
-             }\n\
-             transform less_i64(left: i64, right: i64) -> bool { return left < right }\n\
-             out = 8.0 | scale_twice(factor=0.25)\n\
-             count = keep_i64(7)\n\
-             flag = keep_bool(true)\n\
-             chosen = choose(false, 3.0, 7.0)\n\
-             chosen_true = choose(true, 3.0, 7.0)\n\
-             smaller = minimum(7.0, 3.0)\n\
-             ordered = less_i64(3, 7)\n",
-        )
-        .unwrap();
-        let reference = execute(&compiled).unwrap();
-        let LineageNode::Invocation(reference_lineage) =
-            reference.bindings["out"].lineage.as_ref().unwrap().node()
-        else {
-            unreachable!()
-        };
-        let wasm = compile_wasm(&compiled);
-        let execution = execute_wasm(&compiled, &wasm).unwrap();
-        assert_eq!(execution.bindings["out"].data, ValueData::Float(4.0));
-        assert_eq!(execution.bindings["count"].data, ValueData::Integer(7));
-        assert_eq!(execution.bindings["flag"].data, ValueData::Bool(true));
-        assert_eq!(reference.bindings["chosen"].data, ValueData::Float(7.0));
-        assert_eq!(execution.bindings["chosen"].data, ValueData::Float(7.0));
-        assert_eq!(
-            execution.bindings["chosen_true"].data,
-            ValueData::Float(3.0)
-        );
-        assert_eq!(execution.bindings["smaller"].data, ValueData::Float(3.0));
-        assert_eq!(execution.bindings["ordered"].data, ValueData::Bool(true));
-        let LineageNode::Invocation(native_lineage) =
-            execution.bindings["out"].lineage.as_ref().unwrap().node()
-        else {
-            unreachable!()
-        };
-        assert_eq!(reference_lineage.recipe_id, native_lineage.recipe_id);
-    }
-
-    #[test]
-    fn wasm_reads_environment_through_the_host_capability() {
-        let compiled = crate::compile(
-            "test.tima",
-            "transform read_mode() -> i64 uses env.read { return environment_i64(\"MODE\") }\n\
-             transform configured() -> i64 { return read_mode() }\n\
-             result = configured()\n",
-        )
-        .unwrap();
-        let wasm = compile_wasm(&compiled);
-
-        let diagnostic = execute_wasm(&compiled, &wasm).unwrap_err();
-        assert!(
-            diagnostic[0]
-                .message
-                .contains("environment access is unavailable")
-        );
-        assert_eq!(
-            diagnostic[0].labels[0].span,
-            compiled.transforms.transforms[0].values[0].span
-        );
-
-        let environment = FixedEnvironment::one("MODE", b"73");
-        let mut reference_cache = TransformResultCache::default();
-        let reference =
-            execute_cached_with_capabilities(&compiled, &mut reference_cache, &environment)
-                .unwrap();
-        let mut wasm_cache = TransformResultCache::default();
-        let execution =
-            execute_wasm_cached_with_capabilities(&compiled, &wasm, &mut wasm_cache, &environment)
-                .unwrap();
-        assert_eq!(execution.bindings["result"].data, ValueData::Integer(73));
-        assert_eq!(
-            execution.bindings["result"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id(),
-            reference.bindings["result"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id()
-        );
-    }
-
-    #[test]
-    fn untaken_branches_do_not_observe_runtime_capabilities() {
-        let compiled = crate::compile(
-            "test.tima",
-            "transform guarded(flag: bool) -> i64 uses env.read {\n\
-                 if flag {\n\
-                     observed = environment_i64(\"MODE\")\n\
-                 } else {}\n\
-                 return 7\n\
-             }\n\
-             result = guarded(false)\n",
-        )
-        .unwrap();
-        let reference = execute(&compiled).unwrap();
-        assert_eq!(reference.bindings["result"].data, ValueData::Integer(7));
-
-        let wasm = compile_wasm(&compiled);
-        let execution = execute_wasm(&compiled, &wasm).unwrap();
-        assert_eq!(execution.bindings["result"].data, ValueData::Integer(7));
-    }
-
-    #[test]
-    fn wasm_runtime_defers_unspecified_i64_arithmetic_semantics() {
-        let compiled = crate::compile(
-            "test.tima",
-            "transform add(x: i64, y: i64) -> i64 { return x + y }\n\
-             out = add(1, 2)\n",
-        )
-        .unwrap();
-        let wasm = compile_wasm(&compiled);
-        let diagnostics = execute_wasm(&compiled, &wasm).unwrap_err();
-        assert!(diagnostics[0].message.contains("i64 arithmetic"));
-    }
-
-    #[test]
-    fn owned_image_arguments_detach_when_storage_is_shared() {
-        let compiled = crate::compile(
-            "boundary.tima",
-            "transform keep(img: Image) -> Image { return img }\n",
-        )
-        .unwrap();
-        let wasm = compile_wasm(&compiled);
-        let image = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
-        let retained_outer_alias = image.clone();
-        let first =
-            lower_wasm_argument(&wasm, image.clone(), Type::Image, Span::default()).unwrap();
-        let second = lower_wasm_argument(&wasm, image, Type::Image, Span::default()).unwrap();
-        let WasmValue::Image(first) = first.value else {
-            unreachable!()
-        };
-        let WasmValue::Image(second) = second.value else {
-            unreachable!()
-        };
-        assert_ne!(first.offset, second.offset);
-        drop(retained_outer_alias);
-    }
-
-    #[test]
-    fn image_views_alias_shared_storage_without_copying() {
-        let compiled = crate::compile(
-            "boundary.tima",
-            "transform keep(img: ImageView) -> ImageView { return img }\n",
-        )
-        .unwrap();
-        let wasm = compile_wasm(&compiled);
-        let image = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
-        let first =
-            lower_wasm_argument(&wasm, image.clone(), Type::ImageView, Span::default()).unwrap();
-        let second = lower_wasm_argument(&wasm, image, Type::ImageView, Span::default()).unwrap();
-        let WasmValue::Image(first) = first.value else {
-            unreachable!()
-        };
-        let WasmValue::Image(second) = second.value else {
-            unreachable!()
-        };
-        assert_eq!(first.offset, second.offset);
-    }
-
-    #[test]
-    fn owned_image_detaches_from_a_simultaneous_view() {
-        let compiled = crate::compile(
-            "boundary.tima",
-            "transform keep(img: Image) -> Image { return img }\n",
-        )
-        .unwrap();
-        let wasm = compile_wasm(&compiled);
-        let image = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
-        let view =
-            lower_wasm_argument(&wasm, image.clone(), Type::ImageView, Span::default()).unwrap();
-        let owned = lower_wasm_argument(&wasm, image, Type::Image, Span::default()).unwrap();
-        let WasmValue::Image(view) = view.value else {
-            unreachable!()
-        };
-        let WasmValue::Image(owned) = owned.value else {
-            unreachable!()
-        };
-        assert_ne!(owned.offset, view.offset);
-    }
-
-    #[test]
-    fn wasm_image_boundary_detaches_owned_values_and_freezes_returns() {
-        let compiled = crate::compile(
-            "test.tima",
-            "transform own(img: Image) -> Image { return img }\n\
-             transform view(img: ImageView) -> ImageView { return img }\n\
-             owned = img | own\n\
-             viewed = img | view\n",
-        )
-        .unwrap();
-        let wasm = compile_wasm(&compiled);
-        let input = OuterValue::image(ImageValue::new_rgba8(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
-        let input_content = content_identity(&input).unwrap();
-        let input = input.with_lineage(Lineage::observed_source("cat.raw", input_content));
-        let mut cache = TransformResultCache::default();
-        let execution = execute_wasm_with_bindings_cached(
-            &compiled,
-            &wasm,
-            BTreeMap::from([("img".to_owned(), input)]),
-            &mut cache,
-        )
-        .unwrap();
-        let ValueData::Image(original) = &execution.bindings["img"].data else {
-            panic!("expected input image")
-        };
-        let ValueData::Image(owned) = &execution.bindings["owned"].data else {
-            panic!("expected owned result image")
-        };
-        let ValueData::Image(viewed) = &execution.bindings["viewed"].data else {
-            panic!("expected viewed result image")
-        };
-        assert!(!original.shares_storage_with(owned));
-        // Entering the Wasm arena from host storage is the one required copy.
-        // Subsequent views of the same outer value share its session mirror.
-        assert!(!original.shares_storage_with(viewed));
-        assert_eq!(original.format(), ImageFormat::Rgba8);
-        assert_eq!(owned.format(), ImageFormat::Rgba8);
-        assert_eq!(viewed.format(), ImageFormat::Rgba8);
-        assert_eq!(original.bytes(), owned.bytes());
-        assert_eq!(original.bytes(), viewed.bytes());
-        let owned_trace = execution.bindings["owned"]
-            .lineage
-            .as_ref()
-            .unwrap()
-            .render();
-        assert!(owned_trace.contains("source \"cat.raw\""));
-        assert!(owned_trace.contains("invoke own"));
-        assert!(owned_trace.contains("from=#0"));
-        let owned_value = execution.bindings["owned"].clone();
-        let recipe = owned_value.lineage.as_ref().unwrap().recipe_id().unwrap();
-        cache.invalidate_recipe(recipe);
-        let replayed = replay_wasm(&compiled, &wasm, &owned_value, &mut cache).unwrap();
-        let ValueData::Image(replayed) = replayed.data else {
-            panic!("expected replayed image")
-        };
-        assert_eq!(replayed.bytes(), original.bytes());
-    }
-
-    #[test]
-    fn owned_image_zero_mutates_detached_storage_in_both_engines() {
-        let compiled = crate::compile(
-            "test.tima",
-            "transform clear(img: Image) -> Image { return image_zero(img) }\n\
-             cleared = img | clear\n",
-        )
-        .unwrap();
-        let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
-        let input_content = content_identity(&input).unwrap();
-        let input = input.with_lineage(Lineage::observed_source("cat.raw", input_content));
-
-        let reference_engine = IrInterpreter {
-            module: &compiled.transforms,
-            capabilities: None,
-        };
-        let reference = execute_with(
-            &compiled,
-            &reference_engine,
-            BTreeMap::from([("img".to_owned(), input.clone())]),
-            None,
-        )
-        .unwrap();
-        let ValueData::Image(reference_result) = &reference.bindings["cleared"].data else {
-            panic!("expected reference image")
-        };
-        assert_eq!(reference_result.bytes(), &[0, 0, 0, 0]);
-
-        let wasm = compile_wasm(&compiled);
-        let mut cache = TransformResultCache::default();
-        let execution = execute_wasm_with_bindings_cached(
-            &compiled,
-            &wasm,
-            BTreeMap::from([("img".to_owned(), input.clone())]),
-            &mut cache,
-        )
-        .unwrap();
-        let ValueData::Image(original) = &execution.bindings["img"].data else {
-            panic!("expected original image")
-        };
-        let ValueData::Image(native_result) = &execution.bindings["cleared"].data else {
-            panic!("expected Wasm image")
-        };
-        assert_eq!(original.bytes(), &[1, 2, 3, 4]);
-        assert_eq!(native_result.bytes(), &[0, 0, 0, 0]);
-        assert!(!original.shares_storage_with(native_result));
-        assert_eq!(
-            reference.bindings["cleared"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id(),
-            execution.bindings["cleared"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id()
-        );
-
-        let recorded = execution.bindings["cleared"].clone();
-        let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
-        cache.invalidate_recipe(recipe);
-        let replayed = replay_wasm(&compiled, &wasm, &recorded, &mut cache).unwrap();
-        let ValueData::Image(replayed) = replayed.data else {
-            panic!("expected replayed image")
-        };
-        assert_eq!(replayed.bytes(), &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn u8_image_fill_mutates_detached_storage_in_both_engines() {
-        let compiled = crate::compile(
-            "test.tima",
-            "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n\
-             transform fill_loop(img: Image, value: u8) -> Image {\n\
-                 for byte in img.bytes { byte = value }\n\
-                 return img\n\
-             }\n\
-             transform fill_owned(img: Image, value: u8) -> Image { return fill_loop(img, value) }\n\
-             transform keep(value: u8) -> u8 { return value }\n\
-             transform before(left: u8, right: u8) -> bool { return left < right }\n\
-             filled = fill_owned(img, amount)\n\
-             kept = keep(amount)\n\
-             ordered = before(amount, larger)\n",
-        )
-        .unwrap();
-        let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
-        let input_content = content_identity(&input).unwrap();
-        let input = input.with_lineage(Lineage::observed_source("cat.raw", input_content));
-        let amount = OuterValue::plain(ValueData::Integer(173));
-
-        let reference_engine = IrInterpreter {
-            module: &compiled.transforms,
-            capabilities: None,
-        };
-        let reference = execute_with(
-            &compiled,
-            &reference_engine,
-            BTreeMap::from([
-                ("img".to_owned(), input.clone()),
-                ("amount".to_owned(), amount.clone()),
-                (
-                    "larger".to_owned(),
-                    OuterValue::plain(ValueData::Integer(200)),
-                ),
-            ]),
-            None,
-        )
-        .unwrap();
-        let ValueData::Image(reference_result) = &reference.bindings["filled"].data else {
-            panic!("expected reference image")
-        };
-        assert_eq!(reference_result.bytes(), &[173, 173, 173, 173]);
-        assert_eq!(reference.bindings["kept"].data, ValueData::Integer(173));
-        assert_eq!(reference.bindings["ordered"].data, ValueData::Bool(true));
-
-        let wasm = compile_wasm(&compiled);
-        let mut cache = TransformResultCache::default();
-        let execution = execute_wasm_with_bindings_cached(
-            &compiled,
-            &wasm,
-            BTreeMap::from([
-                ("img".to_owned(), input.clone()),
-                ("amount".to_owned(), amount),
-                (
-                    "larger".to_owned(),
-                    OuterValue::plain(ValueData::Integer(200)),
-                ),
-            ]),
-            &mut cache,
-        )
-        .unwrap();
-        let ValueData::Image(original) = &execution.bindings["img"].data else {
-            panic!("expected original image")
-        };
-        let ValueData::Image(native_result) = &execution.bindings["filled"].data else {
-            panic!("expected Wasm image")
-        };
-        assert_eq!(original.bytes(), &[1, 2, 3, 4]);
-        assert_eq!(native_result.bytes(), &[173, 173, 173, 173]);
-        assert!(!original.shares_storage_with(native_result));
-        assert_eq!(execution.bindings["kept"].data, ValueData::Integer(173));
-        assert_eq!(execution.bindings["ordered"].data, ValueData::Bool(true));
-        assert_eq!(
-            reference.bindings["filled"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id(),
-            execution.bindings["filled"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id()
-        );
-
-        let recorded = execution.bindings["filled"].clone();
-        let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
-        cache.invalidate_recipe(recipe);
-        let replayed = replay_wasm(&compiled, &wasm, &recorded, &mut cache).unwrap();
-        let ValueData::Image(replayed) = replayed.data else {
-            panic!("expected replayed image")
-        };
-        assert_eq!(replayed.bytes(), &[173, 173, 173, 173]);
-
-        let invalid_bindings = BTreeMap::from([
-            ("img".to_owned(), input),
-            (
-                "amount".to_owned(),
-                OuterValue::plain(ValueData::Integer(256)),
-            ),
-            (
-                "larger".to_owned(),
-                OuterValue::plain(ValueData::Integer(200)),
-            ),
-        ]);
-        let diagnostics =
-            execute_with(&compiled, &reference_engine, invalid_bindings.clone(), None).unwrap_err();
-        assert!(diagnostics[0].message.contains("parameter type u8"));
-        let diagnostics = execute_wasm_with_bindings_cached(
-            &compiled,
-            &wasm,
-            invalid_bindings,
-            &mut TransformResultCache::default(),
-        )
-        .unwrap_err();
-        assert!(diagnostics[0].message.contains("parameter type u8"));
-    }
-
-    #[test]
-    fn byte_dependent_image_loop_matches_reference_and_wasm_execution() {
-        let compiled = crate::compile(
-            "test.tima",
-            "transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
-                 if current == target { return replacement } else { return current }\n\
-             }\n\
-             transform replace(img: Image, target: u8, replacement: u8) -> Image {\n\
-                 for byte in img.bytes { byte = choose(byte, target, replacement) }\n\
-                 return img\n\
-             }\n\
-             mapped = replace(img, target, replacement)\n",
-        )
-        .unwrap();
-        let input = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 1, 3]).unwrap());
-        let input_content = content_identity(&input).unwrap();
-        let input = input.with_lineage(Lineage::observed_source("bytes.raw", input_content));
-        let bindings = BTreeMap::from([
-            ("img".to_owned(), input.clone()),
-            (
-                "target".to_owned(),
-                OuterValue::plain(ValueData::Integer(1)),
-            ),
-            (
-                "replacement".to_owned(),
-                OuterValue::plain(ValueData::Integer(9)),
-            ),
-        ]);
-
-        let reference_engine = IrInterpreter {
-            module: &compiled.transforms,
-            capabilities: None,
-        };
-        let reference = execute_with(&compiled, &reference_engine, bindings.clone(), None).unwrap();
-        let ValueData::Image(reference_image) = &reference.bindings["mapped"].data else {
-            panic!("expected reference image")
-        };
-        assert_eq!(reference_image.bytes(), &[9, 2, 9, 3]);
-
-        let wasm = compile_wasm(&compiled);
-        let mut cache = TransformResultCache::default();
-        let execution =
-            execute_wasm_with_bindings_cached(&compiled, &wasm, bindings, &mut cache).unwrap();
-        let ValueData::Image(native_image) = &execution.bindings["mapped"].data else {
-            panic!("expected Wasm image")
-        };
-        assert_eq!(native_image.bytes(), reference_image.bytes());
-        let ValueData::Image(original) = &execution.bindings["img"].data else {
-            panic!("expected original image")
-        };
-        assert_eq!(original.bytes(), &[1, 2, 1, 3]);
-        assert_eq!(
-            reference.bindings["mapped"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id(),
-            execution.bindings["mapped"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id()
-        );
-
-        let recorded = execution.bindings["mapped"].clone();
-        let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
-        cache.invalidate_recipe(recipe);
-        let replayed = replay_wasm(&compiled, &wasm, &recorded, &mut cache).unwrap();
-        let ValueData::Image(replayed) = replayed.data else {
-            panic!("expected replayed image")
-        };
-        assert_eq!(replayed.bytes(), &[9, 2, 9, 3]);
-    }
-
-    #[test]
-    fn rgba8_pixel_scaling_matches_reference_and_wasm_execution() {
-        let compiled = crate::compile(
-            "test.tima",
-            "transform darken(img: Image, factor: f32) -> Image {\n\
-                 for p in img.pixels {\n\
-                     p.r *= factor\n\
-                     p.g *= factor\n\
-                     p.b *= factor\n\
-                 }\n\
-                 return img\n\
-             }\n\
-             darkened = darken(img, factor)\n",
-        )
-        .unwrap();
-        let input_bytes = vec![100, 51, 25, 255, 200, 101, 50, 128, 7, 8];
-        let input =
-            OuterValue::image(ImageValue::new_rgba8(2, 1, 10, input_bytes.clone()).unwrap());
-        let input_content = content_identity(&input).unwrap();
-        let input = input.with_lineage(Lineage::observed_source("pixels.rgba", input_content));
-        let bindings = BTreeMap::from([
-            ("img".to_owned(), input.clone()),
-            (
-                "factor".to_owned(),
-                OuterValue::plain(ValueData::Float(0.5)),
-            ),
-        ]);
-
-        let reference_engine = IrInterpreter {
-            module: &compiled.transforms,
-            capabilities: None,
-        };
-        let reference = execute_with(&compiled, &reference_engine, bindings.clone(), None).unwrap();
-        let ValueData::Image(reference_image) = &reference.bindings["darkened"].data else {
-            panic!("expected reference image")
-        };
-        assert_eq!(
-            reference_image.bytes(),
-            &[50, 25, 12, 255, 100, 50, 25, 128, 7, 8]
-        );
-        assert_eq!(reference_image.format(), ImageFormat::Rgba8);
-
-        let wasm = compile_wasm(&compiled);
-        let mut cache = TransformResultCache::default();
-        let execution =
-            execute_wasm_with_bindings_cached(&compiled, &wasm, bindings, &mut cache).unwrap();
-        let ValueData::Image(native_image) = &execution.bindings["darkened"].data else {
-            panic!("expected Wasm image")
-        };
-        assert_eq!(native_image.bytes(), reference_image.bytes());
-        let ValueData::Image(original) = &execution.bindings["img"].data else {
-            panic!("expected original image")
-        };
-        assert_eq!(original.bytes(), input_bytes);
-        assert_eq!(
-            reference.bindings["darkened"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id(),
-            execution.bindings["darkened"]
-                .lineage
-                .as_ref()
-                .unwrap()
-                .recipe_id()
-        );
-
-        let recorded = execution.bindings["darkened"].clone();
-        let recipe = recorded.lineage.as_ref().unwrap().recipe_id().unwrap();
-        cache.invalidate_recipe(recipe);
-        let replayed = replay_wasm(&compiled, &wasm, &recorded, &mut cache).unwrap();
-        let ValueData::Image(replayed) = replayed.data else {
-            panic!("expected replayed image")
-        };
-        assert_eq!(replayed.bytes(), reference_image.bytes());
-
-        let opaque = OuterValue::image(ImageValue::new(2, 1, 10, vec![0; 10]).unwrap());
-        let opaque_bindings = BTreeMap::from([
-            ("img".to_owned(), opaque),
-            (
-                "factor".to_owned(),
-                OuterValue::plain(ValueData::Float(0.5)),
-            ),
-        ]);
-        let diagnostics =
-            execute_with(&compiled, &reference_engine, opaque_bindings.clone(), None).unwrap_err();
-        assert!(diagnostics[0].message.contains("requires RGBA8"));
-        let diagnostics = execute_wasm_with_bindings_cached(
-            &compiled,
-            &wasm,
-            opaque_bindings,
-            &mut TransformResultCache::default(),
-        )
-        .unwrap_err();
-        assert!(diagnostics[0].message.contains("requires RGBA8"));
-    }
-
-    #[test]
     fn rgba8_channel_scaling_saturates_and_truncates() {
         assert_eq!(scale_rgba8_channel(101, 0.5), 50);
         assert_eq!(scale_rgba8_channel(200, 2.0), 255);
@@ -4273,12 +2659,12 @@ mod tests {
              transform own_inner(img: Image) -> Image { return own(img) }\n",
         )
         .unwrap();
-        let reference = IrInterpreter {
+        let interpreter = IrInterpreter {
             module: &compiled.transforms,
             capabilities: None,
         };
         let image = ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap();
-        let result = reference
+        let result = interpreter
             .invoke(
                 crate::ir::TransformId(1),
                 vec![(OuterValue::image(image), Span::default())],
@@ -4289,29 +2675,46 @@ mod tests {
             panic!("expected image result")
         };
         assert_eq!(result.bytes(), &[1, 2, 3, 4]);
+    }
 
-        let wasm = compile_wasm(&compiled);
-        let image = ImageValue::new_rgba8_in(Some(&wasm), 1, 1, 4, vec![1, 2, 3, 4]).unwrap();
-        let original_offset = match &*image.storage {
-            ImageStorage::Wasm(buffer) => buffer.offset(),
-            ImageStorage::Host(_) => unreachable!(),
-        };
-        let result = invoke_wasm_transform(
-            &compiled,
-            &wasm,
-            crate::ir::TransformId(1),
-            vec![OuterValue::image(image)],
+    #[test]
+    fn interpreted_owned_images_detach_while_views_alias() {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform clear(img: Image) -> Image { return image_zero(img) }\n\
+             transform view(img: ImageView) -> ImageView { return img }\n\
+             cleared = clear(img)\n\
+             viewed = view(img)\n",
         )
         .unwrap();
-        let ValueData::Image(result) = result.data else {
-            panic!("expected image result")
+        let engine = IrInterpreter {
+            module: &compiled.transforms,
+            capabilities: None,
         };
-        let result_offset = match &*result.storage {
-            ImageStorage::Wasm(buffer) => buffer.offset(),
-            ImageStorage::Host(_) => unreachable!(),
+        let execution = execute_with(
+            &compiled,
+            &engine,
+            BTreeMap::from([(
+                "img".to_owned(),
+                OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap()),
+            )]),
+            None,
+        )
+        .unwrap();
+        let ValueData::Image(original) = &execution.bindings["img"].data else {
+            panic!("expected original image")
         };
-        assert_eq!(result_offset, original_offset);
-        assert_eq!(result.bytes(), &[1, 2, 3, 4]);
+        let ValueData::Image(cleared) = &execution.bindings["cleared"].data else {
+            panic!("expected owned result image")
+        };
+        let ValueData::Image(viewed) = &execution.bindings["viewed"].data else {
+            panic!("expected image view")
+        };
+
+        assert_eq!(original.bytes(), &[1, 2, 3, 4]);
+        assert_eq!(cleared.bytes(), &[0, 0, 0, 0]);
+        assert!(!original.shares_storage_with(cleared));
+        assert!(original.shares_storage_with(viewed));
     }
 
     #[test]
@@ -4323,8 +2726,5 @@ mod tests {
         assert_eq!(rgba.format(), ImageFormat::Rgba8);
         let error = ImageValue::new_rgba8(2, 1, 7, vec![0; 7]).unwrap_err();
         assert!(error.to_string().contains("width 2 times 4"));
-
-        let diagnostic = validate_returned_layout(99, 1, 1, 1, 1, Span::default()).unwrap_err();
-        assert!(diagnostic.message.contains("unknown image format tag 99"));
     }
 }

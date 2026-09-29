@@ -21,10 +21,8 @@ The repository currently provides:
 
 The typed IR is the semantic compiler boundary. The planned native backend is
 ahead-of-time Cranelift, not JIT. WebAssembly is reserved for separately
-registered plugin transforms whose ABI is still deferred. The repository
-temporarily retains the former generated-Wasm implementation for regression
-tests over the older scalar/image subset; Histima no longer uses it for product
-execution.
+registered plugin transforms whose ABI is still deferred. Tima does not
+generate or execute WebAssembly for inner-language transforms.
 
 ## Build and try it
 

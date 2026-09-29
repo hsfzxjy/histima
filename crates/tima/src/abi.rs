@@ -1,8 +1,6 @@
 use crate::ir::Type;
 
-/// ABI epoch for core WebAssembly modules using imported memory64 linear
-/// memory. C ABI versions used by older artifacts occupy a different backend
-/// namespace and are intentionally not continued here.
+/// ABI epoch reserved for future ahead-of-time native artifacts.
 pub const TIMA_ABI_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
