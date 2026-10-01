@@ -173,6 +173,17 @@ pub struct WorkspaceVerification {
     pub issues: Vec<VerificationIssue>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceSummary {
+    pub workspace: PathBuf,
+    pub catalog: CatalogInfo,
+    pub stats: CatalogStats,
+    pub assets: CatalogPage<AssetSummary>,
+    pub recipes: CatalogPage<RecipeSummary>,
+    pub transforms: Vec<AvailableTransformInfo>,
+    pub transforms_truncated: bool,
+}
+
 impl WorkspaceVerification {
     pub fn is_valid(&self) -> bool {
         self.sqlite_valid && self.issues.is_empty()
@@ -849,6 +860,27 @@ impl Workspace {
     /// independently to assets and recipes.
     pub fn search_catalog(&self, query: &str, limit: usize) -> Result<CatalogSearch> {
         self.catalog.search(query, limit)
+    }
+
+    /// Returns a bounded, deterministic overview of durable workspace state.
+    ///
+    /// Assets and recipes retain their normal cursors so callers can continue
+    /// through the full catalog with the dedicated listing APIs.
+    pub fn summary(&self, limit: usize) -> Result<WorkspaceSummary> {
+        let assets = self.assets_page(limit, None)?;
+        let recipes = self.recipes_page(limit, None)?;
+        let mut transforms = self.available_transforms();
+        let transforms_truncated = transforms.len() > limit;
+        transforms.truncate(limit);
+        Ok(WorkspaceSummary {
+            workspace: self.root.clone(),
+            catalog: self.catalog_info()?,
+            stats: self.catalog_stats()?,
+            assets,
+            recipes,
+            transforms,
+            transforms_truncated,
+        })
     }
 
     pub fn inspect_content(&self, identity: ContentIdentity) -> Result<ContentInspection> {

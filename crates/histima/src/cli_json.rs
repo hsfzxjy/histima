@@ -4,7 +4,7 @@ use histima::{
     ArtifactInfo, ArtifactInspection, AssetSummary, AvailableTransformInfo, CatalogInfo,
     CatalogPage, CatalogSearch, CatalogStats, ContentInspection, DurableTrace, ImportedAsset,
     PipelineExecution, ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary,
-    RecordedResult, WorkspaceVerification,
+    RecordedResult, WorkspaceSummary, WorkspaceVerification,
 };
 use serde_json::{Map, Value, json};
 use tima::cache::CacheStats;
@@ -103,6 +103,37 @@ pub fn search(result: &CatalogSearch) -> Value {
                 "byte_length": recipe.byte_len,
             })).collect::<Vec<_>>(),
         },
+    })
+}
+
+pub fn summary(value: &WorkspaceSummary) -> Value {
+    let mut transform_section = transforms(&value.transforms);
+    transform_section
+        .as_object_mut()
+        .expect("transform output is an object")
+        .insert(
+            "truncated".to_owned(),
+            Value::Bool(value.transforms_truncated),
+        );
+    json!({
+        "workspace": value.workspace.display().to_string(),
+        "catalog": {
+            "schema_version": value.catalog.schema_version,
+            "foreign_keys_enabled": value.catalog.foreign_keys_enabled,
+            "journal_mode": value.catalog.journal_mode,
+        },
+        "counts": {
+            "contents": value.stats.contents,
+            "source_versions": value.stats.source_versions,
+            "source_heads": value.stats.source_heads,
+            "lineage_invocations": value.stats.lineage_invocations,
+            "recipe_results": value.stats.recipe_results,
+            "artifact_bundles": value.stats.artifact_bundles,
+            "artifacts": value.stats.artifacts,
+        },
+        "assets": assets(&value.assets),
+        "recipes": recipes(&value.recipes),
+        "transforms": transform_section,
     })
 }
 

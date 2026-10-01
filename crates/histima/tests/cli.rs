@@ -453,6 +453,60 @@ fn cli_searches_asset_locators_and_recorded_transform_names() {
 }
 
 #[test]
+fn cli_summarizes_bounded_actionable_workspace_state() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    assert_success(&histima(["init", text(&workspace)]));
+
+    for name in ["summary-one.ppm", "summary-two.ppm"] {
+        let source = test.path().join(name);
+        fs::write(&source, b"P3\n1 1\n255\n40 50 60\n").unwrap();
+        let locator = portable(&source);
+        assert_success(&histima(["import", text(&workspace), &locator]));
+        let expression = format!("asset({locator:?}) | read | ppm.decode | ppm.encode");
+        assert_success(&histima([
+            "pipeline",
+            text(&workspace),
+            &expression,
+            "--json",
+        ]));
+    }
+
+    let summary = histima(["summary", text(&workspace), "--limit", "1", "--json"]);
+    assert_success(&summary);
+    let summary = json_output(&summary);
+    assert_eq!(summary["workspace"], text(&workspace));
+    assert_eq!(summary["catalog"]["schema_version"], 6);
+    assert_eq!(summary["catalog"]["foreign_keys_enabled"], true);
+    assert_eq!(summary["counts"]["source_heads"], 2);
+    assert_eq!(summary["counts"]["recipe_results"], 2);
+    assert_eq!(summary["assets"]["count"], 1);
+    assert_eq!(summary["assets"]["truncated"], true);
+    let asset_cursor = summary["assets"]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(summary["recipes"]["count"], 1);
+    assert_eq!(summary["recipes"]["truncated"], true);
+    assert!(summary["recipes"]["next_cursor"].is_string());
+    assert_eq!(summary["transforms"]["count"], 1);
+    assert_eq!(summary["transforms"]["truncated"], true);
+    assert_eq!(summary["transforms"]["transforms"][0]["name"], "png.decode");
+
+    let remaining_assets = histima([
+        "assets",
+        text(&workspace),
+        "--after",
+        &asset_cursor,
+        "--json",
+    ]);
+    assert_success(&remaining_assets);
+    let remaining_assets = json_output(&remaining_assets);
+    assert_eq!(remaining_assets["count"], 1);
+    assert_eq!(remaining_assets["truncated"], false);
+}
+
+#[test]
 fn cli_executes_and_strictly_replays_workspace_world_file_reads() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");

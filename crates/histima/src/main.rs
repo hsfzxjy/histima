@@ -140,6 +140,75 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 println!("artifacts = {}", stats.artifacts);
             })?;
         }
+        "summary" => {
+            let limit = list_limit(&mut arguments)?;
+            let workspace_path = workspace_path(&mut arguments, 0)?;
+            finished(&mut arguments)?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let summary = workspace
+                .summary(limit)
+                .map_err(|error| error.to_string())?;
+            output.emit(cli_json::summary(&summary), || {
+                println!("workspace = {}", summary.workspace.display());
+                println!("schema_version = {}", summary.catalog.schema_version);
+                println!(
+                    "foreign_keys_enabled = {}",
+                    summary.catalog.foreign_keys_enabled
+                );
+                println!("journal_mode = {}", summary.catalog.journal_mode);
+                println!("contents = {}", summary.stats.contents);
+                println!("source_versions = {}", summary.stats.source_versions);
+                println!("source_heads = {}", summary.stats.source_heads);
+                println!(
+                    "lineage_invocations = {}",
+                    summary.stats.lineage_invocations
+                );
+                println!("recipe_results = {}", summary.stats.recipe_results);
+                println!("artifact_bundles = {}", summary.stats.artifact_bundles);
+                println!("artifacts = {}", summary.stats.artifacts);
+                println!("assets.count = {}", summary.assets.items.len());
+                println!("assets.truncated = {}", summary.assets.truncated);
+                if let Some(cursor) = &summary.assets.next_cursor {
+                    println!("assets.next_cursor = {cursor}");
+                }
+                for (index, asset) in summary.assets.items.iter().enumerate() {
+                    println!("asset[{index}].locator = {}", asset.locator);
+                    println!("asset[{index}].source_id = {}", asset.source_id);
+                    println!("asset[{index}].content_id = {}", asset.content_id);
+                    println!("asset[{index}].byte_length = {}", asset.byte_len);
+                }
+                println!("recipes.count = {}", summary.recipes.items.len());
+                println!("recipes.truncated = {}", summary.recipes.truncated);
+                if let Some(cursor) = &summary.recipes.next_cursor {
+                    println!("recipes.next_cursor = {cursor}");
+                }
+                for (index, recipe) in summary.recipes.items.iter().enumerate() {
+                    println!("recipe[{index}].recipe_id = {}", recipe.recipe_id);
+                    println!("recipe[{index}].transform_id = {}", recipe.transform_id);
+                    println!("recipe[{index}].transform_name = {}", recipe.transform_name);
+                    println!("recipe[{index}].content_id = {}", recipe.content_id);
+                    println!("recipe[{index}].byte_length = {}", recipe.byte_len);
+                }
+                println!("transforms.count = {}", summary.transforms.len());
+                println!("transforms.truncated = {}", summary.transforms_truncated);
+                for (index, transform) in summary.transforms.iter().enumerate() {
+                    println!("transform[{index}].name = {}", transform.name);
+                    println!(
+                        "transform[{index}].implementation = {}",
+                        transform.implementation.as_str()
+                    );
+                    println!(
+                        "transform[{index}].semantic_version = {}",
+                        transform.semantic_version
+                    );
+                    println!(
+                        "transform[{index}].transform_id = {}",
+                        transform.transform_id
+                    );
+                    println!("transform[{index}].signature = {}", transform.signature);
+                }
+            })?;
+        }
         "verify" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
@@ -658,7 +727,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, verify, assets, recipes, search, plugins, transforms, inspect, materialize, pipeline, run, replay, or trace"
+                "unknown command `{command}`; expected init, import, stats, summary, verify, assets, recipes, search, plugins, transforms, inspect, materialize, pipeline, run, replay, or trace"
             ));
         }
     }
@@ -891,6 +960,7 @@ fn print_usage() {
         "  histima import [workspace] <source-path>... [--recursive] [--workspace <workspace>]"
     );
     eprintln!("  histima stats [workspace]");
+    eprintln!("  histima summary [workspace] [--limit <1-100>]");
     eprintln!("  histima verify [workspace]");
     eprintln!(
         "  histima assets [workspace] [--prefix <locator-prefix>] [--limit <1-100>] [--after <locator>]"
