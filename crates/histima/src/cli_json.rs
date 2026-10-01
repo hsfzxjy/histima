@@ -2,9 +2,9 @@ use std::path::Path;
 
 use histima::{
     ArtifactInfo, ArtifactInspection, AssetSummary, AvailableTransformInfo, CatalogInfo,
-    CatalogPage, CatalogStats, ContentInspection, DurableTrace, ImportedAsset, PipelineExecution,
-    ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult,
-    WorkspaceVerification,
+    CatalogPage, CatalogSearch, CatalogStats, ContentInspection, DurableTrace, ImportedAsset,
+    PipelineExecution, ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary,
+    RecordedResult, WorkspaceVerification,
 };
 use serde_json::{Map, Value, json};
 use tima::cache::CacheStats;
@@ -76,6 +76,33 @@ pub fn recipes(page: &CatalogPage<RecipeSummary>) -> Value {
             "content_id": recipe.content_id.to_string(),
             "byte_length": recipe.byte_len,
         })).collect::<Vec<_>>(),
+    })
+}
+
+pub fn search(result: &CatalogSearch) -> Value {
+    json!({
+        "query": result.query,
+        "assets": {
+            "count": result.assets.items.len(),
+            "truncated": result.assets.truncated,
+            "matches": result.assets.items.iter().map(|asset| json!({
+                "locator": asset.locator,
+                "source_id": asset.source_id.to_string(),
+                "content_id": asset.content_id.to_string(),
+                "byte_length": asset.byte_len,
+            })).collect::<Vec<_>>(),
+        },
+        "recipes": {
+            "count": result.recipes.items.len(),
+            "truncated": result.recipes.truncated,
+            "matches": result.recipes.items.iter().map(|recipe| json!({
+                "recipe_id": recipe.recipe_id.to_string(),
+                "transform_id": recipe.transform_id.to_string(),
+                "transform_name": recipe.transform_name,
+                "content_id": recipe.content_id.to_string(),
+                "byte_length": recipe.byte_len,
+            })).collect::<Vec<_>>(),
+        },
     })
 }
 

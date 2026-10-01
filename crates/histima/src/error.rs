@@ -16,6 +16,7 @@ pub enum Error {
     ContentNotFound(String),
     RecipeNotFound(String),
     ArtifactNotFound(String),
+    InvalidSearchQuery,
     ValueNotRecordable(String),
     InvalidMaterializationPath(PathBuf),
     MaterializationExists(PathBuf),
@@ -78,6 +79,9 @@ impl fmt::Display for Error {
                 formatter,
                 "artifact or artifact bundle {identity} is not recorded in this workspace"
             ),
+            Self::InvalidSearchQuery => {
+                formatter.write_str("catalog search query must not be empty")
+            }
             Self::ValueNotRecordable(message) => formatter.write_str(message),
             Self::InvalidMaterializationPath(path) => write!(
                 formatter,
@@ -115,6 +119,7 @@ impl StdError for Error {
             | Self::ContentNotFound(_)
             | Self::RecipeNotFound(_)
             | Self::ArtifactNotFound(_)
+            | Self::InvalidSearchQuery
             | Self::ValueNotRecordable(_)
             | Self::InvalidMaterializationPath(_)
             | Self::MaterializationExists(_)

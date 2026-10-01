@@ -403,6 +403,56 @@ fn cli_paginates_assets_and_recipes_with_stable_cursors() {
 }
 
 #[test]
+fn cli_searches_asset_locators_and_recorded_transform_names() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    assert_success(&histima(["init", text(&workspace)]));
+
+    for name in ["search-ppm-one.ppm", "search-ppm-two.ppm"] {
+        let source = test.path().join(name);
+        fs::write(&source, b"P3\n1 1\n255\n10 20 30\n").unwrap();
+        let locator = portable(&source);
+        assert_success(&histima(["import", text(&workspace), &locator]));
+        let expression = format!("asset({locator:?}) | read | ppm.decode | ppm.encode");
+        assert_success(&histima([
+            "pipeline",
+            text(&workspace),
+            &expression,
+            "--json",
+        ]));
+    }
+
+    let search = histima(["search", text(&workspace), "ppm", "--limit", "1", "--json"]);
+    assert_success(&search);
+    let search = json_output(&search);
+    assert_eq!(search["query"], "ppm");
+    assert_eq!(search["assets"]["count"], 1);
+    assert_eq!(search["assets"]["truncated"], true);
+    assert!(
+        search["assets"]["matches"][0]["locator"]
+            .as_str()
+            .unwrap()
+            .contains("search-ppm-one.ppm")
+    );
+    assert_eq!(search["recipes"]["count"], 1);
+    assert_eq!(search["recipes"]["truncated"], true);
+    assert_eq!(
+        search["recipes"]["matches"][0]["transform_name"],
+        "ppm.encode"
+    );
+
+    let case_sensitive = histima(["search", text(&workspace), "PPM", "--json"]);
+    assert_success(&case_sensitive);
+    let case_sensitive = json_output(&case_sensitive);
+    assert_eq!(case_sensitive["assets"]["count"], 0);
+    assert_eq!(case_sensitive["recipes"]["count"], 0);
+
+    let empty = histima(["search", text(&workspace), ""]);
+    assert!(!empty.status.success());
+    assert!(stderr(&empty).contains("catalog search query must not be empty"));
+}
+
+#[test]
 fn cli_executes_and_strictly_replays_workspace_world_file_reads() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");

@@ -206,6 +206,20 @@ pub struct RecipeSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogSearch {
+    pub query: String,
+    pub assets: CatalogPage<AssetSummary>,
+    pub recipes: CatalogPage<RecipeSummary>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TextMatch<'a> {
+    Exact(&'a str),
+    Prefix(&'a str),
+    Contains(&'a str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactSummary {
     pub artifact_id: ArtifactIdentity,
     pub transform_id: TransformIdentity,
@@ -567,6 +581,15 @@ impl Catalog {
         after: Option<&str>,
         locator_prefix: Option<&str>,
     ) -> Result<CatalogPage<AssetSummary>> {
+        self.assets_matching(limit, after, locator_prefix.map(TextMatch::Prefix))
+    }
+
+    fn assets_matching(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+        locator_match: Option<TextMatch<'_>>,
+    ) -> Result<CatalogPage<AssetSummary>> {
         let limit = sqlite_page_limit(limit)?;
         let select = "SELECT head.locator, head.source_id, source.content_id, content.byte_length
                       FROM source_heads AS head
@@ -575,12 +598,22 @@ impl Catalog {
                       JOIN contents AS content ON content.content_id = source.content_id";
         let mut predicates = Vec::new();
         let mut parameters = Vec::new();
-        if let Some(prefix) = locator_prefix.filter(|prefix| !prefix.is_empty()) {
-            predicates.push("head.locator >= ?");
-            parameters.push(Value::Text(prefix.to_owned()));
-            if let Some(upper_bound) = string_prefix_upper_bound(prefix) {
-                predicates.push("head.locator < ?");
-                parameters.push(Value::Text(upper_bound));
+        if let Some(locator_match) = locator_match {
+            match locator_match {
+                TextMatch::Prefix(prefix) if !prefix.is_empty() => {
+                    predicates.push("head.locator >= ?");
+                    parameters.push(Value::Text(prefix.to_owned()));
+                    if let Some(upper_bound) = string_prefix_upper_bound(prefix) {
+                        predicates.push("head.locator < ?");
+                        parameters.push(Value::Text(upper_bound));
+                    }
+                }
+                TextMatch::Contains(query) => {
+                    predicates.push("instr(head.locator, ?) > 0");
+                    parameters.push(Value::Text(query.to_owned()));
+                }
+                TextMatch::Exact(_) => unreachable!("asset locators are not exactly matched"),
+                TextMatch::Prefix(_) => {}
             }
         }
         if let Some(after) = after {
@@ -629,6 +662,15 @@ impl Catalog {
         after: Option<RecipeIdentity>,
         transform_name: Option<&str>,
     ) -> Result<CatalogPage<RecipeSummary>> {
+        self.recipes_matching(limit, after, transform_name.map(TextMatch::Exact))
+    }
+
+    fn recipes_matching(
+        &self,
+        limit: usize,
+        after: Option<RecipeIdentity>,
+        transform_match: Option<TextMatch<'_>>,
+    ) -> Result<CatalogPage<RecipeSummary>> {
         let limit = sqlite_page_limit(limit)?;
         let after = after.map(|identity| identity.to_string());
         let select = "SELECT result.recipe_id, invocation.transform_id,
@@ -638,9 +680,20 @@ impl Catalog {
                       JOIN contents AS content ON content.content_id = result.content_id";
         let mut predicates = Vec::new();
         let mut parameters = Vec::new();
-        if let Some(transform_name) = transform_name {
-            predicates.push("invocation.transform_name = ?");
-            parameters.push(Value::Text(transform_name.to_owned()));
+        if let Some(transform_match) = transform_match {
+            match transform_match {
+                TextMatch::Exact(transform_name) => {
+                    predicates.push("invocation.transform_name = ?");
+                    parameters.push(Value::Text(transform_name.to_owned()));
+                }
+                TextMatch::Contains(query) => {
+                    predicates.push("instr(invocation.transform_name, ?) > 0");
+                    parameters.push(Value::Text(query.to_owned()));
+                }
+                TextMatch::Prefix(_) => {
+                    unreachable!("recipe transform names are not prefix matched")
+                }
+            }
         }
         if let Some(after) = after {
             predicates.push("result.recipe_id > ?");
@@ -693,6 +746,17 @@ impl Catalog {
         Ok(bounded_page(&mut items, limit, |item| {
             item.recipe_id.to_string()
         }))
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> Result<CatalogSearch> {
+        if query.is_empty() {
+            return Err(Error::InvalidSearchQuery);
+        }
+        Ok(CatalogSearch {
+            query: query.to_owned(),
+            assets: self.assets_matching(limit, None, Some(TextMatch::Contains(query)))?,
+            recipes: self.recipes_matching(limit, None, Some(TextMatch::Contains(query)))?,
+        })
     }
 
     pub fn content_reference_counts(&self, identity: ContentIdentity) -> Result<(u64, u64)> {

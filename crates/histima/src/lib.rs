@@ -39,7 +39,7 @@ const PLUGIN_MODULE_READ_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub use catalog::{
     ArtifactBundleMember, ArtifactInfo, ArtifactSummary, AssetSummary, CATALOG_LIST_LIMIT,
-    CatalogInfo, CatalogPage, CatalogStats, RecipeSummary,
+    CatalogInfo, CatalogPage, CatalogSearch, CatalogStats, RecipeSummary,
 };
 pub use error::{Error, Result};
 pub use runner::{PipelineExecution, ProgramExecution, RecipeReplay, ReplayPolicy, RunError};
@@ -841,6 +841,14 @@ impl Workspace {
         transform_name: Option<&str>,
     ) -> Result<CatalogPage<RecipeSummary>> {
         self.catalog.recipes(limit, after, transform_name)
+    }
+
+    /// Searches current asset locators and recorded transform names.
+    ///
+    /// Matching is case-sensitive substring matching. `limit` is applied
+    /// independently to assets and recipes.
+    pub fn search_catalog(&self, query: &str, limit: usize) -> Result<CatalogSearch> {
+        self.catalog.search(query, limit)
     }
 
     pub fn inspect_content(&self, identity: ContentIdentity) -> Result<ContentInspection> {

@@ -44,6 +44,7 @@ cargo run -p histima -- import build/my-workspace examples/tiny.ppm
 cargo run -p histima -- import build/my-workspace examples/textures --recursive
 cargo run -p histima -- transforms build/my-workspace
 cargo run -p histima -- verify build/my-workspace
+cargo run -p histima -- search build/my-workspace png
 cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | read | ppm.decode | webp.encode(quality=85)'
 cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
 cargo run -p histima -- trace build/my-workspace <recipe-id>
@@ -70,6 +71,12 @@ page. Asset cursors are locators; recipe cursors are Recipe IDs. Calls without
 these options retain the existing 100-row maximum. `assets --prefix <text>`
 filters by a case-sensitive locator prefix, while `recipes --transform <name>`
 matches an exact recorded transform name; both filters compose with cursors.
+
+`histima search [workspace] <query>` performs a bounded, case-sensitive
+substring search across current asset locators and recorded transform names.
+Results are ordered by locator and Recipe ID. `--limit <1-100>` applies
+independently to each category and reports when either category is truncated;
+this initial search surface does not build a separate full-text index.
 
 `histima verify [workspace]` is an explicit read-only integrity pass. It runs
 SQLite integrity and foreign-key checks, then validates every cataloged CAS

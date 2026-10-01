@@ -222,6 +222,36 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 }
             })?;
         }
+        "search" => {
+            let limit = list_limit(&mut arguments)?;
+            let workspace_path = workspace_path(&mut arguments, 1)?;
+            let query = required(&mut arguments, "catalog search query")?;
+            finished(&mut arguments)?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let result = workspace
+                .search_catalog(&query, limit)
+                .map_err(|error| error.to_string())?;
+            output.emit(cli_json::search(&result), || {
+                println!("query = {}", result.query);
+                println!("assets.count = {}", result.assets.items.len());
+                println!("assets.truncated = {}", result.assets.truncated);
+                for (index, asset) in result.assets.items.iter().enumerate() {
+                    println!("asset[{index}].locator = {}", asset.locator);
+                    println!("asset[{index}].source_id = {}", asset.source_id);
+                    println!("asset[{index}].content_id = {}", asset.content_id);
+                    println!("asset[{index}].byte_length = {}", asset.byte_len);
+                }
+                println!("recipes.count = {}", result.recipes.items.len());
+                println!("recipes.truncated = {}", result.recipes.truncated);
+                for (index, recipe) in result.recipes.items.iter().enumerate() {
+                    println!("recipe[{index}].recipe_id = {}", recipe.recipe_id);
+                    println!("recipe[{index}].transform_id = {}", recipe.transform_id);
+                    println!("recipe[{index}].transform_name = {}", recipe.transform_name);
+                    println!("recipe[{index}].content_id = {}", recipe.content_id);
+                    println!("recipe[{index}].byte_length = {}", recipe.byte_len);
+                }
+            })?;
+        }
         "plugins" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
             finished(&mut arguments)?;
@@ -628,7 +658,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, verify, assets, recipes, plugins, transforms, inspect, materialize, pipeline, run, replay, or trace"
+                "unknown command `{command}`; expected init, import, stats, verify, assets, recipes, search, plugins, transforms, inspect, materialize, pipeline, run, replay, or trace"
             ));
         }
     }
@@ -868,6 +898,7 @@ fn print_usage() {
     eprintln!(
         "  histima recipes [workspace] [--transform <name>] [--limit <1-100>] [--after <recipe-id>]"
     );
+    eprintln!("  histima search [workspace] <query> [--limit <1-100>]");
     eprintln!("  histima plugins [workspace]");
     eprintln!("  histima transforms [workspace]");
     eprintln!("  histima inspect content [workspace] <content-id>");
