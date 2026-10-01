@@ -41,6 +41,7 @@ implemented.
 cargo test --workspace
 cargo run -p histima -- init build/my-workspace
 cargo run -p histima -- import build/my-workspace examples/tiny.ppm
+cargo run -p histima -- import build/my-workspace examples/textures --recursive
 cargo run -p histima -- transforms build/my-workspace
 cargo run -p histima -- verify build/my-workspace
 cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | read | ppm.decode | webp.encode(quality=85)'
@@ -53,6 +54,14 @@ Every `[workspace]` CLI argument is optional. When omitted, Histima walks from
 the current directory to the nearest ancestor containing `.histima.sql3`.
 Opening an older workspace migrates `catalog.sqlite3` to that hidden name.
 Add `--json` anywhere for structured output.
+
+`histima import [workspace] <source-path>...` imports one or more explicit
+files. Add `--recursive` to traverse directory arguments in deterministic
+lexical order; recursive traversal rejects symbolic links instead of following
+them. A single non-recursive file retains the original output shape, while a
+batch reports every imported asset in order. When positional workspace/source
+arguments would be ambiguous, `--workspace <path>` selects the workspace
+explicitly.
 
 Catalog listings use bounded SQLite keyset pagination. `histima assets` and
 `histima recipes` accept `--limit <1-100>` and return `next_cursor` when more

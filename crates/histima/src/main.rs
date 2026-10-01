@@ -87,20 +87,37 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             })?;
         }
         "import" => {
-            let workspace_path = workspace_path(&mut arguments, 1)?;
-            let source_path = required(&mut arguments, "source asset path")?;
-            finished(&mut arguments)?;
+            let recursive = take_flag(&mut arguments, "--recursive")?;
+            let explicit_workspace = take_value_option(&mut arguments, "--workspace")?;
+            let workspace_path = import_workspace_path(&mut arguments, explicit_workspace)?;
+            if arguments.is_empty() {
+                return Err("missing source asset path".to_owned());
+            }
+            let source_paths = arguments.drain(..).map(PathBuf::from).collect::<Vec<_>>();
+            let batch_output = recursive || source_paths.len() != 1;
+            let source_paths = expand_import_sources(&source_paths, recursive)?;
             let mut workspace =
                 Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
-            let imported = workspace
-                .import_file(&source_path)
+            let imported = source_paths
+                .iter()
+                .map(|path| workspace.import_file(path))
+                .collect::<histima::Result<Vec<_>>>()
                 .map_err(|error| error.to_string())?;
-            output.emit(cli_json::imported(&imported), || {
-                println!("locator = {}", imported.locator);
-                println!("content_id = {}", imported.content_id);
-                println!("source_id = {}", imported.source_id);
-                println!("byte_length = {}", imported.byte_len);
-            })?;
+            if batch_output {
+                output.emit(cli_json::imported_batch(&imported), || {
+                    println!("count = {}", imported.len());
+                    for (index, asset) in imported.iter().enumerate() {
+                        print_imported(asset, Some(index));
+                    }
+                })?;
+            } else {
+                let imported = imported
+                    .first()
+                    .expect("one non-recursive source produces one import");
+                output.emit(cli_json::imported(imported), || {
+                    print_imported(imported, None);
+                })?;
+            }
         }
         "stats" => {
             let workspace_path = workspace_path(&mut arguments, 0)?;
@@ -637,6 +654,119 @@ fn workspace_path(
     })
 }
 
+fn import_workspace_path(
+    arguments: &mut VecDeque<String>,
+    explicit_workspace: Option<String>,
+) -> Result<PathBuf, String> {
+    if let Some(workspace) = explicit_workspace {
+        return Ok(PathBuf::from(workspace));
+    }
+    if arguments.is_empty() {
+        return Err("missing source asset path".to_owned());
+    }
+
+    let current = env::current_dir()
+        .map_err(|error| format!("could not determine the current directory: {error}"))?;
+    let nearest = Workspace::find_nearest(&current);
+    if arguments.len() > 1 {
+        let candidate = PathBuf::from(arguments.front().expect("arguments are not empty"));
+        if is_initialized_workspace(&candidate) || nearest.is_none() {
+            arguments.pop_front();
+            return Ok(candidate);
+        }
+    }
+    nearest.ok_or_else(|| {
+        format!(
+            "no Histima workspace found at {} or any ancestor; pass an explicit workspace path with --workspace",
+            current.display()
+        )
+    })
+}
+
+fn is_initialized_workspace(path: &std::path::Path) -> bool {
+    path.join(".histima.sql3").is_file() || path.join("catalog.sqlite3").is_file()
+}
+
+fn expand_import_sources(sources: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for source in sources {
+        let metadata = fs::symlink_metadata(source).map_err(|error| {
+            format!(
+                "could not inspect source asset {}: {error}",
+                source.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() && recursive {
+            return Err(format!(
+                "recursive import does not follow symbolic link {}",
+                source.display()
+            ));
+        }
+        if metadata.is_file() || metadata.file_type().is_symlink() {
+            files.push(source.clone());
+        } else if metadata.is_dir() {
+            if !recursive {
+                return Err(format!(
+                    "source asset {} is a directory; pass --recursive to traverse it",
+                    source.display()
+                ));
+            }
+            collect_directory_files(source, &mut files)?;
+        } else {
+            return Err(format!(
+                "source asset {} is not a regular file or directory",
+                source.display()
+            ));
+        }
+    }
+    Ok(files)
+}
+
+fn collect_directory_files(
+    directory: &std::path::Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| {
+            format!(
+                "could not read source directory {}: {error}",
+                directory.display()
+            )
+        })?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| {
+            format!(
+                "could not read source directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    let mut entries = entries;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            format!("could not inspect source asset {}: {error}", path.display())
+        })?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "recursive import does not follow symbolic link {}",
+                path.display()
+            ));
+        }
+        if file_type.is_dir() {
+            collect_directory_files(&path, files)?;
+        } else if file_type.is_file() {
+            files.push(path);
+        } else {
+            return Err(format!(
+                "source asset {} is not a regular file or directory",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn take_record_option(arguments: &mut VecDeque<String>) -> Result<Option<String>, String> {
     let Some(position) = arguments.iter().position(|argument| argument == "--record") else {
         return Ok(None);
@@ -727,7 +857,9 @@ fn print_usage() {
     eprintln!("usage:");
     eprintln!("  histima [--json] <command> ...");
     eprintln!("  histima init [workspace]");
-    eprintln!("  histima import [workspace] <source-file>");
+    eprintln!(
+        "  histima import [workspace] <source-path>... [--recursive] [--workspace <workspace>]"
+    );
     eprintln!("  histima stats [workspace]");
     eprintln!("  histima verify [workspace]");
     eprintln!(
@@ -750,6 +882,14 @@ fn print_usage() {
         "  omitted workspaces resolve to the nearest initialized workspace at or above the current directory"
     );
     eprintln!("  --json may appear anywhere in the command");
+}
+
+fn print_imported(imported: &histima::ImportedAsset, index: Option<usize>) {
+    let prefix = index.map_or_else(String::new, |index| format!("asset[{index}]."));
+    println!("{prefix}locator = {}", imported.locator);
+    println!("{prefix}content_id = {}", imported.content_id);
+    println!("{prefix}source_id = {}", imported.source_id);
+    println!("{prefix}byte_length = {}", imported.byte_len);
 }
 
 fn print_content_inspection(inspection: &histima::ContentInspection) {

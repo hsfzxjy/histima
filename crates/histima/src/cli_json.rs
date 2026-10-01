@@ -30,6 +30,13 @@ pub fn imported(value: &ImportedAsset) -> Value {
     })
 }
 
+pub fn imported_batch(values: &[ImportedAsset]) -> Value {
+    json!({
+        "count": values.len(),
+        "assets": values.iter().map(imported).collect::<Vec<_>>(),
+    })
+}
+
 pub fn stats(info: &CatalogInfo, stats: &CatalogStats) -> Value {
     json!({
         "schema_version": info.schema_version,

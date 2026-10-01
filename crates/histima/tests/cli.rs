@@ -108,6 +108,77 @@ fn cli_imports_inspects_and_materializes_across_processes() {
 }
 
 #[test]
+fn cli_batch_imports_explicit_files_and_directories_in_stable_order() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let first = test.path().join("first.bin");
+    let directory = test.path().join("assets");
+    let nested = directory.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(&first, b"first").unwrap();
+    fs::write(directory.join("z.bin"), b"z").unwrap();
+    fs::write(directory.join("a.bin"), b"a").unwrap();
+    fs::write(nested.join("m.bin"), b"m").unwrap();
+
+    assert_success(&histima(["init", text(&workspace)]));
+
+    let directory_rejected = histima(["import", text(&workspace), text(&directory)]);
+    assert!(!directory_rejected.status.success());
+    assert!(stderr(&directory_rejected).contains("pass --recursive"));
+    let empty = histima(["stats", text(&workspace), "--json"]);
+    assert_success(&empty);
+    assert_eq!(json_output(&empty)["source_heads"], 0);
+
+    let imported = histima([
+        "import",
+        "--workspace",
+        text(&workspace),
+        text(&first),
+        text(&directory),
+        "--recursive",
+        "--json",
+    ]);
+    assert_success(&imported);
+    let imported = json_output(&imported);
+    assert_eq!(imported["count"], 4);
+    let locators = imported["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|asset| asset["locator"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        locators,
+        vec![
+            text(&first),
+            text(&directory.join("a.bin")),
+            text(&nested.join("m.bin")),
+            text(&directory.join("z.bin")),
+        ]
+    );
+
+    let nested_working_directory = workspace.join("project/subdirectory");
+    fs::create_dir_all(&nested_working_directory).unwrap();
+    let second = test.path().join("second.bin");
+    let third = test.path().join("third.bin");
+    fs::write(&second, b"second").unwrap();
+    fs::write(&third, b"third").unwrap();
+    let nearest = histima_in(
+        &nested_working_directory,
+        ["import", text(&second), text(&third), "--json"],
+    );
+    assert_success(&nearest);
+    let nearest = json_output(&nearest);
+    assert_eq!(nearest["count"], 2);
+    assert_eq!(nearest["assets"][0]["locator"], text(&second));
+    assert_eq!(nearest["assets"][1]["locator"], text(&third));
+
+    let stats = histima(["stats", text(&workspace), "--json"]);
+    assert_success(&stats);
+    assert_eq!(json_output(&stats)["source_heads"], 6);
+}
+
+#[test]
 fn cli_verifies_sqlite_and_cataloged_content_without_repairing() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");
