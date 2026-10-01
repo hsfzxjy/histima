@@ -554,11 +554,12 @@ fn invoke_registered_transform_with_lineage<'cache>(
         .parameters()
         .iter()
         .zip(&prepared.arguments)
-        .map(|(name, (argument, argument_span))| {
-            LineageArgument::record(*name, argument).map_err(|error| {
+        .map(|(parameter, (argument, argument_span))| {
+            LineageArgument::record(parameter.name, argument).map_err(|error| {
                 Diagnostic::error(
                     format!(
-                        "cannot record argument `{name}` for registered transform lineage: {error}"
+                        "cannot record argument `{}` for registered transform lineage: {error}",
+                        parameter.name
                     ),
                     *argument_span,
                 )
@@ -824,8 +825,8 @@ fn replay_lineage(
                 .parameters()
                 .iter()
                 .zip(&prepared.arguments)
-                .map(|(name, (value, argument_span))| {
-                    LineageArgument::record(*name, value)
+                .map(|(parameter, (value, argument_span))| {
+                    LineageArgument::record(parameter.name, value)
                         .map_err(|error| Diagnostic::error(error.to_string(), *argument_span))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1292,9 +1293,14 @@ impl Interpreter<'_, '_, '_> {
             return self.save(evaluated, span);
         }
         if let Some(registered) = RegisteredTransform::find(&name) {
+            let parameters = registered
+                .parameters()
+                .iter()
+                .map(|parameter| parameter.name)
+                .collect::<Vec<_>>();
             let arguments = order_outer_arguments_with_defaults(
                 registered.name(),
-                registered.parameters(),
+                &parameters,
                 evaluated,
                 span,
                 |index| registered.default_argument(index),

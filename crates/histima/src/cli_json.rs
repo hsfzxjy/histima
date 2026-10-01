@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use histima::{
-    ArtifactInfo, ArtifactInspection, AssetSummary, CatalogInfo, CatalogPage, CatalogStats,
-    ContentInspection, DurableTrace, ImportedAsset, PipelineExecution, ProgramExecution,
-    RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult,
+    ArtifactInfo, ArtifactInspection, AssetSummary, AvailableTransformInfo, CatalogInfo,
+    CatalogPage, CatalogStats, ContentInspection, DurableTrace, ImportedAsset, PipelineExecution,
+    ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult,
 };
 use serde_json::{Map, Value, json};
 use tima::cache::CacheStats;
@@ -87,6 +87,22 @@ pub fn plugins(plugins: &[PluginTransformInfo]) -> Value {
                 "type": parameter.value_type.as_str(),
             })).collect::<Vec<_>>(),
             "result": plugin.result.as_str(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+pub fn transforms(transforms: &[AvailableTransformInfo]) -> Value {
+    json!({
+        "count": transforms.len(),
+        "transforms": transforms.iter().map(|transform| json!({
+            "name": transform.name,
+            "implementation": transform.implementation.as_str(),
+            "semantic_version": transform.semantic_version,
+            "signature": transform.signature,
+            "transform_id": transform.transform_id.to_string(),
+            "abi_version": transform.abi_version,
+            "artifact_id": transform.artifact_id.map(|identity| identity.to_string()),
+            "module_content_id": transform.module_content_id.map(|identity| identity.to_string()),
         })).collect::<Vec<_>>(),
     })
 }

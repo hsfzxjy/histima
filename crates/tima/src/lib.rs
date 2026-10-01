@@ -31,6 +31,15 @@ use identity::TransformIdentities;
 use ir::TypedModule;
 use source::SourceFile;
 
+pub use registered::{
+    BuiltinDefaultValue, BuiltinParameterInfo, BuiltinTransformInfo, BuiltinValueType,
+};
+
+/// Returns the process-wide standard transform registry in stable registry order.
+pub fn builtin_transform_infos() -> impl Iterator<Item = BuiltinTransformInfo> {
+    registered::RegisteredTransform::infos()
+}
+
 /// A parsed and statically checked Tima program.
 #[derive(Debug)]
 pub struct CompiledProgram {

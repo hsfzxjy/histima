@@ -41,6 +41,7 @@ implemented.
 cargo test --workspace
 cargo run -p histima -- init build/my-workspace
 cargo run -p histima -- import build/my-workspace examples/tiny.ppm
+cargo run -p histima -- transforms build/my-workspace
 cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | read | ppm.decode | webp.encode(quality=85)'
 cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
 cargo run -p histima -- trace build/my-workspace <recipe-id>
@@ -203,6 +204,9 @@ built-ins. Histima does not search for, download, update, or grant ambient
 capabilities to plugins. `histima plugins [workspace]` lists the configured
 contracts in stable name order, including each signature and its Transform,
 Artifact, and module Content IDs; add `--json` for machine-readable output.
+`histima transforms [workspace]` is the unified discovery view: it merges the
+standard registry with configured workspace plugins and reports implementation
+kind, semantic version, signature, and Transform ID.
 
 ## Storage, lineage, and identity
 

@@ -657,6 +657,13 @@ arguments and Recipe IDs. A registered-transform implementation change that
 can alter output must bump that transform's semantic version. WebP decoding is
 not implemented.
 
+`histima transforms [workspace]` lists the callable standard transforms and
+workspace-configured plugins in stable name order. Each entry reports its
+implementation kind, semantic version, normalized signature, and Transform
+ID. Workspace plugins additionally report their ABI, Artifact, and module
+Content IDs. Transforms declared inside a Tima source file belong to that
+compilation and are intentionally not a workspace registry.
+
 ### 11.1 Registered-Wasm ABI v3
 
 The current ABI is intentionally the exact slice required by the registered
@@ -762,7 +769,7 @@ manifest semantic and ABI versions, ordered parameter/result signature,
 Transform ID, module-sensitive Artifact ID, and exact module Content ID.
 `--json` additionally exposes the parameters and result as structured fields.
 This command lists workspace-configured plugins, not the built-in transform
-registry.
+registry. Use `histima transforms` for the unified callable view.
 
 ## 12. Lineage, identity, caching, and replay
 

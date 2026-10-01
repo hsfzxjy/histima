@@ -202,6 +202,40 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 }
             })?;
         }
+        "transforms" => {
+            let workspace_path = workspace_path(&mut arguments, 0)?;
+            finished(&mut arguments)?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let transforms = workspace.available_transforms();
+            output.emit(cli_json::transforms(&transforms), || {
+                println!("count = {}", transforms.len());
+                for (index, transform) in transforms.iter().enumerate() {
+                    println!("transform[{index}].name = {}", transform.name);
+                    println!(
+                        "transform[{index}].implementation = {}",
+                        transform.implementation.as_str()
+                    );
+                    println!(
+                        "transform[{index}].semantic_version = {}",
+                        transform.semantic_version
+                    );
+                    println!("transform[{index}].signature = {}", transform.signature);
+                    println!(
+                        "transform[{index}].transform_id = {}",
+                        transform.transform_id
+                    );
+                    if let Some(abi_version) = transform.abi_version {
+                        println!("transform[{index}].abi_version = {abi_version}");
+                    }
+                    if let Some(artifact_id) = transform.artifact_id {
+                        println!("transform[{index}].artifact_id = {artifact_id}");
+                    }
+                    if let Some(module_content_id) = transform.module_content_id {
+                        println!("transform[{index}].module_content_id = {module_content_id}");
+                    }
+                }
+            })?;
+        }
         "inspect" => {
             let kind = required(
                 &mut arguments,
@@ -550,7 +584,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, assets, recipes, plugins, inspect, materialize, pipeline, run, replay, or trace"
+                "unknown command `{command}`; expected init, import, stats, assets, recipes, plugins, transforms, inspect, materialize, pipeline, run, replay, or trace"
             ));
         }
     }
@@ -675,6 +709,7 @@ fn print_usage() {
         "  histima recipes [workspace] [--transform <name>] [--limit <1-100>] [--after <recipe-id>]"
     );
     eprintln!("  histima plugins [workspace]");
+    eprintln!("  histima transforms [workspace]");
     eprintln!("  histima inspect content [workspace] <content-id>");
     eprintln!("  histima inspect recipe [workspace] <recipe-id>");
     eprintln!("  histima inspect artifact [workspace] <artifact-or-bundle-id>");

@@ -114,6 +114,33 @@ pub struct ArtifactInspection {
     pub bundles: CatalogPage<ArtifactBundleInspection>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransformImplementation {
+    BuiltinRegisteredWasm,
+    WorkspaceRegisteredWasm,
+}
+
+impl TransformImplementation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BuiltinRegisteredWasm => "builtin-registered-wasm",
+            Self::WorkspaceRegisteredWasm => "workspace-registered-wasm",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvailableTransformInfo {
+    pub name: String,
+    pub implementation: TransformImplementation,
+    pub semantic_version: u32,
+    pub signature: String,
+    pub transform_id: tima::identity::TransformIdentity,
+    pub abi_version: Option<u32>,
+    pub artifact_id: Option<ArtifactIdentity>,
+    pub module_content_id: Option<ContentIdentity>,
+}
+
 pub struct Workspace {
     root: PathBuf,
     content: ContentStore,
@@ -528,6 +555,38 @@ impl Workspace {
     /// Returns the workspace's configured plugin transforms in stable name order.
     pub fn plugins(&self) -> Vec<PluginTransformInfo> {
         self.plugins.transform_infos().collect()
+    }
+
+    /// Returns all process-wide and workspace-configured callable transforms.
+    pub fn available_transforms(&self) -> Vec<AvailableTransformInfo> {
+        let mut transforms = tima::builtin_transform_infos()
+            .map(|transform| AvailableTransformInfo {
+                name: transform.name.to_owned(),
+                implementation: TransformImplementation::BuiltinRegisteredWasm,
+                semantic_version: transform.semantic_version,
+                signature: transform.signature(),
+                transform_id: transform.transform_id,
+                abi_version: None,
+                artifact_id: None,
+                module_content_id: None,
+            })
+            .collect::<Vec<_>>();
+        transforms.extend(
+            self.plugins
+                .transform_infos()
+                .map(|transform| AvailableTransformInfo {
+                    name: transform.name.clone(),
+                    implementation: TransformImplementation::WorkspaceRegisteredWasm,
+                    semantic_version: transform.semantic_version,
+                    signature: transform.signature(),
+                    transform_id: transform.transform_id,
+                    abi_version: Some(transform.abi_version),
+                    artifact_id: Some(transform.artifact_id),
+                    module_content_id: Some(transform.module_content_id),
+                }),
+        );
+        transforms.sort_by(|left, right| left.name.cmp(&right.name));
+        transforms
     }
 
     pub fn compile_tima(

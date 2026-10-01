@@ -833,6 +833,36 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
     assert_eq!(plugin["parameters"][0]["type"], "rgba8-image");
     assert_eq!(plugin["result"], "bytes");
 
+    let transforms = histima(["transforms", text(&workspace), "--json"]);
+    assert_success(&transforms);
+    let transforms = json_output(&transforms);
+    assert_eq!(transforms["count"], 6);
+    let transforms = transforms["transforms"].as_array().unwrap();
+    let builtin = transforms
+        .iter()
+        .find(|transform| transform["name"] == "ppm.decode")
+        .unwrap();
+    assert_eq!(builtin["implementation"], "builtin-registered-wasm");
+    assert_eq!(builtin["semantic_version"], 2);
+    assert_eq!(
+        builtin["signature"],
+        "ppm.decode(bytes: bytes) -> rgba8-image"
+    );
+    assert_eq!(
+        builtin["transform_id"],
+        tima::identity::registered_transform_identity("ppm.decode", 2).to_string()
+    );
+    assert_eq!(builtin["artifact_id"], Value::Null);
+    let external = transforms
+        .iter()
+        .find(|transform| transform["name"] == "fixture.encode")
+        .unwrap();
+    assert_eq!(external["implementation"], "workspace-registered-wasm");
+    assert_eq!(external["signature"], plugin["signature"]);
+    assert_eq!(external["transform_id"], transform_id.to_string());
+    assert_eq!(external["artifact_id"], artifact_id.to_string());
+    assert_eq!(external["module_content_id"], module_content.to_string());
+
     let human_plugins = histima(["plugins", text(&workspace)]);
     assert_success(&human_plugins);
     assert_eq!(field(&human_plugins, "count"), "1");

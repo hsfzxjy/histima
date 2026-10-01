@@ -13,9 +13,62 @@ const PNG_DEFAULT_COMPRESSION: i64 = 6;
 const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 2;
 const WEBP_DEFAULT_QUALITY: i64 = 85;
 
-#[derive(Clone, Copy)]
-enum DefaultValue {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinDefaultValue {
     Integer(i64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinValueType {
+    Bytes,
+    Rgba8Image,
+    I64,
+}
+
+impl BuiltinValueType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Rgba8Image => "rgba8-image",
+            Self::I64 => "i64",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltinParameterInfo {
+    pub name: &'static str,
+    pub value_type: BuiltinValueType,
+    pub default: Option<BuiltinDefaultValue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltinTransformInfo {
+    pub name: &'static str,
+    pub semantic_version: u32,
+    pub parameters: &'static [BuiltinParameterInfo],
+    pub result: BuiltinValueType,
+    pub transform_id: TransformIdentity,
+}
+
+impl BuiltinTransformInfo {
+    pub fn signature(self) -> String {
+        let parameters = self
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let value_type = parameter.value_type.as_str();
+                match parameter.default {
+                    Some(BuiltinDefaultValue::Integer(value)) => {
+                        format!("{}: {value_type} = {value}", parameter.name)
+                    }
+                    None => format!("{}: {value_type}", parameter.name),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}({parameters}) -> {}", self.name, self.result.as_str())
+    }
 }
 
 type Validator = fn(&[(OuterValue, Span)], Span) -> Result<(), Diagnostic>;
@@ -28,56 +81,71 @@ type Executor = fn(&[(OuterValue, Span)], Span) -> Result<OuterValue, Diagnostic
 pub(crate) struct RegisteredTransform {
     name: &'static str,
     semantic_version: u32,
-    parameters: &'static [&'static str],
-    defaults: &'static [Option<DefaultValue>],
+    parameters: &'static [BuiltinParameterInfo],
+    result: BuiltinValueType,
     validate: Validator,
     execute: Executor,
 }
 
-const NO_DEFAULTS_1: &[Option<DefaultValue>] = &[None];
-const PNG_ENCODE_DEFAULTS: &[Option<DefaultValue>] =
-    &[None, Some(DefaultValue::Integer(PNG_DEFAULT_COMPRESSION))];
-const WEBP_ENCODE_DEFAULTS: &[Option<DefaultValue>] =
-    &[None, Some(DefaultValue::Integer(WEBP_DEFAULT_QUALITY))];
+const BYTES_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
+    name: "bytes",
+    value_type: BuiltinValueType::Bytes,
+    default: None,
+};
+const IMAGE_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
+    name: "image",
+    value_type: BuiltinValueType::Rgba8Image,
+    default: None,
+};
+const COMPRESSION_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
+    name: "compression",
+    value_type: BuiltinValueType::I64,
+    default: Some(BuiltinDefaultValue::Integer(PNG_DEFAULT_COMPRESSION)),
+};
+const QUALITY_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
+    name: "quality",
+    value_type: BuiltinValueType::I64,
+    default: Some(BuiltinDefaultValue::Integer(WEBP_DEFAULT_QUALITY)),
+};
 
 const REGISTERED_TRANSFORMS: &[RegisteredTransform] = &[
     RegisteredTransform {
         name: "ppm.decode",
         semantic_version: PPM_DECODE_TRANSFORM_VERSION,
-        parameters: &["bytes"],
-        defaults: NO_DEFAULTS_1,
+        parameters: &[BYTES_PARAMETER],
+        result: BuiltinValueType::Rgba8Image,
         validate: validate_bytes,
         execute: execute_decode_ppm,
     },
     RegisteredTransform {
         name: "ppm.encode",
         semantic_version: PPM_ENCODE_TRANSFORM_VERSION,
-        parameters: &["image"],
-        defaults: NO_DEFAULTS_1,
+        parameters: &[IMAGE_PARAMETER],
+        result: BuiltinValueType::Bytes,
         validate: validate_rgba8,
         execute: execute_encode_ppm,
     },
     RegisteredTransform {
         name: "png.decode",
         semantic_version: PNG_DECODE_TRANSFORM_VERSION,
-        parameters: &["bytes"],
-        defaults: NO_DEFAULTS_1,
+        parameters: &[BYTES_PARAMETER],
+        result: BuiltinValueType::Rgba8Image,
         validate: validate_bytes,
         execute: execute_decode_png,
     },
     RegisteredTransform {
         name: "png.encode",
         semantic_version: PNG_ENCODE_TRANSFORM_VERSION,
-        parameters: &["image", "compression"],
-        defaults: PNG_ENCODE_DEFAULTS,
+        parameters: &[IMAGE_PARAMETER, COMPRESSION_PARAMETER],
+        result: BuiltinValueType::Bytes,
         validate: validate_png_encode,
         execute: execute_encode_png,
     },
     RegisteredTransform {
         name: "webp.encode",
         semantic_version: WEBP_ENCODE_TRANSFORM_VERSION,
-        parameters: &["image", "quality"],
-        defaults: WEBP_ENCODE_DEFAULTS,
+        parameters: &[IMAGE_PARAMETER, QUALITY_PARAMETER],
+        result: BuiltinValueType::Bytes,
         validate: validate_webp_encode,
         execute: execute_encode_webp,
     },
@@ -100,18 +168,34 @@ impl RegisteredTransform {
         self.name
     }
 
-    pub(crate) const fn parameters(&self) -> &'static [&'static str] {
+    pub(crate) const fn parameters(&self) -> &'static [BuiltinParameterInfo] {
         self.parameters
     }
 
     pub(crate) fn default_argument(&self, index: usize) -> Option<OuterValue> {
-        match self.defaults.get(index).copied().flatten()? {
-            DefaultValue::Integer(value) => Some(OuterValue::plain(ValueData::Integer(value))),
+        match self.parameters.get(index)?.default? {
+            BuiltinDefaultValue::Integer(value) => {
+                Some(OuterValue::plain(ValueData::Integer(value)))
+            }
         }
     }
 
     pub(crate) fn identity(&self) -> TransformIdentity {
         registered_transform_identity(self.name, self.semantic_version)
+    }
+
+    fn info(&self) -> BuiltinTransformInfo {
+        BuiltinTransformInfo {
+            name: self.name,
+            semantic_version: self.semantic_version,
+            parameters: self.parameters,
+            result: self.result,
+            transform_id: self.identity(),
+        }
+    }
+
+    pub(crate) fn infos() -> impl Iterator<Item = BuiltinTransformInfo> {
+        REGISTERED_TRANSFORMS.iter().map(Self::info)
     }
 }
 
@@ -294,6 +378,30 @@ fn encode_webp(image: &ImageValue, quality: u8, span: Span) -> Result<Vec<u8>, D
 mod tests {
     use super::*;
     use crate::identity::byte_content_identity;
+
+    #[test]
+    fn builtin_inspection_is_derived_from_registry_contracts() {
+        let transforms = RegisteredTransform::infos().collect::<Vec<_>>();
+
+        assert_eq!(transforms.len(), REGISTERED_TRANSFORMS.len());
+        assert_eq!(transforms[0].name, "ppm.decode");
+        assert_eq!(
+            transforms[0].signature(),
+            "ppm.decode(bytes: bytes) -> rgba8-image"
+        );
+        assert_eq!(
+            transforms[0].transform_id,
+            REGISTERED_TRANSFORMS[0].identity()
+        );
+        assert_eq!(
+            transforms[3].signature(),
+            "png.encode(image: rgba8-image, compression: i64 = 6) -> bytes"
+        );
+        assert_eq!(
+            transforms[4].signature(),
+            "webp.encode(image: rgba8-image, quality: i64 = 85) -> bytes"
+        );
+    }
 
     #[test]
     fn ppm_codec_rejects_incomplete_pixels() {
