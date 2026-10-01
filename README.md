@@ -42,6 +42,7 @@ cargo test --workspace
 cargo run -p histima -- init build/my-workspace
 cargo run -p histima -- import build/my-workspace examples/tiny.ppm
 cargo run -p histima -- transforms build/my-workspace
+cargo run -p histima -- verify build/my-workspace
 cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | read | ppm.decode | webp.encode(quality=85)'
 cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
 cargo run -p histima -- trace build/my-workspace <recipe-id>
@@ -60,6 +61,12 @@ page. Asset cursors are locators; recipe cursors are Recipe IDs. Calls without
 these options retain the existing 100-row maximum. `assets --prefix <text>`
 filters by a case-sensitive locator prefix, while `recipes --transform <name>`
 matches an exact recorded transform name; both filters compose with cursors.
+
+`histima verify [workspace]` is an explicit read-only integrity pass. It runs
+SQLite integrity and foreign-key checks, then validates every cataloged CAS
+object's canonical path, recorded kind, byte length, and Content ID. Invalid
+workspaces produce a structured report and non-zero exit status; verification
+never repairs or removes data.
 
 `histima pipeline [workspace] <expression>` accepts exactly one outer Tima
 expression. Invocation-derived byte results are automatically recorded in

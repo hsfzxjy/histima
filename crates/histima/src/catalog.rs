@@ -397,6 +397,70 @@ impl Catalog {
             .transpose()
     }
 
+    pub fn all_contents(&self) -> Result<Vec<CatalogObject>> {
+        let mut statement = self.connection.prepare(
+            "SELECT content_id, byte_length, relative_path, kind
+             FROM contents ORDER BY content_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(content_id, byte_len, relative_path, kind)| {
+                let byte_len = u64::try_from(byte_len).map_err(|_| {
+                    Error::catalog(format!(
+                        "content {content_id} has a negative byte length in the catalog"
+                    ))
+                })?;
+                Ok(CatalogObject {
+                    content_id,
+                    byte_len,
+                    relative_path,
+                    kind: ContentKind::parse(&kind)?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn sqlite_integrity_issues(&self) -> Result<Vec<String>> {
+        let mut issues = Vec::new();
+        let mut integrity = self.connection.prepare("PRAGMA integrity_check")?;
+        for result in integrity
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        {
+            if result != "ok" {
+                issues.push(format!("integrity_check: {result}"));
+            }
+        }
+
+        let mut foreign_keys = self.connection.prepare("PRAGMA foreign_key_check")?;
+        for (table, row_id, parent, constraint) in foreign_keys
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        {
+            let row = row_id.map_or_else(|| "without rowid".to_owned(), |row| row.to_string());
+            issues.push(format!(
+                "foreign_key_check: table {table}, row {row}, parent {parent}, constraint {constraint}"
+            ));
+        }
+        Ok(issues)
+    }
+
     pub fn record_world_snapshot(
         &self,
         capability: &str,
@@ -1509,6 +1573,26 @@ mod tests {
                 .any(|detail| detail.contains("sqlite_autoindex_source_heads_1")),
             "unexpected asset query plan: {asset_plan:?}"
         );
+        assert!(catalog.sqlite_integrity_issues().unwrap().is_empty());
+        catalog
+            .connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        catalog
+            .connection
+            .execute(
+                "INSERT INTO source_heads(locator, source_id) VALUES ('broken', 'missing')",
+                [],
+            )
+            .unwrap();
+        catalog
+            .connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        let integrity_issues = catalog.sqlite_integrity_issues().unwrap();
+        assert_eq!(integrity_issues.len(), 1);
+        assert!(integrity_issues[0].contains("foreign_key_check"));
+        assert!(integrity_issues[0].contains("source_heads"));
         drop(catalog);
         fs::remove_dir_all(directory).unwrap();
     }

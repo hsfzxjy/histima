@@ -108,6 +108,53 @@ fn cli_imports_inspects_and_materializes_across_processes() {
 }
 
 #[test]
+fn cli_verifies_sqlite_and_cataloged_content_without_repairing() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let source = test.path().join("source.bin");
+    fs::write(&source, b"verified content").unwrap();
+
+    assert_success(&histima(["init", text(&workspace)]));
+    let imported = histima(["import", text(&workspace), text(&source), "--json"]);
+    assert_success(&imported);
+    let imported = json_output(&imported);
+    let content_id = imported["content_id"].as_str().unwrap();
+
+    let verified = histima(["verify", text(&workspace), "--json"]);
+    assert_success(&verified);
+    let verified = json_output(&verified);
+    assert_eq!(verified["valid"], true);
+    assert_eq!(verified["sqlite_valid"], true);
+    assert_eq!(verified["objects_checked"], 1);
+    assert_eq!(verified["objects_valid"], 1);
+    assert_eq!(verified["issue_count"], 0);
+
+    let object = workspace
+        .join("objects")
+        .join(&content_id[..2])
+        .join(&content_id[2..]);
+    fs::write(&object, b"corrupt").unwrap();
+    let rejected = histima(["verify", text(&workspace), "--json"]);
+    assert!(!rejected.status.success());
+    let rejected_json = json_output(&rejected);
+    assert_eq!(rejected_json["valid"], false);
+    assert_eq!(rejected_json["sqlite_valid"], true);
+    assert_eq!(rejected_json["objects_checked"], 1);
+    assert_eq!(rejected_json["objects_valid"], 0);
+    assert_eq!(rejected_json["issue_count"], 1);
+    assert_eq!(rejected_json["issues"][0]["kind"], "content");
+    assert_eq!(rejected_json["issues"][0]["subject"], content_id);
+    assert!(
+        rejected_json["issues"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("content integrity failure")
+    );
+    assert!(stderr(&rejected).contains("workspace verification found 1 issue"));
+    assert_eq!(fs::read(object).unwrap(), b"corrupt");
+}
+
+#[test]
 fn cli_paginates_assets_and_recipes_with_stable_cursors() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");

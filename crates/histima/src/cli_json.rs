@@ -4,6 +4,7 @@ use histima::{
     ArtifactInfo, ArtifactInspection, AssetSummary, AvailableTransformInfo, CatalogInfo,
     CatalogPage, CatalogStats, ContentInspection, DurableTrace, ImportedAsset, PipelineExecution,
     ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult,
+    WorkspaceVerification,
 };
 use serde_json::{Map, Value, json};
 use tima::cache::CacheStats;
@@ -103,6 +104,21 @@ pub fn transforms(transforms: &[AvailableTransformInfo]) -> Value {
             "abi_version": transform.abi_version,
             "artifact_id": transform.artifact_id.map(|identity| identity.to_string()),
             "module_content_id": transform.module_content_id.map(|identity| identity.to_string()),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+pub fn verification(report: &WorkspaceVerification) -> Value {
+    json!({
+        "valid": report.is_valid(),
+        "sqlite_valid": report.sqlite_valid,
+        "objects_checked": report.objects_checked,
+        "objects_valid": report.objects_valid,
+        "issue_count": report.issues.len(),
+        "issues": report.issues.iter().map(|issue| json!({
+            "kind": issue.kind.as_str(),
+            "subject": issue.subject,
+            "message": issue.message,
         })).collect::<Vec<_>>(),
     })
 }

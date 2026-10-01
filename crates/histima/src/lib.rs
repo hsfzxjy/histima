@@ -141,6 +141,44 @@ pub struct AvailableTransformInfo {
     pub module_content_id: Option<ContentIdentity>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationIssueKind {
+    Sqlite,
+    Catalog,
+    Content,
+}
+
+impl VerificationIssueKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Catalog => "catalog",
+            Self::Content => "content",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerificationIssue {
+    pub kind: VerificationIssueKind,
+    pub subject: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceVerification {
+    pub sqlite_valid: bool,
+    pub objects_checked: u64,
+    pub objects_valid: u64,
+    pub issues: Vec<VerificationIssue>,
+}
+
+impl WorkspaceVerification {
+    pub fn is_valid(&self) -> bool {
+        self.sqlite_valid && self.issues.is_empty()
+    }
+}
+
 pub struct Workspace {
     root: PathBuf,
     content: ContentStore,
@@ -587,6 +625,77 @@ impl Workspace {
         );
         transforms.sort_by(|left, right| left.name.cmp(&right.name));
         transforms
+    }
+
+    /// Verifies durable catalog structure and every cataloged CAS object.
+    ///
+    /// Verification is read-only and deliberately does not repair or remove
+    /// invalid data.
+    pub fn verify(&self) -> WorkspaceVerification {
+        let mut report = WorkspaceVerification {
+            sqlite_valid: true,
+            objects_checked: 0,
+            objects_valid: 0,
+            issues: Vec::new(),
+        };
+        match self.catalog.sqlite_integrity_issues() {
+            Ok(issues) => {
+                report.sqlite_valid = issues.is_empty();
+                report
+                    .issues
+                    .extend(issues.into_iter().map(|message| VerificationIssue {
+                        kind: VerificationIssueKind::Sqlite,
+                        subject: None,
+                        message,
+                    }));
+            }
+            Err(error) => {
+                report.sqlite_valid = false;
+                report.issues.push(VerificationIssue {
+                    kind: VerificationIssueKind::Sqlite,
+                    subject: None,
+                    message: error.to_string(),
+                });
+            }
+        }
+
+        let objects = match self.catalog.all_contents() {
+            Ok(objects) => objects,
+            Err(error) => {
+                report.issues.push(VerificationIssue {
+                    kind: VerificationIssueKind::Catalog,
+                    subject: None,
+                    message: error.to_string(),
+                });
+                return report;
+            }
+        };
+        for object in objects {
+            report.objects_checked += 1;
+            match self
+                .content
+                .read_recorded(&object.content_id, &object.relative_path, object.kind)
+            {
+                Ok(bytes) if bytes.len() as u64 == object.byte_len => {
+                    report.objects_valid += 1;
+                }
+                Ok(bytes) => report.issues.push(VerificationIssue {
+                    kind: VerificationIssueKind::Content,
+                    subject: Some(object.content_id.clone()),
+                    message: format!(
+                        "catalog length is {}, but stored length is {}",
+                        object.byte_len,
+                        bytes.len()
+                    ),
+                }),
+                Err(error) => report.issues.push(VerificationIssue {
+                    kind: VerificationIssueKind::Content,
+                    subject: Some(object.content_id),
+                    message: error.to_string(),
+                }),
+            }
+        }
+        report
     }
 
     pub fn compile_tima(
@@ -1325,6 +1434,39 @@ mod tests {
         );
         let error = workspace.import_file(&input).unwrap_err();
         assert!(matches!(error, Error::Integrity { .. }));
+    }
+
+    #[test]
+    fn workspace_verification_checks_recorded_content_lengths() {
+        let test = TestDirectory::new("verify-length");
+        let root = test.path().join("workspace");
+        let mut workspace = Workspace::open(&root).unwrap();
+        let imported = workspace.import_bytes("asset", b"stored bytes").unwrap();
+        drop(workspace);
+
+        let connection = rusqlite::Connection::open(root.join(CATALOG_FILE_NAME)).unwrap();
+        connection
+            .execute(
+                "UPDATE contents SET byte_length = byte_length + 1 WHERE content_id = ?1",
+                [imported.content_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let workspace = Workspace::open(root).unwrap();
+        let report = workspace.verify();
+        assert!(!report.is_valid());
+        assert!(report.sqlite_valid);
+        assert_eq!(report.objects_checked, 1);
+        assert_eq!(report.objects_valid, 0);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].kind, VerificationIssueKind::Content);
+        let content_id = imported.content_id.to_string();
+        assert_eq!(
+            report.issues[0].subject.as_deref(),
+            Some(content_id.as_str())
+        );
+        assert!(report.issues[0].message.contains("catalog length"));
     }
 
     #[test]

@@ -123,6 +123,33 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 println!("artifacts = {}", stats.artifacts);
             })?;
         }
+        "verify" => {
+            let workspace_path = workspace_path(&mut arguments, 0)?;
+            finished(&mut arguments)?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let report = workspace.verify();
+            let valid = report.is_valid();
+            output.emit(cli_json::verification(&report), || {
+                println!("valid = {valid}");
+                println!("sqlite_valid = {}", report.sqlite_valid);
+                println!("objects_checked = {}", report.objects_checked);
+                println!("objects_valid = {}", report.objects_valid);
+                println!("issue_count = {}", report.issues.len());
+                for (index, issue) in report.issues.iter().enumerate() {
+                    println!("issue[{index}].kind = {}", issue.kind.as_str());
+                    if let Some(subject) = &issue.subject {
+                        println!("issue[{index}].subject = {subject}");
+                    }
+                    println!("issue[{index}].message = {}", issue.message);
+                }
+            })?;
+            if !valid {
+                return Err(format!(
+                    "workspace verification found {} issue(s)",
+                    report.issues.len()
+                ));
+            }
+        }
         "assets" => {
             let limit = list_limit(&mut arguments)?;
             let after = take_value_option(&mut arguments, "--after")?;
@@ -584,7 +611,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, assets, recipes, plugins, transforms, inspect, materialize, pipeline, run, replay, or trace"
+                "unknown command `{command}`; expected init, import, stats, verify, assets, recipes, plugins, transforms, inspect, materialize, pipeline, run, replay, or trace"
             ));
         }
     }
@@ -702,6 +729,7 @@ fn print_usage() {
     eprintln!("  histima init [workspace]");
     eprintln!("  histima import [workspace] <source-file>");
     eprintln!("  histima stats [workspace]");
+    eprintln!("  histima verify [workspace]");
     eprintln!(
         "  histima assets [workspace] [--prefix <locator-prefix>] [--limit <1-100>] [--after <locator>]"
     );
