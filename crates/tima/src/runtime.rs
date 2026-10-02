@@ -5,7 +5,6 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::CompiledProgram;
 use crate::abi::{ABI_IMAGE_FORMAT_OPAQUE_BYTES, ABI_IMAGE_FORMAT_RGBA8};
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::cache::CachedArtifact;
@@ -17,7 +16,10 @@ use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
 use crate::diagnostic::Diagnostic;
 use crate::fraction::{Fraction, FractionError};
-use crate::identity::{ContentIdentity, SemanticValueIdentity, content_identity};
+use crate::identity::{
+    ContentIdentity, IdentityDomain, IdentityPrefixResolver, SemanticValueIdentity,
+    TransformIdentity, content_identity,
+};
 use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueId, ValueKind};
 use crate::lineage::{
     Lineage, LineageArgument, LineageNode, RecordedValue, semantic_value_identity,
@@ -25,6 +27,7 @@ use crate::lineage::{
 use crate::plugin::{PluginTransform, prepare_plugin_invocation};
 use crate::registered::{RegisteredTransform, prepare_registered_invocation};
 use crate::source::Span;
+use crate::{CompiledProgram, available_transform_identities};
 
 /// An immutable outer value. Composite payloads use immutable `Arc` storage;
 /// there is no API that exposes mutable list, record, string, or asset data.
@@ -291,7 +294,7 @@ pub fn execute(program: &CompiledProgram) -> Result<Execution, Vec<Diagnostic>> 
         module: &program.transforms,
         capabilities: None,
     };
-    execute_with(program, &engine, BTreeMap::new(), None)
+    execute_with(program, &engine, BTreeMap::new(), None, None)
 }
 
 pub fn execute_cached(
@@ -302,7 +305,7 @@ pub fn execute_cached(
         module: &program.transforms,
         capabilities: None,
     };
-    execute_with(program, &engine, BTreeMap::new(), Some(cache))
+    execute_with(program, &engine, BTreeMap::new(), Some(cache), None)
 }
 
 pub fn execute_with_capabilities(
@@ -313,7 +316,7 @@ pub fn execute_with_capabilities(
         module: &program.transforms,
         capabilities: Some(capabilities),
     };
-    execute_with(program, &engine, BTreeMap::new(), None)
+    execute_with(program, &engine, BTreeMap::new(), None, None)
 }
 
 pub fn execute_cached_with_capabilities(
@@ -325,7 +328,26 @@ pub fn execute_cached_with_capabilities(
         module: &program.transforms,
         capabilities: Some(capabilities),
     };
-    execute_with(program, &engine, BTreeMap::new(), Some(cache))
+    execute_with(program, &engine, BTreeMap::new(), Some(cache), None)
+}
+
+pub fn execute_cached_with_capabilities_and_identity_prefixes(
+    program: &CompiledProgram,
+    cache: &mut dyn ResultCache,
+    capabilities: &dyn World,
+    identity_prefixes: &dyn IdentityPrefixResolver,
+) -> Result<Execution, Vec<Diagnostic>> {
+    let engine = IrInterpreter {
+        module: &program.transforms,
+        capabilities: Some(capabilities),
+    };
+    execute_with(
+        program,
+        &engine,
+        BTreeMap::new(),
+        Some(cache),
+        Some(identity_prefixes),
+    )
 }
 
 /// Executes AOT-compatible transforms from a cached native load image and
@@ -350,7 +372,7 @@ pub fn execute_aot_cached_with_capabilities(
         interpreter,
         native: native.as_ref(),
     };
-    let execution = execute_with(program, &engine, BTreeMap::new(), Some(cache))?;
+    let execution = execute_with(program, &engine, BTreeMap::new(), Some(cache), None)?;
     Ok(AotExecution {
         execution,
         artifact,
@@ -425,6 +447,7 @@ fn execute_with<'cache>(
     engine: &dyn TransformEngine,
     bindings: BTreeMap<String, OuterValue>,
     cache: Option<&'cache mut (dyn ResultCache + 'cache)>,
+    identity_prefixes: Option<&dyn IdentityPrefixResolver>,
 ) -> Result<Execution, Vec<Diagnostic>> {
     Interpreter {
         program,
@@ -434,6 +457,7 @@ fn execute_with<'cache>(
             last_value: None,
         },
         cache,
+        identity_prefixes,
     }
     .run()
     .map_err(|diagnostic| vec![diagnostic])
@@ -1103,14 +1127,15 @@ fn validate_replay_content(
     Ok(())
 }
 
-struct Interpreter<'program, 'engine, 'cache> {
+struct Interpreter<'program, 'engine, 'cache, 'identities> {
     program: &'program CompiledProgram,
     engine: &'engine dyn TransformEngine,
     execution: Execution,
     cache: Option<&'cache mut (dyn ResultCache + 'cache)>,
+    identity_prefixes: Option<&'identities dyn IdentityPrefixResolver>,
 }
 
-impl Interpreter<'_, '_, '_> {
+impl Interpreter<'_, '_, '_, '_> {
     fn run(mut self) -> Result<Execution, Diagnostic> {
         for item in &self.program.syntax.items {
             match item {
@@ -1240,31 +1265,137 @@ impl Interpreter<'_, '_, '_> {
         prefix: &str,
         span: Span,
     ) -> Result<OuterValue, Diagnostic> {
-        let (kind, actual) = match &value.data {
-            ValueData::Transform(id) => {
-                ("Transform ID", self.program.identities.get(*id).to_string())
-            }
+        let (domain, actual) = match &value.data {
+            ValueData::Transform(id) => (
+                IdentityDomain::Transform,
+                self.program.identities.get(*id).to_string(),
+            ),
             _ => match semantic_value_identity(&value).map_err(|error| {
                 Diagnostic::error(
                     format!("value has no assertable semantic identity: {error}"),
                     span,
                 )
             })? {
-                SemanticValueIdentity::Content(identity) => ("Content ID", identity.to_string()),
-                SemanticValueIdentity::Source(identity) => ("Source ID", identity.to_string()),
-                SemanticValueIdentity::Recipe(identity) => ("Recipe ID", identity.to_string()),
+                SemanticValueIdentity::Content(identity) => {
+                    (IdentityDomain::Content, identity.to_string())
+                }
+                SemanticValueIdentity::Source(identity) => {
+                    (IdentityDomain::Source, identity.to_string())
+                }
+                SemanticValueIdentity::Recipe(identity) => {
+                    (IdentityDomain::Recipe, identity.to_string())
+                }
             },
         };
-        if actual.starts_with(prefix) {
-            return Ok(value);
+        if !actual.starts_with(prefix) {
+            return Err(Diagnostic::error(
+                format!(
+                    "value has {} {actual}, which does not match identity assertion `#{prefix}`",
+                    domain.name()
+                ),
+                span,
+            )
+            .with_note("update or remove the identity assertion to use this value"));
         }
-        Err(Diagnostic::error(
-            format!(
-                "value has {kind} {actual}, which does not match identity assertion `#{prefix}`"
-            ),
-            span,
-        )
-        .with_note("update or remove the identity assertion to use this value"))
+        self.assert_identity_prefix_unique(domain, &actual, prefix, span)?;
+        Ok(value)
+    }
+
+    fn assert_identity_prefix_unique(
+        &self,
+        domain: IdentityDomain,
+        actual: &str,
+        prefix: &str,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let mut identities = BTreeSet::from([actual.to_owned()]);
+        if domain == IdentityDomain::Transform {
+            identities.extend(
+                available_transform_identities(&self.program.identities, &self.program.plugins)
+                    .into_iter()
+                    .map(|identity| identity.to_string()),
+            );
+        }
+        for value in self
+            .execution
+            .bindings
+            .values()
+            .chain(self.execution.last_value.iter())
+        {
+            if let Some((candidate_domain, identity)) = self.value_identity(value)
+                && candidate_domain == domain
+            {
+                identities.insert(identity);
+            }
+        }
+        if let Some(resolver) = self.identity_prefixes {
+            identities.extend(
+                resolver
+                    .matching_identities(domain, prefix)
+                    .map_err(|error| {
+                        Diagnostic::error(
+                            format!(
+                                "could not check local {} prefix collisions: {error}",
+                                domain.name()
+                            ),
+                            span,
+                        )
+                    })?,
+            );
+        }
+        let mut matches = identities
+            .into_iter()
+            .filter(|identity| identity.starts_with(prefix));
+        let first = matches.next();
+        let second = matches.next();
+        if let (Some(first), Some(second)) = (first, second) {
+            return Err(Diagnostic::error(
+                format!(
+                    "{} assertion `#{prefix}` is ambiguous locally; it matches {first} and {second}",
+                    domain.name()
+                ),
+                span,
+            )
+            .with_note(format!(
+                "use a longer prefix or the full {}",
+                domain.name()
+            )));
+        }
+        Ok(())
+    }
+
+    fn value_identity(&self, value: &OuterValue) -> Option<(IdentityDomain, String)> {
+        if let ValueData::Transform(id) = &value.data {
+            return Some((
+                IdentityDomain::Transform,
+                self.program.identities.get(*id).to_string(),
+            ));
+        }
+        match semantic_value_identity(value).ok()? {
+            SemanticValueIdentity::Content(identity) => {
+                Some((IdentityDomain::Content, identity.to_string()))
+            }
+            SemanticValueIdentity::Source(identity) => {
+                Some((IdentityDomain::Source, identity.to_string()))
+            }
+            SemanticValueIdentity::Recipe(identity) => {
+                Some((IdentityDomain::Recipe, identity.to_string()))
+            }
+        }
+    }
+
+    fn transform_identity(&self, name: &str) -> Option<TransformIdentity> {
+        self.program
+            .transforms
+            .find(name)
+            .map(|(id, _)| self.program.identities.get(id))
+            .or_else(|| RegisteredTransform::find(name).map(RegisteredTransform::identity))
+            .or_else(|| {
+                self.program
+                    .plugins
+                    .find(name)
+                    .map(PluginTransform::identity)
+            })
     }
 
     fn call(
@@ -1277,6 +1408,20 @@ impl Interpreter<'_, '_, '_> {
         let callee_expression = self.program.syntax.expr(callee);
         let name = self.callable_name(callee)?;
         let asserted = matches!(callee_expression.kind, ExprKind::IdentityAsserted { .. });
+        if let ExprKind::IdentityAsserted {
+            prefix,
+            prefix_span,
+            ..
+        } = &callee_expression.kind
+            && let Some(identity) = self.transform_identity(&name)
+        {
+            self.assert_identity_prefix_unique(
+                IdentityDomain::Transform,
+                &identity.to_string(),
+                prefix,
+                *prefix_span,
+            )?;
+        }
         let mut evaluated = Vec::new();
         if let Some(input) = pipeline_input {
             evaluated.push((None, input, callee_expression.span));
@@ -2668,7 +2813,8 @@ mod tests {
     use crate::capability::RuntimeCapabilities;
     use crate::fraction::Fraction;
     use crate::identity::{
-        ContentIdentity, byte_content_identity, content_identity, source_identity,
+        ContentIdentity, IdentityDomain, IdentityPrefixResolver, byte_content_identity,
+        content_identity, source_identity,
     };
     use crate::ir::TransformId;
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
@@ -2676,8 +2822,9 @@ mod tests {
         HybridAotEngine, ImageFormat, ImageValue, IrInterpreter, OuterValue,
         ReplayDependencyResolver, TransformEngine, ValueData, execute,
         execute_aot_cached_with_capabilities, execute_cached, execute_cached_with_capabilities,
-        execute_with, execute_with_capabilities, freeze_interpreted_value, lower_interpreted_value,
-        replay, replay_with_capabilities, replay_with_dependencies, scale_rgba8_channel,
+        execute_cached_with_capabilities_and_identity_prefixes, execute_with,
+        execute_with_capabilities, freeze_interpreted_value, lower_interpreted_value, replay,
+        replay_with_capabilities, replay_with_dependencies, scale_rgba8_channel,
     };
     use crate::source::Span;
 
@@ -2735,6 +2882,29 @@ mod tests {
     }
 
     struct ChangingFile(RefCell<VecDeque<Vec<u8>>>);
+
+    struct FixedIdentityPrefixes {
+        domain: IdentityDomain,
+        identities: Vec<String>,
+    }
+
+    impl IdentityPrefixResolver for FixedIdentityPrefixes {
+        fn matching_identities(
+            &self,
+            domain: IdentityDomain,
+            prefix: &str,
+        ) -> Result<Vec<String>, String> {
+            Ok(if domain == self.domain {
+                self.identities
+                    .iter()
+                    .filter(|identity| identity.starts_with(prefix))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            })
+        }
+    }
 
     impl RuntimeCapabilities for ChangingFile {
         fn environment(&self, name: &str) -> Result<Vec<u8>, String> {
@@ -3029,10 +3199,70 @@ mod tests {
             },
             BTreeMap::from([("input".to_owned(), input.clone())]),
             None,
+            None,
         )
         .unwrap();
 
         assert_eq!(execution.bindings["out"], input);
+    }
+
+    #[test]
+    fn value_identity_prefixes_must_be_unique_in_outer_bindings() {
+        let mut first_by_prefix = BTreeMap::new();
+        let (first, second, prefix) = (0_i64..17)
+            .find_map(|value| {
+                let identity = content_identity(&OuterValue::plain(ValueData::Integer(value)))
+                    .unwrap()
+                    .to_string();
+                let prefix = identity[..1].to_owned();
+                first_by_prefix
+                    .insert(prefix.clone(), value)
+                    .map(|first| (first, value, prefix))
+            })
+            .expect("17 distinct Content IDs collide in one hexadecimal digit");
+        let compiled = crate::compile(
+            "value-collision.tima",
+            format!("first = {first}\nsecond = {second}\nout = first#{prefix}\n"),
+        )
+        .unwrap();
+        let diagnostics = execute(&compiled).unwrap_err();
+
+        assert!(diagnostics[0].message.contains("Content ID"));
+        assert!(diagnostics[0].message.contains("ambiguous locally"));
+        assert!(diagnostics[0].notes[0].contains("longer prefix"));
+    }
+
+    #[test]
+    fn value_identity_prefixes_include_host_local_identities() {
+        let value = OuterValue::plain(ValueData::Integer(42));
+        let actual = content_identity(&value).unwrap().to_string();
+        let prefix = &actual[..1];
+        let collision = (0_i64..)
+            .map(|candidate| {
+                content_identity(&OuterValue::plain(ValueData::Integer(candidate)))
+                    .unwrap()
+                    .to_string()
+            })
+            .find(|candidate| candidate != &actual && candidate.starts_with(prefix))
+            .unwrap();
+        let compiled =
+            crate::compile("host-collision.tima", format!("out = 42#{prefix}\n")).unwrap();
+        let mut cache = TransformResultCache::default();
+        let world = FixedWorld {
+            environment: BTreeMap::new(),
+            files: BTreeMap::new(),
+            urls: BTreeMap::new(),
+        };
+        let resolver = FixedIdentityPrefixes {
+            domain: IdentityDomain::Content,
+            identities: vec![actual, collision],
+        };
+        let diagnostics = execute_cached_with_capabilities_and_identity_prefixes(
+            &compiled, &mut cache, &world, &resolver,
+        )
+        .unwrap_err();
+
+        assert!(diagnostics[0].message.contains("ambiguous locally"));
     }
 
     #[test]
@@ -3524,7 +3754,7 @@ mod tests {
             OuterValue::plain(ValueData::Bytes(Arc::new(b"P3\n".to_vec()))),
         )]);
 
-        let diagnostics = execute_with(&compiled, &engine, bindings, None).unwrap_err();
+        let diagnostics = execute_with(&compiled, &engine, bindings, None, None).unwrap_err();
 
         assert!(diagnostics[0].message.contains("output is unavailable"));
     }
@@ -3586,6 +3816,7 @@ mod tests {
                 OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap()),
             )]),
             None,
+            None,
         )
         .unwrap();
         let ValueData::Image(original) = &execution.bindings["img"].data else {
@@ -3635,6 +3866,7 @@ mod tests {
                 "img".to_owned(),
                 OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap()),
             )]),
+            None,
             None,
         )
         .unwrap();
@@ -3695,6 +3927,7 @@ mod tests {
                     OuterValue::plain(ValueData::Bytes(Arc::new(vec![1, 2, 3, 4]))),
                 ),
             ]),
+            None,
             None,
         )
         .unwrap();
@@ -3805,6 +4038,7 @@ mod tests {
             },
             bindings.clone(),
             None,
+            None,
         )
         .unwrap();
 
@@ -3825,6 +4059,7 @@ mod tests {
                 native: Some(&native),
             },
             bindings,
+            None,
             None,
         )
         .unwrap();
@@ -3877,6 +4112,7 @@ mod tests {
             },
             bindings.clone(),
             None,
+            None,
         )
         .unwrap();
 
@@ -3897,6 +4133,7 @@ mod tests {
                 native: Some(&native_module),
             },
             bindings,
+            None,
             None,
         )
         .unwrap();

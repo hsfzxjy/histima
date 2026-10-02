@@ -165,8 +165,22 @@ The hexadecimal text is a full identity or a prefix. `value#hash` evaluates
 `value`, verifies its selected semantic identity, and returns the same
 immutable value unchanged. A mismatch is an error at the assertion. This is a
 reproducibility assertion, not global lookup by hash, so the expression to the
-left still selects or computes the value and a short prefix need not be
-globally unique.
+left still selects or computes the value.
+
+An abbreviated identity must be unique among distinct identities in the same
+identity domain that are known locally. A prefix matching two local Transform
+IDs, Source IDs, Recipe IDs, or Content IDs is an error even when the value on
+the left has one of those identities. Duplicate references to the same full ID
+do not create ambiguity. The diagnostic reports two colliding IDs and requires
+a longer prefix or the full ID. Different domains do not compete because the
+left-hand value deterministically selects one domain.
+
+The local set includes source-defined, built-in, and configured plugin
+transforms; outer values already available in the current execution; and, when
+running under Histima, identities in the current workspace catalog. Standalone
+Tima has no hidden global identity index. Callable transform prefixes are
+checked against the compile-time registry and checked again against a host
+catalog at execution when one is available.
 
 The selected identity domain is deterministic:
 

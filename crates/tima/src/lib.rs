@@ -5,6 +5,7 @@
 //! backends consume [`ir::TypedModule`], never syntax or a host-specific code
 //! format.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub mod abi;
@@ -28,7 +29,7 @@ pub mod source;
 
 use ast::Program;
 use diagnostic::Diagnostic;
-use identity::TransformIdentities;
+use identity::{TransformIdentities, TransformIdentity};
 use ir::TypedModule;
 use source::SourceFile;
 
@@ -147,6 +148,23 @@ fn validate_callable_identity_assertions(
                 )
                     .with_note("update or remove the identity assertion to use this definition"),
             );
+            continue;
+        }
+        let matches = available_transform_identities(identities, plugins)
+            .into_iter()
+            .filter(|identity| identity.to_string().starts_with(prefix))
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "transform identity assertion `#{prefix}` is ambiguous locally; it matches {} and {}",
+                        matches[0], matches[1]
+                    ),
+                    *prefix_span,
+                )
+                .with_note("use a longer prefix or the full Transform ID"),
+            );
         }
     }
     if diagnostics.is_empty() {
@@ -154,6 +172,17 @@ fn validate_callable_identity_assertions(
     } else {
         Err(diagnostics)
     }
+}
+
+pub(crate) fn available_transform_identities(
+    identities: &TransformIdentities,
+    plugins: &plugin::PluginRegistry,
+) -> BTreeSet<TransformIdentity> {
+    identities
+        .iter()
+        .chain(registered::RegisteredTransform::infos().map(|info| info.transform_id))
+        .chain(plugins.transform_infos().map(|info| info.transform_id))
+        .collect()
 }
 
 fn callable_name(program: &Program, expression: ast::ExprId) -> Option<String> {
@@ -228,5 +257,34 @@ mod tests {
             format!("out = bytes | ppm.decode#{identity}\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn callable_identity_prefixes_must_be_unique_locally() {
+        let definitions = (0..17)
+            .map(|index| format!("transform f{index}() -> i64 {{ return {index} }}\n"))
+            .collect::<String>();
+        let compiled = compile("collision-base.tima", &definitions).unwrap();
+        let mut first_by_prefix = std::collections::BTreeMap::new();
+        let (target, prefix) = compiled
+            .identities
+            .iter()
+            .enumerate()
+            .find_map(|(index, identity)| {
+                let text = identity.to_string();
+                let prefix = text[..1].to_owned();
+                first_by_prefix
+                    .insert(prefix.clone(), index)
+                    .map(|first| (first, prefix))
+            })
+            .expect("17 distinct transform identities collide in one hexadecimal digit");
+        let diagnostics = compile(
+            "collision.tima",
+            format!("{definitions}out = f{target}#{prefix}()\n"),
+        )
+        .unwrap_err();
+
+        assert!(diagnostics[0].message.contains("ambiguous locally"));
+        assert!(diagnostics[0].notes[0].contains("longer prefix"));
     }
 }

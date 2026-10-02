@@ -7,8 +7,8 @@ use rusqlite::{
 };
 use tima::identity::{
     ArtifactBundleIdentity, ArtifactConfiguration, ArtifactIdentity, ContentIdentity,
-    DependencyIdentity, RecipeIdentity, SemanticValueIdentity, SourceIdentity, TransformIdentity,
-    artifact_bundle_identity, artifact_identity, dependency_identity,
+    DependencyIdentity, IdentityDomain, RecipeIdentity, SemanticValueIdentity, SourceIdentity,
+    TransformIdentity, artifact_bundle_identity, artifact_identity, dependency_identity,
 };
 use tima::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
 
@@ -409,6 +409,51 @@ impl Catalog {
                 })
             })
             .transpose()
+    }
+
+    pub(crate) fn identity_prefix_matches(
+        &self,
+        domain: IdentityDomain,
+        prefix: &str,
+    ) -> Result<Vec<String>> {
+        let sql = match domain {
+            IdentityDomain::Transform => {
+                "SELECT identity FROM (
+                     SELECT transform_id AS identity FROM lineage_invocations
+                     UNION SELECT transform_id AS identity FROM artifacts
+                 ) WHERE substr(identity, 1, length(?1)) = ?1
+                 ORDER BY identity LIMIT 2"
+            }
+            IdentityDomain::Source => {
+                "SELECT identity FROM (
+                     SELECT source_id AS identity FROM source_assets
+                     UNION SELECT semantic_id AS identity FROM lineage_arguments
+                           WHERE semantic_kind = 'source'
+                 ) WHERE substr(identity, 1, length(?1)) = ?1
+                 ORDER BY identity LIMIT 2"
+            }
+            IdentityDomain::Recipe => {
+                "SELECT identity FROM (
+                     SELECT recipe_id AS identity FROM lineage_invocations
+                     UNION SELECT semantic_id AS identity FROM lineage_arguments
+                           WHERE semantic_kind = 'recipe'
+                 ) WHERE substr(identity, 1, length(?1)) = ?1
+                 ORDER BY identity LIMIT 2"
+            }
+            IdentityDomain::Content => {
+                "SELECT identity FROM (
+                     SELECT content_id AS identity FROM contents
+                     UNION SELECT semantic_id AS identity FROM lineage_arguments
+                           WHERE semantic_kind = 'content'
+                 ) WHERE substr(identity, 1, length(?1)) = ?1
+                 ORDER BY identity LIMIT 2"
+            }
+        };
+        let mut statement = self.connection.prepare(sql)?;
+        statement
+            .query_map([prefix], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn all_contents(&self) -> Result<Vec<CatalogObject>> {

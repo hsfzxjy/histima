@@ -158,7 +158,10 @@ Any outer value with one selected semantic identity can be pinned as
 `value#hash`, where `hash` is a full lowercase identity or prefix. Transform
 values/calls use Transform ID, observed sources use Source ID, derived values
 use Recipe ID, and otherwise materialized values use Content ID. The assertion
-returns the value unchanged and is not lookup by hash.
+returns the value unchanged and is not lookup by hash. A prefix must uniquely
+match its identity domain among identities known in the current program,
+execution, and Histima workspace catalog; local collisions require a longer or
+full hash.
 
 ## The World boundary
 

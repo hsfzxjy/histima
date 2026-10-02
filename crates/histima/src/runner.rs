@@ -78,9 +78,13 @@ impl Workspace {
             ));
         }
         let mut result_cache = WorkspaceResultCache::new(self);
-        let execution =
-            tima::runtime::execute_cached_with_capabilities(program, &mut result_cache, self)
-                .map_err(RunError::Runtime)?;
+        let execution = tima::runtime::execute_cached_with_capabilities_and_identity_prefixes(
+            program,
+            &mut result_cache,
+            self,
+            self,
+        )
+        .map_err(RunError::Runtime)?;
         let value = execution.last_value.ok_or_else(|| {
             RunError::InvalidPipeline("the pipeline expression produced no value".to_owned())
         })?;
@@ -94,9 +98,13 @@ impl Workspace {
     /// workspace as the only host capability provider.
     pub fn execute(&self, program: &CompiledProgram) -> Result<ProgramExecution, RunError> {
         let mut result_cache = WorkspaceResultCache::new(self);
-        let execution =
-            tima::runtime::execute_cached_with_capabilities(program, &mut result_cache, self)
-                .map_err(RunError::Runtime)?;
+        let execution = tima::runtime::execute_cached_with_capabilities_and_identity_prefixes(
+            program,
+            &mut result_cache,
+            self,
+            self,
+        )
+        .map_err(RunError::Runtime)?;
         Ok(ProgramExecution {
             execution,
             artifact: None,

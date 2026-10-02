@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use tima::capability::{ENVIRONMENT_CAPABILITY, FILE_READ_CAPABILITY, HTTP_GET_CAPABILITY, World};
 use tima::identity::{
-    ArtifactIdentity, ContentIdentity, DependencyIdentity, RecipeIdentity, SourceIdentity,
-    byte_content_identity, source_identity,
+    ArtifactIdentity, ContentIdentity, DependencyIdentity, IdentityDomain, IdentityPrefixResolver,
+    RecipeIdentity, SourceIdentity, byte_content_identity, source_identity,
 };
 use tima::lineage::{Lineage, LineageNode};
 use tima::plugin::{
@@ -1251,6 +1251,18 @@ impl World for Workspace {
     }
 }
 
+impl IdentityPrefixResolver for Workspace {
+    fn matching_identities(
+        &self,
+        domain: IdentityDomain,
+        prefix: &str,
+    ) -> std::result::Result<Vec<String>, String> {
+        self.catalog
+            .identity_prefix_matches(domain, prefix)
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1274,6 +1286,34 @@ mod tests {
             }
         );
         assert_eq!(workspace.catalog_stats().unwrap(), CatalogStats::default());
+    }
+
+    #[test]
+    fn workspace_identity_prefix_lookup_reports_local_collisions() {
+        let test = TestDirectory::new("identity-prefixes");
+        let mut workspace = Workspace::open(test.path().join("workspace")).unwrap();
+        let mut first_by_prefix = std::collections::BTreeMap::new();
+        let (_, prefix) = (0_u8..17)
+            .find_map(|value| {
+                let imported = workspace
+                    .import_bytes(&format!("{value}.bin"), &[value])
+                    .unwrap();
+                let identity = imported.content_id.to_string();
+                let prefix = identity[..1].to_owned();
+                first_by_prefix
+                    .insert(prefix.clone(), identity)
+                    .map(|first| (first, prefix))
+            })
+            .expect("17 distinct Content IDs collide in one hexadecimal digit");
+
+        let matches = IdentityPrefixResolver::matching_identities(
+            &workspace,
+            IdentityDomain::Content,
+            &prefix,
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|identity| identity.starts_with(&prefix)));
     }
 
     #[test]

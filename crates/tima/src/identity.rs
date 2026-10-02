@@ -125,6 +125,36 @@ pub enum SemanticValueIdentity {
     Recipe(RecipeIdentity),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IdentityDomain {
+    Transform,
+    Source,
+    Recipe,
+    Content,
+}
+
+impl IdentityDomain {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Transform => "Transform ID",
+            Self::Source => "Source ID",
+            Self::Recipe => "Recipe ID",
+            Self::Content => "Content ID",
+        }
+    }
+}
+
+/// Supplies identities known to a host-local store for abbreviated identity
+/// assertions. Implementations may return at most enough matches to establish
+/// ambiguity; callers canonicalize duplicates before deciding.
+pub trait IdentityPrefixResolver {
+    fn matching_identities(
+        &self,
+        domain: IdentityDomain,
+        prefix: &str,
+    ) -> Result<Vec<String>, String>;
+}
+
 impl From<ContentIdentity> for SemanticValueIdentity {
     fn from(value: ContentIdentity) -> Self {
         Self::Content(value)
