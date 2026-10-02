@@ -549,6 +549,23 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 println!("materialized = {}", destination.display());
             })?;
         }
+        "expression" => {
+            let starting_input = take_value_option(&mut arguments, "--input")?;
+            let workspace_path = workspace_path(&mut arguments, 1)?;
+            let recipe_text = required(&mut arguments, "Recipe ID")?;
+            finished(&mut arguments)?;
+            let recipe = recipe_text
+                .parse::<RecipeIdentity>()
+                .map_err(|error| format!("invalid Recipe ID: {error}"))?;
+            let workspace = Workspace::open(&workspace_path).map_err(|error| error.to_string())?;
+            let expression = workspace
+                .recipe_expression(recipe, starting_input.as_deref())
+                .map_err(|error| error.to_string())?;
+            output.emit(
+                cli_json::recipe_expression(recipe, starting_input.as_deref(), &expression),
+                || println!("{expression}"),
+            )?;
+        }
         "pipeline" => {
             let workspace_path = workspace_path(&mut arguments, 1)?;
             let expression = required(&mut arguments, "Tima pipeline expression")?;
@@ -727,7 +744,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
         }
         _ => {
             return Err(format!(
-                "unknown command `{command}`; expected init, import, stats, summary, verify, assets, recipes, search, plugins, transforms, inspect, materialize, pipeline, run, replay, or trace"
+                "unknown command `{command}`; expected init, import, stats, summary, verify, assets, recipes, search, plugins, transforms, inspect, materialize, expression, pipeline, run, replay, or trace"
             ));
         }
     }
@@ -975,6 +992,7 @@ fn print_usage() {
     eprintln!("  histima inspect recipe [workspace] <recipe-id>");
     eprintln!("  histima inspect artifact [workspace] <artifact-or-bundle-id>");
     eprintln!("  histima materialize [workspace] <content-id> <destination>");
+    eprintln!("  histima expression [workspace] <recipe-id> [--input <tima-expression>]");
     eprintln!("  histima pipeline [workspace] <tima-expression>");
     eprintln!("  histima run [workspace] <file.tima> [--record <binding>]");
     eprintln!("  histima replay [workspace] <file.tima> <recipe-id> [--snapshot]");

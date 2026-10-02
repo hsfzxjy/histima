@@ -49,6 +49,7 @@ cargo run -p histima -- search build/my-workspace png
 cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | read | ppm.decode | webp.encode(quality=85)'
 cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
 cargo run -p histima -- trace build/my-workspace <recipe-id>
+cargo run -p histima -- expression build/my-workspace <recipe-id>
 cargo run -p histima -- replay build/my-workspace examples/image_pipeline.tima <recipe-id>
 ```
 
@@ -96,6 +97,15 @@ never repairs or removes data.
 expression. Invocation-derived byte results are automatically recorded in
 workspace stock, so a later process can reuse them. Custom `transform`
 declarations remain file-based through `histima run`.
+
+`histima expression [workspace] <recipe-id>` prints one outer-Tima expression
+for a recorded output. It pins transforms by full Transform ID, reconstructs
+recorded sources, and asserts the queried Recipe ID, so the output can be fed
+back to `histima pipeline` when all transforms are registered. Add `--input
+<tima-expression>` to replace the primary starting input; the generated source
+then omits the old Source/Recipe assertions and represents a new derivation.
+Source-defined transforms still need their declarations when the expression is
+embedded in a Tima file.
 
 ## A small Tima program
 

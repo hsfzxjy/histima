@@ -15,6 +15,10 @@ pub enum Error {
     AssetNotFound(String),
     ContentNotFound(String),
     RecipeNotFound(String),
+    RecipeNotExpressible {
+        identity: String,
+        reason: String,
+    },
     ArtifactNotFound(String),
     InvalidSearchQuery,
     ValueNotRecordable(String),
@@ -75,6 +79,12 @@ impl fmt::Display for Error {
                     "recipe {identity} is not recorded in this workspace"
                 )
             }
+            Self::RecipeNotExpressible { identity, reason } => {
+                write!(
+                    formatter,
+                    "recipe {identity} cannot be rendered as one Tima expression: {reason}"
+                )
+            }
             Self::ArtifactNotFound(identity) => write!(
                 formatter,
                 "artifact or artifact bundle {identity} is not recorded in this workspace"
@@ -118,6 +128,7 @@ impl StdError for Error {
             | Self::AssetNotFound(_)
             | Self::ContentNotFound(_)
             | Self::RecipeNotFound(_)
+            | Self::RecipeNotExpressible { .. }
             | Self::ArtifactNotFound(_)
             | Self::InvalidSearchQuery
             | Self::ValueNotRecordable(_)

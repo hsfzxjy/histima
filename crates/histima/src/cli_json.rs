@@ -292,6 +292,18 @@ pub fn materialized(content_id: impl ToString, destination: &Path) -> Value {
     })
 }
 
+pub fn recipe_expression(
+    recipe_id: impl ToString,
+    starting_input: Option<&str>,
+    expression: &str,
+) -> Value {
+    json!({
+        "recipe_id": recipe_id.to_string(),
+        "starting_input": starting_input,
+        "expression": expression,
+    })
+}
+
 pub fn run(result: &ProgramExecution, recorded: Option<(&str, &RecordedResult)>) -> Value {
     let bindings = result
         .execution

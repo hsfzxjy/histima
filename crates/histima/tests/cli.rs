@@ -934,12 +934,16 @@ fn cli_pipeline_evaluates_one_expression_and_stocks_byte_results() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");
     let source = test.path().join("source.ppm");
+    let alternate = test.path().join("alternate.ppm");
     fs::write(&source, b"P3\n1 1\n255\n24 48 96\n").unwrap();
+    fs::write(&alternate, b"P3\n1 1\n255\n96 48 24\n").unwrap();
     let source_locator = portable(&source);
+    let alternate_locator = portable(&alternate);
     let expression = format!("asset({source_locator:?}) | read | ppm.decode | ppm.encode");
 
     assert_success(&histima(["init", text(&workspace)]));
     assert_success(&histima(["import", text(&workspace), &source_locator]));
+    assert_success(&histima(["import", text(&workspace), &alternate_locator]));
 
     let first = histima(["pipeline", text(&workspace), &expression]);
     assert_success(&first);
@@ -972,6 +976,58 @@ fn cli_pipeline_evaluates_one_expression_and_stocks_byte_results() {
     let recipes = json_output(&recipes);
     assert_eq!(recipes["count"], 1);
     assert_eq!(recipes["recipes"][0]["recipe_id"], recipe_id);
+
+    let generated = histima(["expression", text(&workspace), &recipe_id]);
+    assert_success(&generated);
+    let generated_expression = stdout(&generated).trim().to_owned();
+    assert_eq!(generated_expression.lines().count(), 1);
+    assert!(generated_expression.contains("read(asset("));
+    assert!(generated_expression.contains("ppm.decode#"));
+    assert!(generated_expression.contains("ppm.encode#"));
+    assert!(generated_expression.ends_with(&format!("#{recipe_id}")));
+    let regenerated = histima([
+        "pipeline",
+        text(&workspace),
+        &generated_expression,
+        "--json",
+    ]);
+    assert_success(&regenerated);
+    assert_eq!(json_output(&regenerated)["stocked"]["recipe_id"], recipe_id);
+
+    let starting_input = format!("asset({alternate_locator:?}) | read");
+    let substituted = histima([
+        "expression",
+        text(&workspace),
+        &recipe_id,
+        "--input",
+        &starting_input,
+        "--json",
+    ]);
+    assert_success(&substituted);
+    let substituted = json_output(&substituted);
+    assert_eq!(substituted["recipe_id"], recipe_id);
+    assert_eq!(substituted["starting_input"], starting_input);
+    let substituted_expression = json_string(&substituted, "expression");
+    assert!(!substituted_expression.contains(&recipe_id));
+    assert!(substituted_expression.contains(&alternate_locator));
+    let evaluated = histima([
+        "pipeline",
+        text(&workspace),
+        substituted_expression,
+        "--json",
+    ]);
+    assert_success(&evaluated);
+    assert_ne!(json_output(&evaluated)["stocked"]["recipe_id"], recipe_id);
+
+    let invalid_input = histima([
+        "expression",
+        text(&workspace),
+        &recipe_id,
+        "--input",
+        "value = 1",
+    ]);
+    assert!(!invalid_input.status.success());
+    assert!(stderr(&invalid_input).contains("exactly one Tima outer expression"));
 
     let scalar = histima(["pipeline", text(&workspace), "1 + 2", "--json"]);
     assert_success(&scalar);

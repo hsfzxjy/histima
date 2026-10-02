@@ -939,6 +939,27 @@ impl Workspace {
         })
     }
 
+    /// Renders a durable recipe as one outer-Tima expression. A supplied
+    /// starting input replaces the primary first-argument lineage root and
+    /// therefore describes a new derivation rather than replaying the recipe.
+    pub fn recipe_expression(
+        &self,
+        recipe: RecipeIdentity,
+        starting_input: Option<&str>,
+    ) -> Result<String> {
+        let stored = self
+            .catalog
+            .replay_record(recipe)?
+            .ok_or_else(|| Error::RecipeNotFound(recipe.to_string()))?;
+        stored
+            .lineage
+            .outer_expression(starting_input)
+            .map_err(|error| Error::RecipeNotExpressible {
+                identity: recipe.to_string(),
+                reason: error.to_string(),
+            })
+    }
+
     /// Searches the supplied digest in both the Artifact-ID and bundle-ID
     /// namespaces. Both are canonical 256-bit identities, so the CLI can
     /// inspect either without a separate discriminator.

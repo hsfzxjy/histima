@@ -884,6 +884,31 @@ does not access that external resource. A missing snapshot is an error. Source
 assets retain their separate source-validation behavior. Retention metadata
 and policy do not enter Dependency, Recipe, or Content identity.
 
+### 12.5 Recipe expressions
+
+Histima can render a durably recorded recipe as one outer-Tima expression:
+
+```text
+histima expression [workspace] <recipe-id>
+```
+
+The generated expression reconstructs the first-argument pipeline, renders
+other recorded arguments positionally, pins each transform with its full
+Transform ID, reconstructs observed sources as `read(asset(locator))#source`,
+and asserts the final Recipe ID. Executing it therefore either produces the
+queried derivation or fails an identity assertion. A recorded materialized
+argument without reconstructable lineage cannot be emitted as source text.
+Arguments remain positional because parameter names are not part of semantic
+Transform identity and may change without changing a Transform ID.
+
+`--input <tima-expression>` replaces the deepest value on the primary
+first-argument chain. The supplied text must itself be exactly one one-line
+outer expression. This form retains Transform-ID pins but omits the recorded
+Source- and final Recipe-ID assertions affected by the replacement. Executing
+the result creates a new derivation; it is not replay and does not weaken the
+strict replay contract. Non-primary argument branches retain their recorded
+lineage and identity assertions.
+
 ## 13. Diagnostics
 
 Lexer, parser, semantic checker, boundary validation, World operations,

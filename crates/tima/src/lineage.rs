@@ -3,12 +3,14 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::ast::Item;
 use crate::identity::{
     ContentIdentity, DependencyIdentity, IdentityError, RecipeIdentity, SemanticValueIdentity,
     SourceIdentity, TransformIdentity, content_identity, dependency_identity, recipe_identity,
     source_identity,
 };
 use crate::runtime::{OuterValue, ValueData};
+use crate::source::SourceFile;
 
 /// One immutable node in a semantic derivation DAG.
 ///
@@ -183,6 +185,38 @@ impl Lineage {
         renderer.lines.join("\n")
     }
 
+    /// Reconstructs this invocation lineage as one outer-language expression.
+    ///
+    /// The recorded derivation is pinned by full Transform and Recipe IDs. If
+    /// `starting_input` is supplied, it replaces the deepest value on the
+    /// first-argument chain and the old Recipe assertion is omitted because
+    /// the substitution intentionally describes a new derivation.
+    pub fn outer_expression(&self, starting_input: Option<&str>) -> Result<String, LineageError> {
+        let starting_input = starting_input.map(validate_outer_expression).transpose()?;
+        let LineageNode::Invocation(invocation) = self.node() else {
+            return Err(LineageError::new(
+                "only transform invocation lineage can be rendered as a recipe expression",
+            ));
+        };
+        let mut renderer = OuterExpressionRenderer {
+            starting_input: starting_input.as_deref(),
+            substituted: false,
+        };
+        let rendered = renderer.invocation(invocation, true)?;
+        if starting_input.is_some() && !renderer.substituted {
+            return Err(LineageError::new(
+                "the recorded invocation has no primary input to replace",
+            ));
+        }
+        let expression = if starting_input.is_some() {
+            rendered.text
+        } else {
+            format!("({})#{}", rendered.text, invocation.recipe_id)
+        };
+        validate_outer_expression(&expression)?;
+        Ok(expression)
+    }
+
     fn render_key(&self) -> LineageKey {
         match self.node() {
             LineageNode::Source(source) => source.source_id.map_or_else(
@@ -195,6 +229,234 @@ impl Lineage {
             }
         }
     }
+}
+
+fn validate_outer_expression(expression: &str) -> Result<String, LineageError> {
+    if expression
+        .chars()
+        .any(|character| matches!(character, '\r' | '\n'))
+    {
+        return Err(LineageError::new(
+            "a recipe starting input must be a one-line Tima expression",
+        ));
+    }
+    let source = SourceFile::new("<recipe-expression>", expression);
+    let program = crate::parser::parse(&source).map_err(|diagnostics| {
+        let message = diagnostics
+            .first()
+            .map_or("invalid Tima syntax", |diagnostic| {
+                diagnostic.message.as_str()
+            });
+        LineageError::new(format!("invalid Tima outer expression: {message}"))
+    })?;
+    if program.items.len() != 1 || !matches!(program.items.first(), Some(Item::Expression(_))) {
+        return Err(LineageError::new(
+            "recipe input must contain exactly one Tima outer expression",
+        ));
+    }
+    Ok(expression.to_owned())
+}
+
+struct OuterExpressionRenderer<'a> {
+    starting_input: Option<&'a str>,
+    substituted: bool,
+}
+
+struct RenderedExpression {
+    text: String,
+    is_pipeline: bool,
+}
+
+impl OuterExpressionRenderer<'_> {
+    fn invocation(
+        &mut self,
+        invocation: &InvocationLineage,
+        primary: bool,
+    ) -> Result<RenderedExpression, LineageError> {
+        if primary && invocation.arguments.is_empty() && self.starting_input.is_some() {
+            return self.substitute();
+        }
+        let callable = format!("{}#{}", invocation.transform_name, invocation.transform_id);
+        let Some((first, rest)) = invocation.arguments.split_first() else {
+            return Ok(self.pin_non_primary(
+                invocation,
+                primary,
+                RenderedExpression {
+                    text: format!("{callable}()"),
+                    is_pipeline: false,
+                },
+            ));
+        };
+        let input = self.argument(first, primary)?;
+        let stage = if rest.is_empty() {
+            callable
+        } else {
+            let arguments = rest
+                .iter()
+                .map(|argument| {
+                    let value = self.argument(argument, false)?;
+                    Ok(if value.is_pipeline {
+                        format!("({})", value.text)
+                    } else {
+                        value.text
+                    })
+                })
+                .collect::<Result<Vec<_>, LineageError>>()?
+                .join(", ");
+            format!("{callable}({arguments})")
+        };
+        Ok(self.pin_non_primary(
+            invocation,
+            primary,
+            RenderedExpression {
+                text: format!("{} | {stage}", input.text),
+                is_pipeline: true,
+            },
+        ))
+    }
+
+    fn argument(
+        &mut self,
+        argument: &LineageArgument,
+        primary: bool,
+    ) -> Result<RenderedExpression, LineageError> {
+        if primary && self.starting_input.is_some() {
+            if let Some(lineage) = &argument.lineage
+                && let LineageNode::Invocation(invocation) = lineage.node()
+            {
+                return self.invocation(invocation, true);
+            }
+            return self.substitute();
+        }
+        if let Some(lineage) = &argument.lineage {
+            return match lineage.node() {
+                LineageNode::Invocation(invocation) => self.invocation(invocation, primary),
+                LineageNode::Source(source) => render_source_expression(source),
+                LineageNode::ExternalObservation(_) => Err(LineageError::new(
+                    "external observations cannot be used as transform arguments",
+                )),
+            };
+        }
+        render_recorded_expression(&argument.value)
+    }
+
+    fn substitute(&mut self) -> Result<RenderedExpression, LineageError> {
+        if self.substituted {
+            return Err(LineageError::new(
+                "one starting input cannot replace more than one lineage root",
+            ));
+        }
+        let input = self
+            .starting_input
+            .ok_or_else(|| LineageError::new("no starting input was supplied"))?;
+        self.substituted = true;
+        Ok(RenderedExpression {
+            text: format!("({input})"),
+            is_pipeline: false,
+        })
+    }
+
+    fn pin_non_primary(
+        &self,
+        invocation: &InvocationLineage,
+        primary: bool,
+        rendered: RenderedExpression,
+    ) -> RenderedExpression {
+        if primary {
+            rendered
+        } else {
+            RenderedExpression {
+                text: format!("({})#{}", rendered.text, invocation.recipe_id),
+                is_pipeline: false,
+            }
+        }
+    }
+}
+
+fn render_source_expression(source: &SourceLineage) -> Result<RenderedExpression, LineageError> {
+    let source_id = source.source_id.ok_or_else(|| {
+        LineageError::new(format!(
+            "source {:?} was never observed and has no Source ID",
+            source.locator
+        ))
+    })?;
+    Ok(RenderedExpression {
+        text: format!(
+            "read(asset({}))#{source_id}",
+            string_literal(&source.locator)?
+        ),
+        is_pipeline: false,
+    })
+}
+
+fn render_recorded_expression(value: &RecordedValue) -> Result<RenderedExpression, LineageError> {
+    let text = match value {
+        RecordedValue::Null => "null".to_owned(),
+        RecordedValue::Bool(value) => value.to_string(),
+        RecordedValue::Integer(value) if *value >= 0 => value.to_string(),
+        RecordedValue::Integer(value) => {
+            return Err(LineageError::new(format!(
+                "recorded negative integer {value} is not expressible without unary negation"
+            )));
+        }
+        RecordedValue::Float(value) => float_literal(*value)?,
+        RecordedValue::String(value) => string_literal(value)?,
+        RecordedValue::Source { locator, source_id } => {
+            format!("read(asset({}))#{source_id}", string_literal(locator)?)
+        }
+        RecordedValue::Materialized { kind, content_id } => {
+            return Err(LineageError::new(format!(
+                "recorded {kind} argument {content_id} has no reconstructable lineage; supply --input when it is the primary input"
+            )));
+        }
+    };
+    Ok(RenderedExpression {
+        text,
+        is_pipeline: false,
+    })
+}
+
+fn string_literal(value: &str) -> Result<String, LineageError> {
+    let mut literal = String::with_capacity(value.len() + 2);
+    literal.push('"');
+    for character in value.chars() {
+        match character {
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            character if character.is_control() => {
+                return Err(LineageError::new(format!(
+                    "recorded string contains unsupported control character U+{:04X}",
+                    character as u32
+                )));
+            }
+            character => literal.push(character),
+        }
+    }
+    literal.push('"');
+    Ok(literal)
+}
+
+fn float_literal(value: f32) -> Result<String, LineageError> {
+    if !value.is_finite() || value.is_sign_negative() {
+        return Err(LineageError::new(format!(
+            "recorded float {value} is not expressible as a Tima float literal"
+        )));
+    }
+    for precision in 1..=149 {
+        let candidate = format!("{value:.precision$}");
+        if candidate
+            .parse::<f64>()
+            .is_ok_and(|parsed| (parsed as f32).to_bits() == value.to_bits())
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(LineageError::new(format!(
+        "recorded float {value} has no exact Tima decimal representation"
+    )))
 }
 
 /// Selects the identity that represents an outer value in recipes and
@@ -375,6 +637,41 @@ mod tests {
     use super::*;
     use crate::runtime::{ImageValue, ValueData};
 
+    fn example_recipe_lineage(locator: &str) -> Lineage {
+        let compiled = crate::compile(
+            "test.tima",
+            "transform decode(value: BytesView) -> BytesView { return value }\n\
+             transform encode(value: BytesView, quality: i64) -> BytesView { return value }\n",
+        )
+        .unwrap();
+        let source = Lineage::observed_source(
+            locator,
+            crate::identity::byte_content_identity(b"source bytes"),
+        );
+        let source_value = OuterValue::plain(ValueData::Bytes(Arc::new(b"source bytes".to_vec())))
+            .with_lineage(source);
+        let decoded = Lineage::invocation(
+            "decode",
+            compiled.identities.get(crate::ir::TransformId(0)),
+            vec![LineageArgument::record("value", &source_value).unwrap()],
+            vec![],
+        )
+        .unwrap();
+        let decoded_value = OuterValue::plain(ValueData::Bytes(Arc::new(b"decoded".to_vec())))
+            .with_lineage(decoded);
+        Lineage::invocation(
+            "encode",
+            compiled.identities.get(crate::ir::TransformId(1)),
+            vec![
+                LineageArgument::record("value", &decoded_value).unwrap(),
+                LineageArgument::record("quality", &OuterValue::plain(ValueData::Integer(85)))
+                    .unwrap(),
+            ],
+            vec![],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn trace_renders_shared_sources_before_their_invocation() {
         let input = OuterValue::image(ImageValue::new(1, 1, 1, vec![7]).unwrap());
@@ -435,5 +732,159 @@ mod tests {
         };
         assert_eq!(first.recipe_id, second.recipe_id);
         assert_eq!(first.observations.len(), 1);
+    }
+
+    #[test]
+    fn recipe_expression_reconstructs_and_pins_a_linear_outer_pipeline() {
+        let lineage = example_recipe_lineage("assets/cat \"one\".bin");
+        let expression = lineage.outer_expression(None).unwrap();
+        let LineageNode::Invocation(root) = lineage.node() else {
+            unreachable!()
+        };
+        let LineageNode::Invocation(decoded) = root.arguments[0]
+            .lineage
+            .as_ref()
+            .expect("encoded value has decode lineage")
+            .node()
+        else {
+            unreachable!()
+        };
+        let LineageNode::Source(source) = decoded.arguments[0]
+            .lineage
+            .as_ref()
+            .expect("decoded value has source lineage")
+            .node()
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            expression,
+            format!(
+                "(read(asset(\"assets/cat \\\"one\\\".bin\"))#{} | decode#{} | encode#{}(85))#{}",
+                source.source_id.unwrap(),
+                decoded.transform_id,
+                root.transform_id,
+                root.recipe_id
+            )
+        );
+    }
+
+    #[test]
+    fn recipe_expression_can_replace_the_primary_starting_input() {
+        let lineage = example_recipe_lineage("cat.bin");
+        let expression = lineage
+            .outer_expression(Some("asset(\"dog.bin\") | read"))
+            .unwrap();
+        let LineageNode::Invocation(root) = lineage.node() else {
+            unreachable!()
+        };
+        let LineageNode::Invocation(decoded) = root.arguments[0]
+            .lineage
+            .as_ref()
+            .expect("encoded value has decode lineage")
+            .node()
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            expression,
+            format!(
+                "(asset(\"dog.bin\") | read) | decode#{} | encode#{}(85)",
+                decoded.transform_id, root.transform_id
+            )
+        );
+        assert!(!expression.contains(&root.recipe_id.to_string()));
+        assert!(!expression.contains("cat.bin"));
+    }
+
+    #[test]
+    fn recipe_expression_requires_one_outer_expression_as_replacement() {
+        let lineage = example_recipe_lineage("cat.bin");
+        let error = lineage.outer_expression(Some("value = 1")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exactly one Tima outer expression")
+        );
+
+        let error = lineage.outer_expression(Some("first\nsecond")).unwrap_err();
+        assert!(error.to_string().contains("one-line"));
+    }
+
+    #[test]
+    fn recipe_expression_replaces_only_the_primary_branch() {
+        let primary = example_recipe_lineage("primary.bin");
+        let secondary = example_recipe_lineage("secondary.bin");
+        let secondary_recipe = secondary.recipe_id().unwrap();
+        let primary_value =
+            OuterValue::plain(ValueData::Bytes(Arc::new(vec![1]))).with_lineage(primary);
+        let secondary_value =
+            OuterValue::plain(ValueData::Bytes(Arc::new(vec![2]))).with_lineage(secondary);
+        let compiled = crate::compile(
+            "combine.tima",
+            "transform combine(left: BytesView, right: BytesView) -> BytesView { return left }\n",
+        )
+        .unwrap();
+        let combined = Lineage::invocation(
+            "combine",
+            compiled.identities.get(crate::ir::TransformId(0)),
+            vec![
+                LineageArgument::record("left", &primary_value).unwrap(),
+                LineageArgument::record("right", &secondary_value).unwrap(),
+            ],
+            vec![],
+        )
+        .unwrap();
+
+        let expression = combined.outer_expression(Some("replacement")).unwrap();
+        assert!(expression.starts_with("(replacement) | "));
+        assert!(!expression.contains("primary.bin"));
+        assert!(expression.contains("secondary.bin"));
+        assert!(expression.contains(&secondary_recipe.to_string()));
+        assert!(expression.contains("combine#"));
+    }
+
+    #[test]
+    fn recipe_expression_requires_lineage_for_materialized_arguments() {
+        let compiled = crate::compile(
+            "keep.tima",
+            "transform keep(value: BytesView) -> BytesView { return value }\n",
+        )
+        .unwrap();
+        let bytes = OuterValue::plain(ValueData::Bytes(Arc::new(vec![1, 2, 3])));
+        let lineage = Lineage::invocation(
+            "keep",
+            compiled.identities.get(crate::ir::TransformId(0)),
+            vec![LineageArgument::record("value", &bytes).unwrap()],
+            vec![],
+        )
+        .unwrap();
+
+        let error = lineage.outer_expression(None).unwrap_err();
+        assert!(error.to_string().contains("no reconstructable lineage"));
+        assert_eq!(
+            lineage.outer_expression(Some("input")).unwrap(),
+            format!(
+                "(input) | keep#{}",
+                compiled.identities.get(crate::ir::TransformId(0))
+            )
+        );
+    }
+
+    #[test]
+    fn recipe_expression_float_literals_round_trip_exactly() {
+        for value in [0.0_f32, 0.8, f32::MIN_POSITIVE, f32::MAX] {
+            let literal = float_literal(value).unwrap();
+            assert!(literal.contains('.'));
+            assert_eq!(
+                literal.parse::<f64>().unwrap() as f32,
+                value,
+                "literal was {literal}"
+            );
+        }
+        assert!(float_literal(-0.5).is_err());
+        assert!(float_literal(f32::NAN).is_err());
     }
 }
