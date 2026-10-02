@@ -399,7 +399,7 @@ fn render_recorded_expression(value: &RecordedValue) -> Result<RenderedExpressio
                 "recorded negative integer {value} is not expressible without unary negation"
             )));
         }
-        RecordedValue::Float(value) => float_literal(*value)?,
+        RecordedValue::Float(value) => float_literal(*value),
         RecordedValue::String(value) => string_literal(value)?,
         RecordedValue::Source { locator, source_id } => {
             format!("read(asset({}))#{source_id}", string_literal(locator)?)
@@ -439,24 +439,19 @@ fn string_literal(value: &str) -> Result<String, LineageError> {
     Ok(literal)
 }
 
-fn float_literal(value: f32) -> Result<String, LineageError> {
-    if !value.is_finite() || value.is_sign_negative() {
-        return Err(LineageError::new(format!(
-            "recorded float {value} is not expressible as a Tima float literal"
-        )));
-    }
-    for precision in 1..=149 {
-        let candidate = format!("{value:.precision$}");
-        if candidate
-            .parse::<f64>()
-            .is_ok_and(|parsed| (parsed as f32).to_bits() == value.to_bits())
-        {
-            return Ok(candidate);
+fn float_literal(value: f32) -> String {
+    if value.is_finite() && !value.is_sign_negative() {
+        for precision in 1..=149 {
+            let candidate = format!("{value:.precision$}");
+            if candidate
+                .parse::<f64>()
+                .is_ok_and(|parsed| (parsed as f32).to_bits() == value.to_bits())
+            {
+                return candidate;
+            }
         }
     }
-    Err(LineageError::new(format!(
-        "recorded float {value} has no exact Tima decimal representation"
-    )))
+    format!("f32.from_bits({})", value.to_bits())
 }
 
 /// Selects the identity that represents an outer value in recipes and
@@ -874,17 +869,58 @@ mod tests {
     }
 
     #[test]
-    fn recipe_expression_float_literals_round_trip_exactly() {
-        for value in [0.0_f32, 0.8, f32::MIN_POSITIVE, f32::MAX] {
-            let literal = float_literal(value).unwrap();
-            assert!(literal.contains('.'));
-            assert_eq!(
-                literal.parse::<f64>().unwrap() as f32,
-                value,
-                "literal was {literal}"
-            );
+    fn recipe_expression_float_values_round_trip_through_tima_bits() {
+        let mut patterns = vec![
+            0,
+            0x8000_0000,
+            1,
+            0x8000_0001,
+            f32::MIN_POSITIVE.to_bits(),
+            (-f32::MIN_POSITIVE).to_bits(),
+            f32::MAX.to_bits(),
+            (-f32::MAX).to_bits(),
+            f32::INFINITY.to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+            f32::NAN.to_bits(),
+            0x7f80_0001,
+            0xffc0_1234,
+        ];
+        for exponent in 0_u32..=255 {
+            for mantissa in [0, 1, 0x003f_ffff, 0x007f_fffe, 0x007f_ffff] {
+                let magnitude = (exponent << 23) | mantissa;
+                patterns.push(magnitude);
+                patterns.push(magnitude | 0x8000_0000);
+            }
         }
-        assert!(float_literal(-0.5).is_err());
-        assert!(float_literal(f32::NAN).is_err());
+        let mut random = 0x6d2b_79f5_u32;
+        for _ in 0..2048 {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            patterns.push(random);
+        }
+        patterns.sort_unstable();
+        patterns.dedup();
+
+        let expressions = patterns
+            .iter()
+            .map(|bits| float_literal(f32::from_bits(*bits)))
+            .collect::<Vec<_>>();
+        assert_eq!(float_literal(0.8), "0.8");
+        assert_eq!(float_literal(-0.0), "f32.from_bits(2147483648)");
+        let compiled = crate::compile(
+            "float-roundtrip.tima",
+            format!("out = [{}]\n", expressions.join(", ")),
+        )
+        .unwrap();
+        let execution = crate::runtime::execute(&compiled).unwrap();
+        let ValueData::List(values) = &execution.bindings["out"].data else {
+            panic!("expected generated float list")
+        };
+        assert_eq!(values.len(), patterns.len());
+        for (value, expected) in values.iter().zip(patterns) {
+            let ValueData::Float(value) = &value.data else {
+                panic!("expected generated f32")
+            };
+            assert_eq!(value.to_bits(), expected);
+        }
     }
 }

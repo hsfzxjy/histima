@@ -1289,6 +1289,15 @@ impl Interpreter<'_, '_, '_> {
             }
             return self.asset(evaluated, span);
         }
+        if name == "f32.from_bits" {
+            if asserted {
+                return Err(Diagnostic::error(
+                    "outer builtins cannot use semantic identity assertions",
+                    callee_expression.span,
+                ));
+            }
+            return self.f32_from_bits(evaluated, span);
+        }
         if name == "read" {
             if asserted {
                 return Err(Diagnostic::error(
@@ -1437,6 +1446,30 @@ impl Interpreter<'_, '_, '_> {
             locator: locator.clone(),
         })))
         .with_lineage(Lineage::source(locator, None)))
+    }
+
+    fn f32_from_bits(
+        &self,
+        arguments: Vec<(Option<String>, OuterValue, Span)>,
+        span: Span,
+    ) -> Result<OuterValue, Diagnostic> {
+        let mut arguments = order_outer_arguments("f32.from_bits", &["bits"], arguments, span)?;
+        let (argument, argument_span) = arguments
+            .pop()
+            .expect("f32.from_bits has one normalized argument");
+        let ValueData::Integer(bits) = argument.data else {
+            return Err(Diagnostic::error(
+                "f32.from_bits expects an integer bit pattern",
+                argument_span,
+            ));
+        };
+        let bits = u32::try_from(bits).map_err(|_| {
+            Diagnostic::error(
+                "f32.from_bits requires an integer in the range 0..=4294967295",
+                argument_span,
+            )
+        })?;
+        Ok(OuterValue::plain(ValueData::Float(f32::from_bits(bits))))
     }
 
     fn read(
@@ -2605,6 +2638,33 @@ mod tests {
         .unwrap();
         let execution = execute(&compiled).unwrap();
         assert_eq!(execution.bindings["out"].data, ValueData::Float(2.0));
+    }
+
+    #[test]
+    fn outer_f32_from_bits_preserves_every_bit_in_special_values() {
+        let compiled = crate::compile(
+            "float-bits.tima",
+            "negative_zero = f32.from_bits(2147483648)\n\
+             payload_nan = f32.from_bits(2143294004)\n",
+        )
+        .unwrap();
+        let execution = execute(&compiled).unwrap();
+        let ValueData::Float(negative_zero) = execution.bindings["negative_zero"].data else {
+            panic!("expected f32")
+        };
+        let ValueData::Float(payload_nan) = execution.bindings["payload_nan"].data else {
+            panic!("expected f32")
+        };
+        assert_eq!(negative_zero.to_bits(), 0x8000_0000);
+        assert_eq!(payload_nan.to_bits(), 0x7fc0_1234);
+
+        let compiled = crate::compile(
+            "invalid-float-bits.tima",
+            "out = f32.from_bits(4294967296)\n",
+        )
+        .unwrap();
+        let diagnostics = execute(&compiled).unwrap_err();
+        assert!(diagnostics[0].message.contains("0..=4294967295"));
     }
 
     #[test]

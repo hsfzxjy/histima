@@ -105,7 +105,9 @@ back to `histima pipeline` when all transforms are registered. Add `--input
 <tima-expression>` to replace the primary starting input; the generated source
 then omits the old Source/Recipe assertions and represents a new derivation.
 Source-defined transforms still need their declarations when the expression is
-embedded in a Tima file.
+embedded in a Tima file. Recorded `f32` arguments round-trip bit exactly;
+ordinary values remain decimal while exceptional representations use the
+outer-only `f32.from_bits(...)` constructor.
 
 ## A small Tima program
 

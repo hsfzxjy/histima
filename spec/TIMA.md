@@ -320,6 +320,14 @@ Lineage is recorded at source and transform boundaries.
 
 ### 6.3 Outer builtins
 
+#### `f32.from_bits(bits)`
+
+`f32.from_bits` accepts one integer in `0..=4294967295` and returns the `f32`
+with that exact IEEE-754 bit pattern. It is an outer-only representation
+primitive used when a value such as negative zero, infinity, or a particular
+NaN payload cannot be written with Tima's decimal float-literal grammar. It
+performs no numeric conversion.
+
 #### `asset(locator)`
 
 `asset` accepts exactly one string, optionally named `path` or `locator`, and
@@ -900,6 +908,10 @@ queried derivation or fails an identity assertion. A recorded materialized
 argument without reconstructable lineage cannot be emitted as source text.
 Arguments remain positional because parameter names are not part of semantic
 Transform identity and may change without changing a Transform ID.
+Finite non-negative floats use an exactly round-tripping decimal literal.
+Every other `f32` bit pattern uses `f32.from_bits`, so recipe-expression
+generation preserves negative values, signed zero, infinities, subnormals, and
+NaN payloads bit for bit.
 
 `--input <tima-expression>` replaces the deepest value on the primary
 first-argument chain. The supplied text must itself be exactly one one-line
