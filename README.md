@@ -13,6 +13,8 @@ The repository currently provides:
 - statically checked transforms lowered to backend-neutral typed Tima IR;
 - a production typed-IR interpreter with owned mutable inner values,
   read-only aliasable views, and freeze-on-return;
+- one call/lineage/replay path for source Tima, standard, and registered-Wasm
+  transforms, also exposed to Rust hosts as `runtime::invoke_transform`;
 - a capability-controlled `World` boundary for observable external state;
 - a SQLite catalog at `.histima.sql3` plus a filesystem content-addressed
   store for durable assets, lineage, recipes, and results;

@@ -19,12 +19,16 @@ use crate::identity::{
     ContentIdentity, IdentityDomain, IdentityPrefixResolver, SemanticValueIdentity,
     TransformIdentity, content_identity,
 };
-use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueId, ValueKind};
+use crate::ir::{
+    Constant, RuntimeCall, Terminator, Transform, TransformId, Type, ValueId, ValueKind,
+};
 use crate::lineage::{
     Lineage, LineageArgument, LineageNode, RecordedValue, semantic_value_identity,
 };
-use crate::plugin::{PluginTransform, prepare_plugin_invocation};
-use crate::registered::{RegisteredTransform, prepare_registered_invocation};
+use crate::plugin::{PluginTransform, PreparedPluginInvocation, prepare_plugin_invocation};
+use crate::registered::{
+    PreparedRegisteredInvocation, RegisteredTransform, prepare_registered_invocation,
+};
 use crate::source::Span;
 use crate::{CompiledProgram, available_transform_identities};
 
@@ -254,6 +258,62 @@ pub fn execute(program: &CompiledProgram) -> Result<Execution, Vec<Diagnostic>> 
     execute_with(program, &engine, BTreeMap::new(), None, None)
 }
 
+/// Invokes any named transform through the same positional Rust interface used
+/// by outer Tima calls. The name may resolve to source-defined Tima IR, a
+/// standard transform, or a configured registered-Wasm transform.
+pub fn invoke_transform(
+    program: &CompiledProgram,
+    name: &str,
+    arguments: Vec<OuterValue>,
+) -> Result<OuterValue, Diagnostic> {
+    let engine = IrInterpreter {
+        module: &program.transforms,
+        capabilities: None,
+    };
+    invoke_transform_with_engine(program, &engine, name, arguments)
+}
+
+/// Equivalent to [`invoke_transform`], with an explicit World for a
+/// source-defined transform that declares runtime capabilities.
+pub fn invoke_transform_with_capabilities(
+    program: &CompiledProgram,
+    name: &str,
+    arguments: Vec<OuterValue>,
+    capabilities: &dyn World,
+) -> Result<OuterValue, Diagnostic> {
+    let engine = IrInterpreter {
+        module: &program.transforms,
+        capabilities: Some(capabilities),
+    };
+    invoke_transform_with_engine(program, &engine, name, arguments)
+}
+
+fn invoke_transform_with_engine(
+    program: &CompiledProgram,
+    engine: &dyn TransformEngine,
+    name: &str,
+    arguments: Vec<OuterValue>,
+) -> Result<OuterValue, Diagnostic> {
+    let span = Span::default();
+    let transform = CallableTransform::find(program, name)
+        .ok_or_else(|| Diagnostic::error(format!("unknown transform `{name}`"), span))?;
+    let parameters = (0..transform.parameter_count())
+        .map(|index| transform.parameter_name(index))
+        .collect::<Vec<_>>();
+    let evaluated = arguments
+        .into_iter()
+        .map(|argument| (None, argument, span))
+        .collect::<Vec<_>>();
+    let arguments = order_outer_arguments_with_defaults(
+        transform.name(),
+        &parameters,
+        evaluated,
+        span,
+        |index| transform.default_argument(index),
+    )?;
+    invoke_transform_with_lineage(engine, transform, arguments, None, span)
+}
+
 pub fn execute_cached(
     program: &CompiledProgram,
     cache: &mut dyn ResultCache,
@@ -441,63 +501,228 @@ struct TransformOutcome {
     observations: Vec<Lineage>,
 }
 
-fn invoke_transform_with_lineage<'cache>(
-    program: &CompiledProgram,
-    engine: &dyn TransformEngine,
-    id: TransformId,
-    arguments: Vec<(OuterValue, Span)>,
-    mut cache: Option<&mut (dyn ResultCache + 'cache)>,
-) -> Result<OuterValue, Diagnostic> {
-    let transform = program.transforms.get(id);
-    let recorded = transform
-        .parameters
+#[derive(Clone, Copy)]
+enum CallableTransform<'a> {
+    Tima {
+        id: TransformId,
+        definition: &'a Transform,
+        identity: TransformIdentity,
+    },
+    Builtin(&'static RegisteredTransform),
+    Wasm(&'a PluginTransform),
+}
+
+impl<'a> CallableTransform<'a> {
+    fn find(program: &'a CompiledProgram, name: &str) -> Option<Self> {
+        program
+            .transforms
+            .find(name)
+            .map(|(id, definition)| Self::Tima {
+                id,
+                definition,
+                identity: program.identities.get(id),
+            })
+            .or_else(|| RegisteredTransform::find(name).map(Self::Builtin))
+            .or_else(|| program.plugins.find(name).map(Self::Wasm))
+    }
+
+    fn from_identity(program: &'a CompiledProgram, identity: TransformIdentity) -> Option<Self> {
+        program
+            .identities
+            .find_id(identity)
+            .map(|id| Self::Tima {
+                id,
+                definition: program.transforms.get(id),
+                identity,
+            })
+            .or_else(|| RegisteredTransform::from_identity(identity).map(Self::Builtin))
+            .or_else(|| program.plugins.find_by_identity(identity).map(Self::Wasm))
+    }
+
+    fn name(self) -> &'a str {
+        match self {
+            Self::Tima { definition, .. } => definition.name.as_str(),
+            Self::Builtin(transform) => transform.name(),
+            Self::Wasm(transform) => transform.name(),
+        }
+    }
+
+    fn identity(self) -> TransformIdentity {
+        match self {
+            Self::Tima { identity, .. } => identity,
+            Self::Builtin(transform) => transform.identity(),
+            Self::Wasm(transform) => transform.identity(),
+        }
+    }
+
+    fn parameter_count(self) -> usize {
+        match self {
+            Self::Tima { definition, .. } => definition.parameters.len(),
+            Self::Builtin(transform) => transform.parameters().len(),
+            Self::Wasm(transform) => transform.parameters().len(),
+        }
+    }
+
+    fn parameter_name(self, index: usize) -> &'a str {
+        match self {
+            Self::Tima { definition, .. } => definition.parameters[index].name.as_str(),
+            Self::Builtin(transform) => transform.parameters()[index].name,
+            Self::Wasm(transform) => transform.parameters()[index].name.as_str(),
+        }
+    }
+
+    fn default_argument(self, index: usize) -> Option<OuterValue> {
+        match self {
+            Self::Builtin(transform) => transform.default_argument(index),
+            Self::Tima { .. } | Self::Wasm(_) => None,
+        }
+    }
+
+    fn diagnostic_span(self, call_span: Span) -> Span {
+        match self {
+            Self::Tima { definition, .. } => definition.span,
+            Self::Builtin(_) | Self::Wasm(_) => call_span,
+        }
+    }
+
+    fn may_observe_dependencies(self, engine: &dyn TransformEngine) -> bool {
+        match self {
+            Self::Tima { id, .. } => engine.may_observe_dependencies(id),
+            Self::Builtin(_) | Self::Wasm(_) => false,
+        }
+    }
+
+    fn prepare(
+        self,
+        arguments: Vec<(OuterValue, Span)>,
+        span: Span,
+    ) -> Result<PreparedTransformInvocation<'a>, Diagnostic> {
+        match self {
+            Self::Tima { id, .. } => {
+                if arguments.len() != self.parameter_count() {
+                    return Err(Diagnostic::error(
+                        format!(
+                            "{} expects exactly {} arguments",
+                            self.name(),
+                            self.parameter_count()
+                        ),
+                        span,
+                    ));
+                }
+                Ok(PreparedTransformInvocation::Tima { id, arguments })
+            }
+            Self::Builtin(transform) => prepare_registered_invocation(transform, arguments, span)
+                .map(PreparedTransformInvocation::Builtin),
+            Self::Wasm(transform) => prepare_plugin_invocation(transform, arguments, span)
+                .map(PreparedTransformInvocation::Wasm),
+        }
+    }
+}
+
+enum PreparedTransformInvocation<'a> {
+    Tima {
+        id: TransformId,
+        arguments: Vec<(OuterValue, Span)>,
+    },
+    Builtin(PreparedRegisteredInvocation),
+    Wasm(PreparedPluginInvocation<'a>),
+}
+
+impl PreparedTransformInvocation<'_> {
+    fn arguments(&self) -> &[(OuterValue, Span)] {
+        match self {
+            Self::Tima { arguments, .. } => arguments,
+            Self::Builtin(prepared) => &prepared.arguments,
+            Self::Wasm(prepared) => &prepared.arguments,
+        }
+    }
+
+    fn execute(self, engine: &dyn TransformEngine) -> Result<TransformOutcome, Diagnostic> {
+        match self {
+            Self::Tima { id, arguments } => engine.invoke(id, arguments),
+            Self::Builtin(prepared) => Ok(TransformOutcome {
+                value: prepared.execute()?,
+                observations: vec![],
+            }),
+            Self::Wasm(prepared) => Ok(TransformOutcome {
+                value: prepared.execute()?,
+                observations: vec![],
+            }),
+        }
+    }
+}
+
+fn record_transform_arguments(
+    transform: CallableTransform<'_>,
+    arguments: &[(OuterValue, Span)],
+) -> Result<Vec<LineageArgument>, Diagnostic> {
+    arguments
         .iter()
-        .zip(&arguments)
-        .map(|(parameter, (argument, span))| {
-            LineageArgument::record(parameter.name.as_str(), argument).map_err(|error| {
+        .enumerate()
+        .map(|(index, (argument, span))| {
+            let name = transform.parameter_name(index);
+            LineageArgument::record(name, argument).map_err(|error| {
                 Diagnostic::error(
-                    format!(
-                        "cannot record argument `{}` for transform lineage: {error}",
-                        parameter.name
-                    ),
+                    format!("cannot record argument `{name}` for transform lineage: {error}"),
                     *span,
                 )
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(cache) = cache.as_deref_mut() {
-        for (recorded, (argument, span)) in recorded.iter().zip(&arguments) {
-            let RecordedValue::Materialized { content_id, .. } = recorded.value else {
-                continue;
-            };
-            let remembered = cache
-                .remember(argument)
-                .map_err(|error| Diagnostic::error(error.to_string(), *span))?;
-            if remembered != content_id {
-                return Err(Diagnostic::error(
-                    format!(
-                        "recorded argument content identity {content_id} does not match stored content {remembered}"
-                    ),
-                    *span,
-                ));
-            }
+        .collect()
+}
+
+fn remember_materialized_arguments(
+    cache: &mut dyn ResultCache,
+    recorded: &[LineageArgument],
+    arguments: &[(OuterValue, Span)],
+) -> Result<(), Diagnostic> {
+    for (recorded, (argument, span)) in recorded.iter().zip(arguments) {
+        let RecordedValue::Materialized { content_id, .. } = recorded.value else {
+            continue;
+        };
+        let remembered = cache
+            .remember(argument)
+            .map_err(|error| Diagnostic::error(error.to_string(), *span))?;
+        if remembered != content_id {
+            return Err(Diagnostic::error(
+                format!(
+                    "recorded argument content identity {content_id} does not match stored content {remembered}"
+                ),
+                *span,
+            ));
         }
     }
-    if !engine.may_observe_dependencies(id) {
+    Ok(())
+}
+
+fn invoke_transform_with_lineage<'cache>(
+    engine: &dyn TransformEngine,
+    transform: CallableTransform<'_>,
+    arguments: Vec<(OuterValue, Span)>,
+    mut cache: Option<&mut (dyn ResultCache + 'cache)>,
+    span: Span,
+) -> Result<OuterValue, Diagnostic> {
+    let diagnostic_span = transform.diagnostic_span(span);
+    let prepared = transform.prepare(arguments, span)?;
+    let recorded = record_transform_arguments(transform, prepared.arguments())?;
+    if let Some(cache) = cache.as_deref_mut() {
+        remember_materialized_arguments(cache, &recorded, prepared.arguments())?;
+    }
+    if !transform.may_observe_dependencies(engine) {
         let lineage = Lineage::invocation(
-            transform.name.as_str(),
-            program.identities.get(id),
+            transform.name(),
+            transform.identity(),
             recorded.clone(),
             vec![],
         )
-        .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
+        .map_err(|error| Diagnostic::error(error.to_string(), diagnostic_span))?;
         let recipe = lineage
             .recipe_id()
             .expect("invocation lineage always has a recipe identity");
         if let Some(cache) = cache.as_deref_mut()
             && let Some(mut value) = cache
                 .lookup(recipe)
-                .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?
+                .map_err(|error| Diagnostic::error(error.to_string(), diagnostic_span))?
         {
             value.lineage = Some(lineage);
             return Ok(value);
@@ -506,14 +731,14 @@ fn invoke_transform_with_lineage<'cache>(
     let TransformOutcome {
         mut value,
         observations,
-    } = engine.invoke(id, arguments)?;
+    } = prepared.execute(engine)?;
     let lineage = Lineage::invocation(
-        transform.name.as_str(),
-        program.identities.get(id),
+        transform.name(),
+        transform.identity(),
         recorded,
         observations,
     )
-    .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
+    .map_err(|error| Diagnostic::error(error.to_string(), diagnostic_span))?;
     if let Some(cache) = cache {
         cache
             .store(
@@ -522,131 +747,7 @@ fn invoke_transform_with_lineage<'cache>(
                     .expect("invocation lineage always has a recipe identity"),
                 &value,
             )
-            .map_err(|error| Diagnostic::error(error.to_string(), transform.span))?;
-    }
-    value.lineage = Some(lineage);
-    Ok(value)
-}
-
-fn invoke_registered_transform_with_lineage<'cache>(
-    transform: &'static RegisteredTransform,
-    arguments: Vec<(OuterValue, Span)>,
-    mut cache: Option<&mut (dyn ResultCache + 'cache)>,
-    span: Span,
-) -> Result<OuterValue, Diagnostic> {
-    let prepared = prepare_registered_invocation(transform, arguments, span)?;
-    let recorded = transform
-        .parameters()
-        .iter()
-        .zip(&prepared.arguments)
-        .map(|(parameter, (argument, argument_span))| {
-            LineageArgument::record(parameter.name, argument).map_err(|error| {
-                Diagnostic::error(
-                    format!(
-                        "cannot record argument `{}` for registered transform lineage: {error}",
-                        parameter.name
-                    ),
-                    *argument_span,
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(cache) = cache.as_deref_mut() {
-        for (recorded, (argument, argument_span)) in recorded.iter().zip(&prepared.arguments) {
-            let RecordedValue::Materialized { content_id, .. } = recorded.value else {
-                continue;
-            };
-            let remembered = cache
-                .remember(argument)
-                .map_err(|error| Diagnostic::error(error.to_string(), *argument_span))?;
-            if remembered != content_id {
-                return Err(Diagnostic::error(
-                    "recorded registered-transform argument does not match stored content",
-                    *argument_span,
-                ));
-            }
-        }
-    }
-    let lineage = Lineage::invocation(transform.name(), transform.identity(), recorded, vec![])
-        .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-    let recipe = lineage
-        .recipe_id()
-        .expect("registered invocation lineage has a recipe identity");
-    if let Some(cache) = cache.as_deref_mut()
-        && let Some(mut value) = cache
-            .lookup(recipe)
-            .map_err(|error| Diagnostic::error(error.to_string(), span))?
-    {
-        value.lineage = Some(lineage);
-        return Ok(value);
-    }
-    let mut value = prepared.execute()?;
-    if let Some(cache) = cache {
-        cache
-            .store(recipe, &value)
-            .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-    }
-    value.lineage = Some(lineage);
-    Ok(value)
-}
-
-fn invoke_plugin_transform_with_lineage<'cache>(
-    transform: &PluginTransform,
-    arguments: Vec<(OuterValue, Span)>,
-    mut cache: Option<&mut (dyn ResultCache + 'cache)>,
-    span: Span,
-) -> Result<OuterValue, Diagnostic> {
-    let prepared = prepare_plugin_invocation(transform, arguments, span)?;
-    let recorded = transform
-        .parameters()
-        .iter()
-        .zip(&prepared.arguments)
-        .map(|(parameter, (argument, argument_span))| {
-            LineageArgument::record(parameter.name.as_str(), argument).map_err(|error| {
-                Diagnostic::error(
-                    format!(
-                        "cannot record argument `{}` for plugin transform lineage: {error}",
-                        parameter.name
-                    ),
-                    *argument_span,
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(cache) = cache.as_deref_mut() {
-        for (recorded, (argument, argument_span)) in recorded.iter().zip(&prepared.arguments) {
-            let RecordedValue::Materialized { content_id, .. } = recorded.value else {
-                continue;
-            };
-            let remembered = cache
-                .remember(argument)
-                .map_err(|error| Diagnostic::error(error.to_string(), *argument_span))?;
-            if remembered != content_id {
-                return Err(Diagnostic::error(
-                    "recorded plugin-transform argument does not match stored content",
-                    *argument_span,
-                ));
-            }
-        }
-    }
-    let lineage = Lineage::invocation(transform.name(), transform.identity(), recorded, vec![])
-        .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-    let recipe = lineage
-        .recipe_id()
-        .expect("plugin invocation lineage has a recipe identity");
-    if let Some(cache) = cache.as_deref_mut()
-        && let Some(mut value) = cache
-            .lookup(recipe)
-            .map_err(|error| Diagnostic::error(error.to_string(), span))?
-    {
-        value.lineage = Some(lineage);
-        return Ok(value);
-    }
-    let mut value = prepared.execute()?;
-    if let Some(cache) = cache {
-        cache
-            .store(recipe, &value)
-            .map_err(|error| Diagnostic::error(error.to_string(), span))?;
+            .map_err(|error| Diagnostic::error(error.to_string(), diagnostic_span))?;
     }
     value.lineage = Some(lineage);
     Ok(value)
@@ -684,27 +785,13 @@ fn replay_with(
     )
 }
 
-#[derive(Clone, Copy)]
-enum ReplayTransform<'a> {
-    Inner(TransformId),
-    Registered(&'static RegisteredTransform),
-    Plugin(&'a PluginTransform),
-}
-
 fn resolve_replay_transform<'a>(
     program: &'a CompiledProgram,
     invocation: &crate::lineage::InvocationLineage,
     span: Span,
-) -> Result<ReplayTransform<'a>, Diagnostic> {
-    let replay_transform = if let Some(transform_id) =
-        program.identities.find_id(invocation.transform_id)
-    {
-        ReplayTransform::Inner(transform_id)
-    } else if let Some(registered) = RegisteredTransform::from_identity(invocation.transform_id) {
-        ReplayTransform::Registered(registered)
-    } else if let Some(plugin) = program.plugins.find_by_identity(invocation.transform_id) {
-        ReplayTransform::Plugin(plugin)
-    } else {
+) -> Result<CallableTransform<'a>, Diagnostic> {
+    let Some(replay_transform) = CallableTransform::from_identity(program, invocation.transform_id)
+    else {
         return Err(Diagnostic::error(
             format!(
                 "recorded transform definition {} is unavailable or has changed",
@@ -713,16 +800,8 @@ fn resolve_replay_transform<'a>(
             span,
         ));
     };
-    let (transform_name, parameter_count) = match replay_transform {
-        ReplayTransform::Inner(id) => {
-            let transform = program.transforms.get(id);
-            (transform.name.as_str(), transform.parameters.len())
-        }
-        ReplayTransform::Registered(registered) => {
-            (registered.name(), registered.parameters().len())
-        }
-        ReplayTransform::Plugin(plugin) => (plugin.name(), plugin.parameters().len()),
-    };
+    let transform_name = replay_transform.name();
+    let parameter_count = replay_transform.parameter_count();
     if parameter_count != invocation.arguments.len() {
         return Err(Diagnostic::error(
             format!(
@@ -788,54 +867,19 @@ fn replay_lineage(
         .into_iter()
         .map(|argument| (argument, span))
         .collect::<Vec<_>>();
-    let (mut value, observed_lineage) = match replay_transform {
-        ReplayTransform::Inner(transform_id) => {
-            let transform = program.transforms.get(transform_id);
-            let TransformOutcome {
-                value,
-                observations,
-            } = engine.invoke(transform_id, runtime_arguments)?;
-            let lineage = Lineage::invocation(
-                transform.name.as_str(),
-                program.identities.get(transform_id),
-                invocation.arguments.to_vec(),
-                observations,
-            )
-            .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-            (value, lineage)
-        }
-        ReplayTransform::Registered(registered) => {
-            let prepared = prepare_registered_invocation(registered, runtime_arguments, span)?;
-            let arguments = registered
-                .parameters()
-                .iter()
-                .zip(&prepared.arguments)
-                .map(|(parameter, (value, argument_span))| {
-                    LineageArgument::record(parameter.name, value)
-                        .map_err(|error| Diagnostic::error(error.to_string(), *argument_span))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let lineage =
-                Lineage::invocation(registered.name(), registered.identity(), arguments, vec![])
-                    .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-            (prepared.execute()?, lineage)
-        }
-        ReplayTransform::Plugin(plugin) => {
-            let prepared = prepare_plugin_invocation(plugin, runtime_arguments, span)?;
-            let arguments = plugin
-                .parameters()
-                .iter()
-                .zip(&prepared.arguments)
-                .map(|(parameter, (value, argument_span))| {
-                    LineageArgument::record(parameter.name.as_str(), value)
-                        .map_err(|error| Diagnostic::error(error.to_string(), *argument_span))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let lineage = Lineage::invocation(plugin.name(), plugin.identity(), arguments, vec![])
-                .map_err(|error| Diagnostic::error(error.to_string(), span))?;
-            (prepared.execute()?, lineage)
-        }
-    };
+    let prepared = replay_transform.prepare(runtime_arguments, span)?;
+    let recorded = record_transform_arguments(replay_transform, prepared.arguments())?;
+    let TransformOutcome {
+        mut value,
+        observations,
+    } = prepared.execute(engine)?;
+    let observed_lineage = Lineage::invocation(
+        replay_transform.name(),
+        replay_transform.identity(),
+        recorded,
+        observations,
+    )
+    .map_err(|error| Diagnostic::error(error.to_string(), span))?;
     let observed_recipe = observed_lineage
         .recipe_id()
         .expect("invocation lineage always has a recipe identity");
@@ -1342,17 +1386,7 @@ impl Interpreter<'_, '_, '_, '_> {
     }
 
     fn transform_identity(&self, name: &str) -> Option<TransformIdentity> {
-        self.program
-            .transforms
-            .find(name)
-            .map(|(id, _)| self.program.identities.get(id))
-            .or_else(|| RegisteredTransform::find(name).map(RegisteredTransform::identity))
-            .or_else(|| {
-                self.program
-                    .plugins
-                    .find(name)
-                    .map(PluginTransform::identity)
-            })
+        CallableTransform::find(self.program, name).map(CallableTransform::identity)
     }
 
     fn call(
@@ -1462,67 +1496,31 @@ impl Interpreter<'_, '_, '_, '_> {
             }
             return self.save(evaluated, span);
         }
-        if let Some(registered) = RegisteredTransform::find(&name) {
-            let parameters = registered
-                .parameters()
-                .iter()
-                .map(|parameter| parameter.name)
-                .collect::<Vec<_>>();
-            let arguments = order_outer_arguments_with_defaults(
-                registered.name(),
-                &parameters,
-                evaluated,
-                span,
-                |index| registered.default_argument(index),
-            )?;
-            return invoke_registered_transform_with_lineage(
-                registered,
-                arguments,
-                match &mut self.cache {
-                    Some(cache) => Some(&mut **cache),
-                    None => None,
-                },
-                span,
-            );
-        }
-        if let Some(plugin) = self.program.plugins.find(&name) {
-            let parameters = plugin
-                .parameters()
-                .iter()
-                .map(|parameter| parameter.name.as_str())
-                .collect::<Vec<_>>();
-            let arguments = order_outer_arguments(plugin.name(), &parameters, evaluated, span)?;
-            return invoke_plugin_transform_with_lineage(
-                plugin,
-                arguments,
-                match &mut self.cache {
-                    Some(cache) => Some(&mut **cache),
-                    None => None,
-                },
-                span,
-            );
-        }
-        let Some((id, transform)) = self.program.transforms.find(&name) else {
+        let Some(transform) = CallableTransform::find(self.program, &name) else {
             return Err(Diagnostic::error(
                 format!("unknown outer callable `{name}`"),
                 callee_expression.span,
             ));
         };
-        let parameters = transform
-            .parameters
-            .iter()
-            .map(|parameter| parameter.name.as_str())
+        let parameters = (0..transform.parameter_count())
+            .map(|index| transform.parameter_name(index))
             .collect::<Vec<_>>();
-        let values = order_outer_arguments(&transform.name, &parameters, evaluated, span)?;
+        let arguments = order_outer_arguments_with_defaults(
+            transform.name(),
+            &parameters,
+            evaluated,
+            span,
+            |index| transform.default_argument(index),
+        )?;
         invoke_transform_with_lineage(
-            self.program,
             self.engine,
-            id,
-            values,
+            transform,
+            arguments,
             match &mut self.cache {
                 Some(cache) => Some(&mut **cache),
                 None => None,
             },
+            span,
         )
     }
 
@@ -2666,12 +2664,13 @@ mod tests {
     };
     use crate::ir::TransformId;
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
+    use crate::plugin::{PluginDefinition, PluginParameter, PluginRegistry, PluginValueType};
     use crate::runtime::{
         BufferValue, HybridAotEngine, IrInterpreter, OuterValue, ReplayDependencyResolver,
         TransformEngine, ValueData, execute, execute_aot_cached_with_capabilities, execute_cached,
         execute_cached_with_capabilities, execute_cached_with_capabilities_and_identity_prefixes,
-        execute_with, execute_with_capabilities, freeze_interpreted_value, lower_interpreted_value,
-        replay, replay_with_capabilities, replay_with_dependencies,
+        execute_with, execute_with_capabilities, freeze_interpreted_value, invoke_transform,
+        lower_interpreted_value, replay, replay_with_capabilities, replay_with_dependencies,
     };
     use crate::source::Span;
 
@@ -2775,6 +2774,53 @@ mod tests {
         .unwrap();
         let execution = execute(&compiled).unwrap();
         assert_eq!(execution.bindings["out"].data, ValueData::Float(2.0));
+    }
+
+    #[test]
+    fn rust_invocation_dispatches_tima_builtin_and_workspace_wasm_transforms() {
+        let module = include_bytes!("../../../plugins/ppm-decode/ppm_decode.wasm").to_vec();
+        let plugins = PluginRegistry::new([PluginDefinition {
+            name: "fixture.decode".to_owned(),
+            semantic_version: 1,
+            abi_version: crate::registered_wasm::PLUGIN_ABI_VERSION,
+            parameters: vec![PluginParameter {
+                name: "bytes".to_owned(),
+                value_type: PluginValueType::Bytes,
+            }],
+            result: PluginValueType::Buffer,
+            expected_module_content: byte_content_identity(&module),
+            module_bytes: module,
+        }])
+        .unwrap();
+        let program = crate::compile_with_plugins(
+            "invoke.tima",
+            "transform echo(value: i64) -> i64 { return value }\n",
+            Arc::new(plugins),
+        )
+        .unwrap();
+
+        let echoed = invoke_transform(
+            &program,
+            "echo",
+            vec![OuterValue::plain(ValueData::Integer(7))],
+        )
+        .unwrap();
+        assert_eq!(echoed.data, ValueData::Integer(7));
+
+        let bytes = OuterValue::plain(ValueData::Bytes(Arc::new(
+            b"P3\n1 1\n255\n2 4 8\n".to_vec(),
+        )));
+        let builtin = invoke_transform(&program, "ppm.decode", vec![bytes.clone()]).unwrap();
+        let wasm = invoke_transform(&program, "fixture.decode", vec![bytes]).unwrap();
+        assert_eq!(builtin.data, wasm.data);
+        assert!(matches!(
+            builtin.lineage.as_ref().map(Lineage::node),
+            Some(LineageNode::Invocation(invocation)) if invocation.transform_name.as_ref() == "ppm.decode"
+        ));
+        assert!(matches!(
+            wasm.lineage.as_ref().map(Lineage::node),
+            Some(LineageNode::Invocation(invocation)) if invocation.transform_name.as_ref() == "fixture.decode"
+        ));
     }
 
     #[test]

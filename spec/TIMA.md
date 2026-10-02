@@ -445,6 +445,20 @@ and parameter names must be unique in their respective scopes. The names
 `environment_i64`, `buffer_zero`, and `buffer_fill` are reserved inner runtime
 operations.
 
+Source-defined Tima transforms, standard transforms, and workspace
+registered-Wasm transforms are one callable concept at the outer-language
+boundary. They use the same call and pipeline syntax, argument association,
+semantic identity assertions, invocation lineage, Recipe cache, and replay
+path. Their implementation kind affects execution and Artifact identity, not
+the meaning of a call.
+
+Rust hosts may invoke any of those transform kinds positionally through
+`tima::runtime::invoke_transform`. The
+`invoke_transform_with_capabilities` variant supplies an explicit World for
+source-defined transforms that declare capabilities. This direct interface
+applies standard default arguments and attaches the same invocation lineage as
+an outer Tima call; it does not implicitly provide a result cache.
+
 ### 7.1 Types
 
 The implemented inner types are:
