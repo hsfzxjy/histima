@@ -5,12 +5,11 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::abi::{ABI_IMAGE_FORMAT_OPAQUE_BYTES, ABI_IMAGE_FORMAT_RGBA8};
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::cache::CachedArtifact;
 use crate::backend::native::{
-    NativeArgument, NativeBuffer, NativeBufferView, NativeImage, NativeImageView, NativeModule,
-    NativeResult, NativeScalar as AbiScalar,
+    NativeArgument, NativeBuffer, NativeBufferView, NativeModule, NativeResult,
+    NativeScalar as AbiScalar,
 };
 use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
@@ -47,8 +46,8 @@ impl OuterValue {
         }
     }
 
-    pub fn image(image: ImageValue) -> Self {
-        Self::plain(ValueData::Image(Arc::new(image)))
+    pub fn buffer(buffer: BufferValue) -> Self {
+        Self::plain(ValueData::Buffer(Arc::new(buffer)))
     }
 
     pub fn with_lineage(mut self, lineage: Lineage) -> Self {
@@ -69,7 +68,7 @@ pub enum ValueData {
     List(Arc<[OuterValue]>),
     Record(Arc<BTreeMap<String, OuterValue>>),
     Asset(Arc<AssetValue>),
-    Image(Arc<ImageValue>),
+    Buffer(Arc<BufferValue>),
     Transform(TransformId),
     Lineage(Lineage),
 }
@@ -82,9 +81,9 @@ pub struct AssetValue {
 }
 
 #[derive(Clone, Debug)]
-struct ImageStorage(Arc<Vec<u8>>);
+struct BufferStorage(Arc<Vec<u8>>);
 
-impl ImageStorage {
+impl BufferStorage {
     fn new(bytes: Vec<u8>) -> Self {
         Self(Arc::new(bytes))
     }
@@ -106,104 +105,48 @@ impl ImageStorage {
     }
 }
 
-impl PartialEq for ImageStorage {
+impl PartialEq for BufferStorage {
     fn eq(&self, other: &Self) -> bool {
         self.0.as_slice() == other.0.as_slice()
     }
 }
 
-impl Eq for ImageStorage {}
+impl Eq for BufferStorage {}
 
-/// The semantic layout of an image's byte storage.
+/// Immutable outer shaped byte buffer backed by shareable storage.
 ///
-/// Opaque byte images preserve the initial runtime behavior and may be used by
-/// byte-oriented transforms. RGBA8 is the first pixel-addressable layout: four
-/// interleaved 8-bit channels per pixel, in red, green, blue, alpha order.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ImageFormat {
-    OpaqueBytes = ABI_IMAGE_FORMAT_OPAQUE_BYTES,
-    Rgba8 = ABI_IMAGE_FORMAT_RGBA8,
-}
-
-impl ImageFormat {
-    pub(crate) const fn abi_tag(self) -> u32 {
-        self as u32
-    }
-}
-
-impl fmt::Display for ImageFormat {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OpaqueBytes => formatter.write_str("opaque-bytes"),
-            Self::Rgba8 => formatter.write_str("rgba8"),
-        }
-    }
-}
-
-/// Immutable outer image descriptor backed by shareable byte storage.
-///
-/// `width` and `height` are logical dimensions, while `stride` is the backing
-/// byte count per row. The explicit format controls any pixel interpretation.
+/// Version zero admits one through three dimensions. Elements are bytes, inner
+/// dimensions are dense, and `outer_stride` permits padding between slices of
+/// the first dimension. Raster interpretation belongs to codec contracts, not
+/// to Tima's value model.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageValue {
-    storage: Arc<ImageStorage>,
-    format: ImageFormat,
-    width: usize,
-    height: usize,
-    stride: usize,
+pub struct BufferValue {
+    storage: Arc<BufferStorage>,
+    shape: Arc<[usize]>,
+    outer_stride: usize,
 }
 
-impl ImageValue {
+impl BufferValue {
     pub fn new(
-        width: usize,
-        height: usize,
-        stride: usize,
+        shape: impl Into<Arc<[usize]>>,
+        outer_stride: usize,
         bytes: Vec<u8>,
-    ) -> Result<Self, ImageLayoutError> {
-        Self::with_format(ImageFormat::OpaqueBytes, width, height, stride, bytes)
-    }
-
-    pub fn new_rgba8(
-        width: usize,
-        height: usize,
-        stride: usize,
-        bytes: Vec<u8>,
-    ) -> Result<Self, ImageLayoutError> {
-        Self::with_format(ImageFormat::Rgba8, width, height, stride, bytes)
-    }
-
-    fn with_format(
-        format: ImageFormat,
-        width: usize,
-        height: usize,
-        stride: usize,
-        bytes: Vec<u8>,
-    ) -> Result<Self, ImageLayoutError> {
-        validate_image_layout(format, width, height, stride, bytes.len())?;
+    ) -> Result<Self, BufferLayoutError> {
+        let shape = shape.into();
+        validate_buffer_layout(&shape, outer_stride, bytes.len())?;
         Ok(Self {
-            storage: Arc::new(ImageStorage::new(bytes)),
-            format,
-            width,
-            height,
-            stride,
+            storage: Arc::new(BufferStorage::new(bytes)),
+            shape,
+            outer_stride,
         })
     }
 
-    pub fn format(&self) -> ImageFormat {
-        self.format
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
     }
 
-    pub fn width(&self) -> usize {
-        self.width
-    }
-
-    pub fn height(&self) -> usize {
-        self.height
-    }
-
-    pub fn stride(&self) -> usize {
-        self.stride
+    pub fn outer_stride(&self) -> usize {
+        self.outer_stride
     }
 
     pub fn byte_len(&self) -> usize {
@@ -212,10 +155,6 @@ impl ImageValue {
 
     pub fn with_bytes<R>(&self, operation: impl FnOnce(&[u8]) -> R) -> R {
         self.storage.with_bytes(operation)
-    }
-
-    fn byte_slice(&self) -> &[u8] {
-        self.storage.0.as_slice()
     }
 
     pub fn to_vec(&self) -> Vec<u8> {
@@ -233,44 +172,62 @@ impl ImageValue {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageLayoutError {
+pub struct BufferLayoutError {
     message: String,
 }
 
-impl fmt::Display for ImageLayoutError {
+impl fmt::Display for BufferLayoutError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
     }
 }
 
-impl Error for ImageLayoutError {}
+impl Error for BufferLayoutError {}
 
-fn validate_image_layout(
-    format: ImageFormat,
-    width: usize,
-    height: usize,
-    stride: usize,
+fn validate_buffer_layout(
+    shape: &[usize],
+    outer_stride: usize,
     byte_len: usize,
-) -> Result<(), ImageLayoutError> {
-    if format == ImageFormat::Rgba8 {
-        let minimum_stride = width.checked_mul(4).ok_or_else(|| ImageLayoutError {
-            message: "RGBA8 row byte length overflows usize".to_owned(),
-        })?;
-        if stride < minimum_stride {
-            return Err(ImageLayoutError {
-                message: format!(
-                    "RGBA8 image stride {stride} is smaller than width {width} times 4 ({minimum_stride})"
-                ),
-            });
-        }
+) -> Result<(), BufferLayoutError> {
+    if !(1..=3).contains(&shape.len()) {
+        return Err(BufferLayoutError {
+            message: "buffer rank must be from 1 through 3".to_owned(),
+        });
     }
-    let expected = height.checked_mul(stride).ok_or_else(|| ImageLayoutError {
-        message: "image byte length overflows usize".to_owned(),
-    })?;
-    if byte_len != expected {
-        return Err(ImageLayoutError {
+    let dense_inner = shape[1..]
+        .iter()
+        .try_fold(1_usize, |product, dimension| {
+            product.checked_mul(*dimension)
+        })
+        .ok_or_else(|| BufferLayoutError {
+            message: "buffer inner dimensions overflow usize".to_owned(),
+        })?;
+    let (outer, minimum_stride) = if shape.len() == 1 {
+        (1, shape[0])
+    } else {
+        (shape[0], dense_inner)
+    };
+    if outer_stride < minimum_stride {
+        return Err(BufferLayoutError {
             message: format!(
-                "image storage has {byte_len} bytes, but height {height} and stride {stride} require {expected}"
+                "buffer outer stride {outer_stride} is smaller than dense inner length {minimum_stride}"
+            ),
+        });
+    }
+    if shape.len() == 1 && outer_stride != minimum_stride {
+        return Err(BufferLayoutError {
+            message: "rank-1 buffer outer stride must equal its length".to_owned(),
+        });
+    }
+    let expected = outer
+        .checked_mul(outer_stride)
+        .ok_or_else(|| BufferLayoutError {
+            message: "buffer byte length overflows usize".to_owned(),
+        })?;
+    if byte_len != expected {
+        return Err(BufferLayoutError {
+            message: format!(
+                "buffer storage has {byte_len} bytes, but shape {shape:?} and outer stride {outer_stride} require {expected}"
             ),
         });
     }
@@ -2083,8 +2040,8 @@ enum InterpretedValue {
     StringView(Arc<String>),
     Bytes(Vec<u8>),
     BytesView(Arc<Vec<u8>>),
-    Image(InterpretedImage),
-    ImageView(Arc<ImageValue>),
+    Buffer(InterpretedBuffer),
+    BufferView(Arc<BufferValue>),
 }
 
 impl InterpretedValue {
@@ -2095,8 +2052,8 @@ impl InterpretedValue {
             | Self::StringView(_)
             | Self::Bytes(_)
             | Self::BytesView(_)
-            | Self::Image(_)
-            | Self::ImageView(_) => {
+            | Self::Buffer(_)
+            | Self::BufferView(_) => {
                 unreachable!("typed scalar operation received a composite value")
             }
         }
@@ -2111,12 +2068,10 @@ impl InterpretedValue {
     }
 }
 
-struct InterpretedImage {
+struct InterpretedBuffer {
     storage: Vec<u8>,
-    format: ImageFormat,
-    width: usize,
-    height: usize,
-    stride: usize,
+    shape: Arc<[usize]>,
+    outer_stride: usize,
 }
 
 struct IrInterpreter<'a> {
@@ -2135,8 +2090,6 @@ enum PreparedNativeArgument {
     StringView(Arc<String>),
     Bytes(NativeBuffer),
     BytesView(Arc<Vec<u8>>),
-    Image(NativeImage),
-    ImageView(Arc<ImageValue>),
 }
 
 impl TransformEngine for HybridAotEngine<'_> {
@@ -2171,16 +2124,6 @@ impl TransformEngine for HybridAotEngine<'_> {
                 PreparedNativeArgument::BytesView(value) => {
                     NativeArgument::BytesView(NativeBufferView {
                         bytes: value.as_slice(),
-                    })
-                }
-                PreparedNativeArgument::Image(image) => NativeArgument::Image(image),
-                PreparedNativeArgument::ImageView(image) => {
-                    NativeArgument::ImageView(NativeImageView {
-                        bytes: image.byte_slice(),
-                        format: image.format().abi_tag(),
-                        width: image.width(),
-                        height: image.height(),
-                        stride: image.stride(),
                     })
                 }
             })
@@ -2235,21 +2178,6 @@ impl TransformEngine for HybridAotEngine<'_> {
                 };
                 OuterValue::plain(ValueData::Bytes(value.clone()))
             }
-            NativeResult::OwnedImageArgument(index) => {
-                let PreparedNativeArgument::Image(image) = std::mem::replace(
-                    &mut prepared[index],
-                    PreparedNativeArgument::Scalar(AbiScalar::Bool(false)),
-                ) else {
-                    unreachable!("native owned image result identifies an owned image argument")
-                };
-                freeze_native_image(image)
-            }
-            NativeResult::ImageViewArgument(index) => {
-                let PreparedNativeArgument::ImageView(image) = &prepared[index] else {
-                    unreachable!("native image view result identifies a view argument")
-                };
-                OuterValue::plain(ValueData::Image(image.clone()))
-            }
         };
         Ok(TransformOutcome {
             value,
@@ -2295,28 +2223,6 @@ fn prepare_native_argument(
             Ok(PreparedNativeArgument::Bytes(NativeBuffer { bytes }))
         }
         (Type::BytesView, ValueData::Bytes(value)) => Ok(PreparedNativeArgument::BytesView(value)),
-        (Type::Image, ValueData::Image(image)) => {
-            let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
-            let ImageValue {
-                storage,
-                format,
-                width,
-                height,
-                stride,
-            } = image;
-            let bytes = match Arc::try_unwrap(storage) {
-                Ok(storage) => storage.into_vec(),
-                Err(shared) => shared.to_vec(),
-            };
-            Ok(PreparedNativeArgument::Image(NativeImage {
-                bytes,
-                format: format.abi_tag(),
-                width,
-                height,
-                stride,
-            }))
-        }
-        (Type::ImageView, ValueData::Image(image)) => Ok(PreparedNativeArgument::ImageView(image)),
         (expected, _) => Err(Diagnostic::error(
             format!(
                 "outer value cannot cross into native parameter type {}",
@@ -2332,21 +2238,6 @@ fn freeze_native_string(buffer: NativeBuffer, span: Span) -> Result<OuterValue, 
         Diagnostic::error("native transform returned invalid UTF-8 for String", span)
     })?;
     Ok(OuterValue::plain(ValueData::String(Arc::new(value))))
-}
-
-fn freeze_native_image(image: NativeImage) -> OuterValue {
-    let format = match image.format {
-        ABI_IMAGE_FORMAT_OPAQUE_BYTES => ImageFormat::OpaqueBytes,
-        ABI_IMAGE_FORMAT_RGBA8 => ImageFormat::Rgba8,
-        _ => unreachable!("native image descriptors preserve validated input metadata"),
-    };
-    OuterValue::image(ImageValue {
-        storage: Arc::new(ImageStorage::new(image.bytes)),
-        format,
-        width: image.width,
-        height: image.height,
-        stride: image.stride,
-    })
 }
 
 impl IrInterpreter<'_> {
@@ -2428,7 +2319,7 @@ impl IrInterpreter<'_> {
     ) -> Result<InterpretedValue, Diagnostic> {
         let value = transform.value(id);
         Ok(match &value.kind {
-            ValueKind::Parameter { .. } | ValueKind::ImageByteElement => unreachable!(),
+            ValueKind::Parameter { .. } | ValueKind::BufferByteElement => unreachable!(),
             ValueKind::Constant(constant) => match constant {
                 Constant::Bool(value) => InterpretedValue::Scalar(NativeScalar::Bool(*value)),
                 Constant::I64(value) => InterpretedValue::Scalar(NativeScalar::I64(*value)),
@@ -2458,39 +2349,42 @@ impl IrInterpreter<'_> {
                     .collect();
                 self.invoke_lowered_at_depth(*callee, call_arguments, depth + 1, capabilities)?
             }
-            ValueKind::ImageZero { image } => {
-                let Some(InterpretedValue::Image(mut image)) = values[image.0 as usize].take()
+            ValueKind::BufferZero { buffer } => {
+                let Some(InterpretedValue::Buffer(mut buffer)) = values[buffer.0 as usize].take()
                 else {
-                    unreachable!("typed image_zero input is an available owned image")
+                    unreachable!("typed buffer_zero input is an available owned buffer")
                 };
-                image.storage.fill(0);
-                InterpretedValue::Image(image)
+                buffer.storage.fill(0);
+                InterpretedValue::Buffer(buffer)
             }
-            ValueKind::ImageFill { image, value: fill } => {
+            ValueKind::BufferFill {
+                buffer,
+                value: fill,
+            } => {
                 let NativeScalar::U8(fill) = values[fill.0 as usize].as_ref().unwrap().scalar()
                 else {
-                    unreachable!("typed image_fill value is u8")
+                    unreachable!("typed buffer_fill value is u8")
                 };
-                let Some(InterpretedValue::Image(mut image)) = values[image.0 as usize].take()
+                let Some(InterpretedValue::Buffer(mut buffer)) = values[buffer.0 as usize].take()
                 else {
-                    unreachable!("typed image_fill input is an available owned image")
+                    unreachable!("typed buffer_fill input is an available owned buffer")
                 };
-                image.storage.fill(fill);
-                InterpretedValue::Image(image)
+                buffer.storage.fill(fill);
+                InterpretedValue::Buffer(buffer)
             }
-            ValueKind::ImageByteMap {
-                image,
+            ValueKind::BufferByteMap {
+                buffer,
                 element,
                 instructions,
                 result,
             } => {
-                let Some(InterpretedValue::Image(mut image)) = values[image.0 as usize].take()
+                let Some(InterpretedValue::Buffer(mut buffer)) = values[buffer.0 as usize].take()
                 else {
-                    unreachable!("typed image byte map input is an available owned image")
+                    unreachable!("typed buffer byte map input is an available owned buffer")
                 };
-                for index in 0..image.storage.len() {
+                for index in 0..buffer.storage.len() {
                     values[element.0 as usize] = Some(InterpretedValue::Scalar(NativeScalar::U8(
-                        image.storage[index],
+                        buffer.storage[index],
                     )));
                     for instruction in instructions {
                         let evaluated = self.evaluate_instruction(
@@ -2505,40 +2399,11 @@ impl IrInterpreter<'_> {
                     let NativeScalar::U8(mapped) =
                         values[result.0 as usize].as_ref().unwrap().scalar()
                     else {
-                        unreachable!("typed image byte map result is u8")
+                        unreachable!("typed buffer byte map result is u8")
                     };
-                    image.storage[index] = mapped;
+                    buffer.storage[index] = mapped;
                 }
-                InterpretedValue::Image(image)
-            }
-            ValueKind::ImageRgba8Scale { image, channels } => {
-                let Some(InterpretedValue::Image(mut image)) = values[image.0 as usize].take()
-                else {
-                    unreachable!("typed RGBA8 scale input is an available owned image")
-                };
-                if image.format != ImageFormat::Rgba8 {
-                    return Err(Diagnostic::error(
-                        "image pixel iteration requires RGBA8 format",
-                        value.span,
-                    )
-                    .with_note(format!("received {} image storage", image.format)));
-                }
-                for y in 0..image.height {
-                    for x in 0..image.width {
-                        let pixel = y * image.stride + x * 4;
-                        for (channel, factor) in channels {
-                            let NativeScalar::F32(factor) =
-                                values[factor.0 as usize].as_ref().unwrap().scalar()
-                            else {
-                                unreachable!("typed RGBA8 scale factor is f32")
-                            };
-                            let offset = pixel + channel.offset();
-                            image.storage[offset] =
-                                scale_rgba8_channel(image.storage[offset], factor);
-                        }
-                    }
-                }
-                InterpretedValue::Image(image)
+                InterpretedValue::Buffer(buffer)
             }
             ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
                 InterpretedValue::Scalar(NativeScalar::I64(
@@ -2639,28 +2504,24 @@ fn lower_interpreted_value(
             Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone()),
         )),
         (Type::BytesView, ValueData::Bytes(value)) => Ok(InterpretedValue::BytesView(value)),
-        (Type::Image, ValueData::Image(image)) => {
-            let image = Arc::try_unwrap(image).unwrap_or_else(|shared| (*shared).clone());
-            let ImageValue {
+        (Type::Buffer, ValueData::Buffer(buffer)) => {
+            let buffer = Arc::try_unwrap(buffer).unwrap_or_else(|shared| (*shared).clone());
+            let BufferValue {
                 storage,
-                format,
-                width,
-                height,
-                stride,
-            } = image;
+                shape,
+                outer_stride,
+            } = buffer;
             let storage = match Arc::try_unwrap(storage) {
                 Ok(storage) => storage.into_vec(),
                 Err(shared) => shared.to_vec(),
             };
-            Ok(InterpretedValue::Image(InterpretedImage {
+            Ok(InterpretedValue::Buffer(InterpretedBuffer {
                 storage,
-                format,
-                width,
-                height,
-                stride,
+                shape,
+                outer_stride,
             }))
         }
-        (Type::ImageView, ValueData::Image(image)) => Ok(InterpretedValue::ImageView(image)),
+        (Type::BufferView, ValueData::Buffer(buffer)) => Ok(InterpretedValue::BufferView(buffer)),
         (expected, _) => Err(Diagnostic::error(
             format!(
                 "outer value cannot cross into native parameter type {}",
@@ -2699,10 +2560,10 @@ fn transfer_interpreted_argument(
                 .take()
                 .expect("owned inner argument remains available until transferred")
         }
-        (Type::ImageView, InterpretedValue::ImageView(image)) => {
-            InterpretedValue::ImageView(image.clone())
+        (Type::BufferView, InterpretedValue::BufferView(buffer)) => {
+            InterpretedValue::BufferView(buffer.clone())
         }
-        (Type::Image, InterpretedValue::Image(_)) => value
+        (Type::Buffer, InterpretedValue::Buffer(_)) => value
             .take()
             .expect("owned inner argument remains available until transferred"),
         _ => unreachable!("typed inner call arguments match their parameter types"),
@@ -2716,14 +2577,12 @@ fn freeze_interpreted_value(value: InterpretedValue) -> OuterValue {
         InterpretedValue::StringView(value) => OuterValue::plain(ValueData::String(value)),
         InterpretedValue::Bytes(value) => OuterValue::plain(ValueData::Bytes(Arc::new(value))),
         InterpretedValue::BytesView(value) => OuterValue::plain(ValueData::Bytes(value)),
-        InterpretedValue::Image(image) => OuterValue::image(ImageValue {
-            storage: Arc::new(ImageStorage::new(image.storage)),
-            format: image.format,
-            width: image.width,
-            height: image.height,
-            stride: image.stride,
+        InterpretedValue::Buffer(buffer) => OuterValue::buffer(BufferValue {
+            storage: Arc::new(BufferStorage::new(buffer.storage)),
+            shape: buffer.shape,
+            outer_stride: buffer.outer_stride,
         }),
-        InterpretedValue::ImageView(image) => OuterValue::plain(ValueData::Image(image)),
+        InterpretedValue::BufferView(buffer) => OuterValue::plain(ValueData::Buffer(buffer)),
     }
 }
 
@@ -2734,17 +2593,6 @@ fn freeze_scalar(value: NativeScalar) -> OuterValue {
         NativeScalar::I64(value) => ValueData::Integer(value),
         NativeScalar::F32(value) => ValueData::Float(value),
     })
-}
-
-fn scale_rgba8_channel(channel: u8, factor: f32) -> u8 {
-    let scaled = f32::from(channel) * factor;
-    if !matches!(scaled.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
-        0
-    } else if scaled >= 255.0 {
-        255
-    } else {
-        scaled as u8
-    }
 }
 
 fn native_binary(
@@ -2819,12 +2667,11 @@ mod tests {
     use crate::ir::TransformId;
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
-        HybridAotEngine, ImageFormat, ImageValue, IrInterpreter, OuterValue,
-        ReplayDependencyResolver, TransformEngine, ValueData, execute,
-        execute_aot_cached_with_capabilities, execute_cached, execute_cached_with_capabilities,
-        execute_cached_with_capabilities_and_identity_prefixes, execute_with,
-        execute_with_capabilities, freeze_interpreted_value, lower_interpreted_value, replay,
-        replay_with_capabilities, replay_with_dependencies, scale_rgba8_channel,
+        BufferValue, HybridAotEngine, IrInterpreter, OuterValue, ReplayDependencyResolver,
+        TransformEngine, ValueData, execute, execute_aot_cached_with_capabilities, execute_cached,
+        execute_cached_with_capabilities, execute_cached_with_capabilities_and_identity_prefixes,
+        execute_with, execute_with_capabilities, freeze_interpreted_value, lower_interpreted_value,
+        replay, replay_with_capabilities, replay_with_dependencies,
     };
     use crate::source::Span;
 
@@ -3760,46 +3607,37 @@ mod tests {
     }
 
     #[test]
-    fn rgba8_channel_scaling_saturates_and_truncates() {
-        assert_eq!(scale_rgba8_channel(101, 0.5), 50);
-        assert_eq!(scale_rgba8_channel(200, 2.0), 255);
-        assert_eq!(scale_rgba8_channel(200, -1.0), 0);
-        assert_eq!(scale_rgba8_channel(200, f32::NAN), 0);
-        assert_eq!(scale_rgba8_channel(1, f32::INFINITY), 255);
-    }
-
-    #[test]
-    fn unique_owned_image_storage_transfers_through_inner_calls_without_copying() {
+    fn unique_owned_buffer_storage_transfers_through_inner_calls_without_copying() {
         let compiled = crate::compile(
             "test.tima",
-            "transform own(img: Image) -> Image { return img }\n\
-             transform own_inner(img: Image) -> Image { return own(img) }\n",
+            "transform own(img: Buffer) -> Buffer { return img }\n\
+             transform own_inner(img: Buffer) -> Buffer { return own(img) }\n",
         )
         .unwrap();
         let interpreter = IrInterpreter {
             module: &compiled.transforms,
             capabilities: None,
         };
-        let image = ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap();
+        let buffer = BufferValue::new(vec![2, 2], 2, vec![1, 2, 3, 4]).unwrap();
         let result = interpreter
             .invoke(
                 crate::ir::TransformId(1),
-                vec![(OuterValue::image(image), Span::default())],
+                vec![(OuterValue::buffer(buffer), Span::default())],
             )
             .unwrap()
             .value;
-        let ValueData::Image(result) = result.data else {
-            panic!("expected image result")
+        let ValueData::Buffer(result) = result.data else {
+            panic!("expected Buffer result")
         };
         assert_eq!(result.bytes(), &[1, 2, 3, 4]);
     }
 
     #[test]
-    fn interpreted_owned_images_detach_while_views_alias() {
+    fn interpreted_owned_buffers_detach_while_views_alias() {
         let compiled = crate::compile(
             "test.tima",
-            "transform clear(img: Image) -> Image { return image_zero(img) }\n\
-             transform view(img: ImageView) -> ImageView { return img }\n\
+            "transform clear(img: Buffer) -> Buffer { return buffer_zero(img) }\n\
+             transform view(img: BufferView) -> BufferView { return img }\n\
              cleared = clear(img)\n\
              viewed = view(img)\n",
         )
@@ -3813,20 +3651,20 @@ mod tests {
             &engine,
             BTreeMap::from([(
                 "img".to_owned(),
-                OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap()),
+                OuterValue::buffer(BufferValue::new(vec![2, 2], 2, vec![1, 2, 3, 4]).unwrap()),
             )]),
             None,
             None,
         )
         .unwrap();
-        let ValueData::Image(original) = &execution.bindings["img"].data else {
-            panic!("expected original image")
+        let ValueData::Buffer(original) = &execution.bindings["img"].data else {
+            panic!("expected original Buffer")
         };
-        let ValueData::Image(cleared) = &execution.bindings["cleared"].data else {
-            panic!("expected owned result image")
+        let ValueData::Buffer(cleared) = &execution.bindings["cleared"].data else {
+            panic!("expected owned Buffer result")
         };
-        let ValueData::Image(viewed) = &execution.bindings["viewed"].data else {
-            panic!("expected image view")
+        let ValueData::Buffer(viewed) = &execution.bindings["viewed"].data else {
+            panic!("expected Buffer view")
         };
 
         assert_eq!(original.bytes(), &[1, 2, 3, 4]);
@@ -3836,58 +3674,7 @@ mod tests {
     }
 
     #[test]
-    fn native_owned_images_detach_while_views_alias() {
-        let compiled = crate::compile(
-            "native-images.tima",
-            "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n\
-             transform view(img: ImageView) -> ImageView { return img }\n\
-             filled = fill(img, 7)\n\
-             viewed = view(img)\n",
-        )
-        .unwrap();
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build")
-            .join(format!("native-image-runtime-{}", std::process::id()));
-        let native = NativeModule::build(&compiled.transforms, &compiled.identities, root)
-            .unwrap()
-            .unwrap();
-        let engine = HybridAotEngine {
-            interpreter: IrInterpreter {
-                module: &compiled.transforms,
-                capabilities: None,
-            },
-            native: Some(&native),
-        };
-        let execution = execute_with(
-            &compiled,
-            &engine,
-            BTreeMap::from([(
-                "img".to_owned(),
-                OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap()),
-            )]),
-            None,
-            None,
-        )
-        .unwrap();
-        let ValueData::Image(original) = &execution.bindings["img"].data else {
-            panic!("expected original image")
-        };
-        let ValueData::Image(filled) = &execution.bindings["filled"].data else {
-            panic!("expected owned result image")
-        };
-        let ValueData::Image(viewed) = &execution.bindings["viewed"].data else {
-            panic!("expected image view")
-        };
-
-        assert_eq!(original.bytes(), &[1, 2, 3, 4]);
-        assert_eq!(filled.bytes(), &[7, 7, 7, 7]);
-        assert!(!original.shares_storage_with(filled));
-        assert!(original.shares_storage_with(viewed));
-    }
-
-    #[test]
-    fn native_owned_buffers_detach_while_views_alias() {
+    fn native_owned_strings_and_bytes_detach_while_views_alias() {
         let compiled = crate::compile(
             "native-buffers.tima",
             "transform own_text(value: String) -> String { return value }\n\
@@ -3991,99 +3778,13 @@ mod tests {
     }
 
     #[test]
-    fn native_rgba8_scaling_matches_interpreted_semantics() {
+    fn hybrid_aot_falls_back_for_buffer_maps() {
         let compiled = crate::compile(
-            "native-rgba.tima",
-            "transform adjust(img: Image, r: f32, g: f32, b: f32, a: f32) -> Image {\n\
-                 for p in img.pixels {\n\
-                     p.r *= r\n\
-                     p.g *= g\n\
-                     p.b *= b\n\
-                     p.a *= a\n\
-                 }\n\
-                 return img\n\
-             }\n\
-             out = adjust(img, r, g, b, a)\n",
-        )
-        .unwrap();
-        let bindings = BTreeMap::from([
-            (
-                "img".to_owned(),
-                OuterValue::image(
-                    ImageValue::new_rgba8(
-                        2,
-                        2,
-                        10,
-                        vec![
-                            101, 200, 200, 1, 2, 3, 4, 5, 99, 100, 255, 10, 6, 10, 3, 4, 5, 6, 77,
-                            88,
-                        ],
-                    )
-                    .unwrap(),
-                ),
-            ),
-            ("r".to_owned(), OuterValue::plain(ValueData::Float(0.5))),
-            ("g".to_owned(), OuterValue::plain(ValueData::Float(2.0))),
-            ("b".to_owned(), OuterValue::plain(ValueData::Float(-1.0))),
-            (
-                "a".to_owned(),
-                OuterValue::plain(ValueData::Float(f32::INFINITY)),
-            ),
-        ]);
-        let interpreted = execute_with(
-            &compiled,
-            &IrInterpreter {
-                module: &compiled.transforms,
-                capabilities: None,
-            },
-            bindings.clone(),
-            None,
-            None,
-        )
-        .unwrap();
-
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build")
-            .join(format!("native-rgba-runtime-{}", std::process::id()));
-        let native = NativeModule::build(&compiled.transforms, &compiled.identities, root)
-            .unwrap()
-            .unwrap();
-        let native = execute_with(
-            &compiled,
-            &HybridAotEngine {
-                interpreter: IrInterpreter {
-                    module: &compiled.transforms,
-                    capabilities: None,
-                },
-                native: Some(&native),
-            },
-            bindings,
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(native.bindings["out"], interpreted.bindings["out"]);
-        let ValueData::Image(result) = &native.bindings["out"].data else {
-            panic!("expected native RGBA8 image")
-        };
-        assert_eq!(
-            result.bytes(),
-            &[
-                50, 255, 0, 255, 1, 6, 0, 255, 99, 100, 127, 20, 0, 255, 1, 8, 0, 255, 77, 88,
-            ]
-        );
-    }
-
-    #[test]
-    fn native_byte_map_calls_match_interpreted_semantics() {
-        let compiled = crate::compile(
-            "native-byte-map.tima",
+            "buffer-map-fallback.tima",
             "transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
                  if current == target { return replacement } else { return current }\n\
              }\n\
-             transform replace(img: Image, target: u8, replacement: u8) -> Image {\n\
+             transform replace(img: Buffer, target: u8, replacement: u8) -> Buffer {\n\
                  for byte in img.bytes { byte = choose(byte, target, replacement) }\n\
                  return img\n\
              }\n\
@@ -4093,7 +3794,9 @@ mod tests {
         let bindings = BTreeMap::from([
             (
                 "img".to_owned(),
-                OuterValue::image(ImageValue::new(3, 2, 4, vec![1, 2, 1, 8, 3, 1, 4, 1]).unwrap()),
+                OuterValue::buffer(
+                    BufferValue::new(vec![2, 3], 4, vec![1, 2, 1, 8, 3, 1, 4, 1]).unwrap(),
+                ),
             ),
             (
                 "target".to_owned(),
@@ -4119,7 +3822,10 @@ mod tests {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("build")
-            .join(format!("native-byte-map-runtime-{}", std::process::id()));
+            .join(format!(
+                "buffer-map-fallback-runtime-{}",
+                std::process::id()
+            ));
         let native_module = NativeModule::build(&compiled.transforms, &compiled.identities, root)
             .unwrap()
             .unwrap();
@@ -4139,24 +3845,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(native.bindings["out"], interpreted.bindings["out"]);
-        let ValueData::Image(original) = &native.bindings["img"].data else {
-            panic!("expected original byte image")
+        let ValueData::Buffer(original) = &native.bindings["img"].data else {
+            panic!("expected original Buffer")
         };
-        let ValueData::Image(result) = &native.bindings["out"].data else {
-            panic!("expected native byte-map image")
+        let ValueData::Buffer(result) = &native.bindings["out"].data else {
+            panic!("expected mapped Buffer")
         };
         assert_eq!(original.bytes(), &[1, 2, 1, 8, 3, 1, 4, 1]);
         assert_eq!(result.bytes(), &[9, 2, 9, 8, 3, 9, 4, 9]);
     }
 
     #[test]
-    fn validates_outer_image_layouts() {
-        let error = ImageValue::new(2, 2, 2, vec![0; 3]).unwrap_err();
+    fn validates_outer_buffer_layouts() {
+        let error = BufferValue::new(Vec::<usize>::new(), 0, Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("rank must be from 1 through 3"));
+        let error = BufferValue::new(vec![1, 1, 1, 1], 1, vec![0]).unwrap_err();
+        assert!(error.to_string().contains("rank must be from 1 through 3"));
+
+        let error = BufferValue::new(vec![2, 2], 2, vec![0; 3]).unwrap_err();
         assert!(error.to_string().contains("require 4"));
 
-        let rgba = ImageValue::new_rgba8(2, 1, 8, vec![0; 8]).unwrap();
-        assert_eq!(rgba.format(), ImageFormat::Rgba8);
-        let error = ImageValue::new_rgba8(2, 1, 7, vec![0; 7]).unwrap_err();
-        assert!(error.to_string().contains("width 2 times 4"));
+        let padded = BufferValue::new(vec![1, 2, 4], 10, vec![0; 10]).unwrap();
+        assert_eq!(padded.shape(), &[1, 2, 4]);
+        assert_eq!(padded.outer_stride(), 10);
+        let error = BufferValue::new(vec![1, 2, 4], 7, vec![0; 7]).unwrap_err();
+        assert!(error.to_string().contains("dense inner length 8"));
     }
 }

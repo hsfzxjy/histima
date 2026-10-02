@@ -486,13 +486,11 @@ fn outer_value(value: &OuterValue) -> Value {
         ValueData::Asset(asset) => {
             json!({"type": "asset", "locator": asset.locator.as_ref()})
         }
-        ValueData::Image(image) => json!({
-            "type": "image",
-            "format": image.format().to_string(),
-            "width": image.width(),
-            "height": image.height(),
-            "stride": image.stride(),
-            "byte_length": image.byte_len(),
+        ValueData::Buffer(buffer) => json!({
+            "type": "buffer",
+            "shape": buffer.shape(),
+            "outer_stride": buffer.outer_stride(),
+            "byte_length": buffer.byte_len(),
         }),
         ValueData::Transform(id) => json!({"type": "transform", "index": id.0}),
         ValueData::Lineage(lineage) => json!({"type": "lineage", "trace": lineage.render()}),

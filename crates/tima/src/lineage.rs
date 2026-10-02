@@ -510,8 +510,8 @@ impl LineageArgument {
                 kind: "record",
                 content_id: content_identity(value)?,
             },
-            ValueData::Image(_) => RecordedValue::Materialized {
-                kind: "image",
+            ValueData::Buffer(_) => RecordedValue::Materialized {
+                kind: "buffer",
                 content_id: content_identity(value)?,
             },
             ValueData::Asset(asset) => {
@@ -656,7 +656,7 @@ impl fmt::Display for RecordedValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{ImageValue, ValueData};
+    use crate::runtime::{BufferValue, ValueData};
 
     fn example_recipe_lineage(locator: &str) -> Lineage {
         let compiled = crate::compile(
@@ -695,14 +695,14 @@ mod tests {
 
     #[test]
     fn trace_renders_shared_sources_before_their_invocation() {
-        let input = OuterValue::image(ImageValue::new(1, 1, 1, vec![7]).unwrap());
+        let input = OuterValue::buffer(BufferValue::new(vec![1], 1, vec![7]).unwrap());
         let content = content_identity(&input).unwrap();
         let source = Lineage::observed_source("cat.raw", content);
         let input = input.with_lineage(source);
         let argument = LineageArgument::record("value", &input).unwrap();
         let compiled = crate::compile(
             "test.tima",
-            "transform keep(value: ImageView) -> ImageView { return value }\n",
+            "transform keep(value: BufferView) -> BufferView { return value }\n",
         )
         .unwrap();
         let invocation = Lineage::invocation(

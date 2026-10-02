@@ -340,39 +340,30 @@ impl TransformIdentityResolver<'_> {
                         hasher.u32(argument.0);
                     }
                 }
-                ValueKind::ImageZero { image } => {
+                ValueKind::BufferZero { buffer } => {
                     hasher.u8(5);
-                    hasher.u32(image.0);
+                    hasher.u32(buffer.0);
                 }
-                ValueKind::ImageFill { image, value } => {
+                ValueKind::BufferFill { buffer, value } => {
                     hasher.u8(6);
-                    hasher.u32(image.0);
+                    hasher.u32(buffer.0);
                     hasher.u32(value.0);
                 }
-                ValueKind::ImageByteElement => hasher.u8(7),
-                ValueKind::ImageByteMap {
-                    image,
+                ValueKind::BufferByteElement => hasher.u8(7),
+                ValueKind::BufferByteMap {
+                    buffer,
                     element,
                     instructions,
                     result,
                 } => {
                     hasher.u8(8);
-                    hasher.u32(image.0);
+                    hasher.u32(buffer.0);
                     hasher.u32(element.0);
                     hasher.u32(instructions.len() as u32);
                     for instruction in instructions {
                         hasher.u32(instruction.0);
                     }
                     hasher.u32(result.0);
-                }
-                ValueKind::ImageRgba8Scale { image, channels } => {
-                    hasher.u8(9);
-                    hasher.u32(image.0);
-                    hasher.u32(channels.len() as u32);
-                    for (channel, factor) in channels {
-                        hasher.u8(channel.offset() as u8);
-                        hasher.u32(factor.0);
-                    }
                 }
                 ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
                     hasher.u8(4);
@@ -484,13 +475,17 @@ fn encode_outer_value(
                 hasher.raw(content_identity(value)?.as_bytes());
             }
         }
-        ValueData::Image(image) => {
-            hasher.u8(7);
-            hasher.u32(image.format().abi_tag());
-            hasher.u64(image.width() as u64);
-            hasher.u64(image.height() as u64);
-            hasher.u64(image.stride() as u64);
-            image.with_bytes(|bytes| hasher.bytes(bytes));
+        ValueData::Buffer(buffer) => {
+            // Buffer replaced the former image-specific value contract. Use a
+            // fresh canonical tag so old Image content cannot be mistaken for
+            // the new generic shaped byte value.
+            hasher.u8(10);
+            hasher.u64(buffer.shape().len() as u64);
+            for dimension in buffer.shape() {
+                hasher.u64(*dimension as u64);
+            }
+            hasher.u64(buffer.outer_stride() as u64);
+            buffer.with_bytes(|bytes| hasher.bytes(bytes));
         }
         ValueData::Asset(asset) => {
             return Err(IdentityError::unavailable(format!(
@@ -672,8 +667,10 @@ fn encode_type(hasher: &mut CanonicalHasher, ty: Type) {
         Type::Bool => 0,
         Type::I64 => 1,
         Type::F32 => 2,
-        Type::Image => 3,
-        Type::ImageView => 4,
+        // Keep the retired Image/ImageView tags unavailable. Buffer has
+        // different semantics and therefore must not reuse their identities.
+        Type::Buffer => 10,
+        Type::BufferView => 11,
         Type::U8 => 5,
         Type::String => 6,
         Type::StringView => 7,
@@ -886,7 +883,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::runtime::{ImageValue, OuterValue, ValueData};
+    use crate::runtime::{BufferValue, OuterValue, ValueData};
 
     #[test]
     fn sha256_matches_published_vectors() {
@@ -942,8 +939,8 @@ mod tests {
         let base = registered_wasm_transform_identity(
             "fixture.encode",
             1,
-            3,
-            &[("image", 2), ("quality", 3)],
+            4,
+            &[("buffer", 2), ("quality", 3)],
             1,
         );
         assert_eq!(
@@ -951,8 +948,8 @@ mod tests {
             registered_wasm_transform_identity(
                 "fixture.encode",
                 1,
-                3,
-                &[("image", 2), ("quality", 3)],
+                4,
+                &[("buffer", 2), ("quality", 3)],
                 1,
             )
         );
@@ -961,22 +958,22 @@ mod tests {
             registered_wasm_transform_identity(
                 "fixture.encode",
                 1,
-                3,
+                4,
                 &[("input", 2), ("quality", 3)],
                 1,
             )
         );
         assert_ne!(
             base,
-            registered_wasm_transform_identity("fixture.encode", 1, 3, &[("image", 2)], 1)
+            registered_wasm_transform_identity("fixture.encode", 1, 4, &[("buffer", 2)], 1)
         );
         assert_ne!(
             base,
             registered_wasm_transform_identity(
                 "fixture.encode",
                 2,
-                3,
-                &[("image", 2), ("quality", 3)],
+                4,
+                &[("buffer", 2), ("quality", 3)],
                 1,
             )
         );
@@ -1098,15 +1095,15 @@ mod tests {
     }
 
     #[test]
-    fn owned_image_operation_is_part_of_transform_identity() {
+    fn owned_buffer_operation_is_part_of_transform_identity() {
         let keep = crate::compile(
             "keep.tima",
-            "transform image(img: Image) -> Image { return img }\n",
+            "transform buffer(input: Buffer) -> Buffer { return input }\n",
         )
         .unwrap();
         let clear = crate::compile(
             "clear.tima",
-            "transform image(img: Image) -> Image { return image_zero(img) }\n",
+            "transform buffer(input: Buffer) -> Buffer { return buffer_zero(input) }\n",
         )
         .unwrap();
         assert_ne!(
@@ -1116,12 +1113,12 @@ mod tests {
 
         let keep_with_value = crate::compile(
             "keep_value.tima",
-            "transform image(img: Image, value: u8) -> Image { return img }\n",
+            "transform buffer(input: Buffer, value: u8) -> Buffer { return input }\n",
         )
         .unwrap();
         let fill = crate::compile(
             "fill.tima",
-            "transform image(img: Image, value: u8) -> Image { return image_fill(img, value) }\n",
+            "transform buffer(input: Buffer, value: u8) -> Buffer { return buffer_fill(input, value) }\n",
         )
         .unwrap();
         assert_ne!(
@@ -1131,15 +1128,15 @@ mod tests {
     }
 
     #[test]
-    fn normalized_image_byte_loop_has_fill_semantic_identity() {
+    fn normalized_buffer_byte_loop_has_fill_semantic_identity() {
         let builtin = crate::compile(
             "builtin.tima",
-            "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n",
+            "transform fill(img: Buffer, value: u8) -> Buffer { return buffer_fill(img, value) }\n",
         )
         .unwrap();
         let loop_surface = crate::compile(
             "loop.tima",
-            "transform fill(img: Image, value: u8) -> Image {\n\
+            "transform fill(img: Buffer, value: u8) -> Buffer {\n\
                  for byte in img.bytes { byte = value }\n\
                  return img\
              }\n",
@@ -1152,10 +1149,10 @@ mod tests {
     }
 
     #[test]
-    fn image_byte_map_identity_ignores_loop_binding_name() {
+    fn buffer_byte_map_identity_ignores_loop_binding_name() {
         let first = crate::compile(
             "first.tima",
-            "transform keep(img: Image) -> Image {\n\
+            "transform keep(img: Buffer) -> Buffer {\n\
                  for byte in img.bytes { byte = byte }\n\
                  return img\n\
              }\n",
@@ -1163,32 +1160,8 @@ mod tests {
         .unwrap();
         let second = crate::compile(
             "second.tima",
-            "transform keep(img: Image) -> Image {\n\
+            "transform keep(img: Buffer) -> Buffer {\n\
                  for element in img.bytes { element = element }\n\
-                 return img\n\
-             }\n",
-        )
-        .unwrap();
-        assert_eq!(
-            first.identities.get(TransformId(0)),
-            second.identities.get(TransformId(0))
-        );
-    }
-
-    #[test]
-    fn rgba8_pixel_scale_identity_ignores_loop_binding_name() {
-        let first = crate::compile(
-            "first.tima",
-            "transform darken(img: Image, factor: f32) -> Image {\n\
-                 for p in img.pixels { p.r *= factor }\n\
-                 return img\n\
-             }\n",
-        )
-        .unwrap();
-        let second = crate::compile(
-            "second.tima",
-            "transform darken(img: Image, factor: f32) -> Image {\n\
-                 for pixel in img.pixels { pixel.r *= factor }\n\
                  return img\n\
              }\n",
         )
@@ -1234,15 +1207,15 @@ mod tests {
 
     #[test]
     fn content_identity_uses_materialized_value_not_storage_identity() {
-        let first = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
-        let second = OuterValue::image(ImageValue::new(2, 2, 2, vec![1, 2, 3, 4]).unwrap());
+        let first = OuterValue::buffer(BufferValue::new(vec![2, 2], 2, vec![1, 2, 3, 4]).unwrap());
+        let second = OuterValue::buffer(BufferValue::new(vec![2, 2], 2, vec![1, 2, 3, 4]).unwrap());
         assert_eq!(
             content_identity(&first).unwrap(),
             content_identity(&second).unwrap()
         );
 
         let record = OuterValue::plain(ValueData::Record(Arc::new(BTreeMap::from([
-            ("image".to_owned(), first),
+            ("buffer".to_owned(), first),
             (
                 "quality".to_owned(),
                 OuterValue::plain(ValueData::Integer(85)),
@@ -1253,11 +1226,12 @@ mod tests {
             content_identity(&second).unwrap()
         );
 
-        let opaque = OuterValue::image(ImageValue::new(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
-        let rgba = OuterValue::image(ImageValue::new_rgba8(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
+        let opaque = OuterValue::buffer(BufferValue::new(vec![4], 4, vec![1, 2, 3, 4]).unwrap());
+        let shaped =
+            OuterValue::buffer(BufferValue::new(vec![1, 1, 4], 4, vec![1, 2, 3, 4]).unwrap());
         assert_ne!(
             content_identity(&opaque).unwrap(),
-            content_identity(&rgba).unwrap()
+            content_identity(&shaped).unwrap()
         );
     }
 

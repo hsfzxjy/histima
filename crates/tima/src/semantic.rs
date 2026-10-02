@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ast::{self, ExprId, ExprKind, InnerStmt, Item};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    BasicBlock, BlockId, Capability, Constant, Parameter, Rgba8Channel, RuntimeCall, Terminator,
-    Transform, TransformId, Type, TypedModule, Value, ValueId, ValueKind,
+    BasicBlock, BlockId, Capability, Constant, Parameter, RuntimeCall, Terminator, Transform,
+    TransformId, Type, TypedModule, Value, ValueId, ValueKind,
 };
 
 pub fn check(program: &ast::Program) -> Result<TypedModule, Vec<Diagnostic>> {
@@ -62,7 +62,7 @@ impl<'a> Checker<'a> {
             };
             if matches!(
                 declaration.name.as_str(),
-                "environment_i64" | "image_zero" | "image_fill"
+                "environment_i64" | "buffer_zero" | "buffer_fill"
             ) {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -151,8 +151,8 @@ impl<'a> Checker<'a> {
             "StringView" => Type::StringView,
             "Bytes" => Type::Bytes,
             "BytesView" => Type::BytesView,
-            "Image" => Type::Image,
-            "ImageView" => Type::ImageView,
+            "Buffer" => Type::Buffer,
+            "BufferView" => Type::BufferView,
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -160,7 +160,7 @@ impl<'a> Checker<'a> {
                         reference.span,
                     )
                     .with_note(
-                        "the native-safe types are bool, u8, i64, f32, String, StringView, Bytes, BytesView, Image, and ImageView",
+                        "the native-safe types are bool, u8, i64, f32, String, StringView, Bytes, BytesView, Buffer, and BufferView",
                     ),
                 );
                 return None;
@@ -332,20 +332,17 @@ impl<'a> Lowerer<'a> {
                     iterable,
                     body,
                     span,
-                } => self.image_byte_loop(binding, *binding_span, *iterable, body, *span),
-                InnerStmt::Assignment { span, .. } => self.diagnostics.push(
-                    Diagnostic::error(
-                        "inner field assignment is only available inside an image pixel loop",
-                        *span,
-                    )
-                    .with_note("example: for p in img.pixels { p.r *= factor }"),
-                ),
+                } => self.buffer_byte_loop(binding, *binding_span, *iterable, body, *span),
+                InnerStmt::Assignment { span, .. } => self.diagnostics.push(Diagnostic::error(
+                    "inner field assignment is not implemented",
+                    *span,
+                )),
             }
         }
         terminated
     }
 
-    fn image_byte_loop(
+    fn buffer_byte_loop(
         &mut self,
         binding: &str,
         binding_span: crate::source::Span,
@@ -374,53 +371,47 @@ impl<'a> Lowerer<'a> {
         else {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "initial inner `for` requires an owned image `.bytes` or `.pixels` iterator",
+                    "initial inner `for` requires an owned buffer `.bytes` iterator",
                     iterable_expression.span,
                 )
-                .with_note(
-                    "examples: for byte in img.bytes { byte = value }; for p in img.pixels { p.r *= factor }",
-                ),
+                .with_note("example: for byte in buffer.bytes { byte = value }"),
             );
             return;
         };
-        if name == "pixels" {
-            self.image_pixel_loop(binding, binding_span, *receiver, body, span);
-            return;
-        }
         if name != "bytes" {
             self.diagnostics.push(
                 Diagnostic::error(
-                    format!("Image has no iterable member `{name}` in the initial language"),
+                    format!("Buffer has no iterable member `{name}` in the initial language"),
                     *name_span,
                 )
-                .with_note("supported inner iterators are owned `Image.bytes` and `Image.pixels`"),
+                .with_note("the supported inner iterator is owned `Buffer.bytes`"),
             );
             return;
         }
-        let ExprKind::Name(image_name) = &self.program.expr(*receiver).kind else {
+        let ExprKind::Name(buffer_name) = &self.program.expr(*receiver).kind else {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "image byte iteration requires a directly named owned Image",
+                    "buffer byte iteration requires a directly named owned Buffer",
                     self.program.expr(*receiver).span,
                 )
-                .with_note("bind the owned image to a local before iterating it"),
+                .with_note("bind the owned buffer to a local before iterating it"),
             );
             return;
         };
-        let Some(image) = self.expression(*receiver) else {
+        let Some(buffer) = self.expression(*receiver) else {
             return;
         };
-        let actual_image = self.values[image.0 as usize].ty;
-        if actual_image != Type::Image {
+        let actual_buffer = self.values[buffer.0 as usize].ty;
+        if actual_buffer != Type::Buffer {
             self.diagnostics.push(
                 Diagnostic::error(
                     format!(
-                        "image byte iteration requires owned Image, not {}",
-                        actual_image.name()
+                        "buffer byte iteration requires owned Buffer, not {}",
+                        actual_buffer.name()
                     ),
                     iterable_expression.span,
                 )
-                .with_note("ImageView is read-only and may alias"),
+                .with_note("BufferView is read-only and may alias"),
             );
             return;
         }
@@ -428,7 +419,7 @@ impl<'a> Lowerer<'a> {
         let [InnerStmt::Binding(assignment)] = body else {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "initial image byte loop body must contain exactly one byte assignment",
+                    "initial buffer byte loop body must contain exactly one byte assignment",
                     span,
                 )
                 .with_note(format!(
@@ -441,7 +432,7 @@ impl<'a> Lowerer<'a> {
             self.diagnostics.push(
                 Diagnostic::error(
                     format!(
-                        "image byte loop must assign its `{binding}` binding, not `{}`",
+                        "buffer byte loop must assign its `{binding}` binding, not `{}`",
                         assignment.name
                     ),
                     assignment.name_span,
@@ -450,7 +441,7 @@ impl<'a> Lowerer<'a> {
             );
             return;
         }
-        let image_name_span = self.environment[image_name].1;
+        let buffer_name_span = self.environment[buffer_name].1;
         if !expression_mentions_name(self.program, assignment.value, binding) {
             let Some(value) = self.expression(assignment.value) else {
                 return;
@@ -458,21 +449,21 @@ impl<'a> Lowerer<'a> {
             if !self.require_byte_loop_result(value, assignment.value) {
                 return;
             }
-            self.moved.insert(image);
+            self.moved.insert(buffer);
             let filled = self.alloc(
-                Type::Image,
-                ValueKind::ImageFill { image, value },
+                Type::Buffer,
+                ValueKind::BufferFill { buffer, value },
                 span,
                 true,
             );
             self.environment
-                .insert(image_name.clone(), (filled, image_name_span));
+                .insert(buffer_name.clone(), (filled, buffer_name_span));
             return;
         }
 
         let moved_before = self.moved.clone();
-        self.moved.insert(image);
-        let element = self.alloc(Type::U8, ValueKind::ImageByteElement, binding_span, false);
+        self.moved.insert(buffer);
+        let element = self.alloc(Type::U8, ValueKind::BufferByteElement, binding_span, false);
         self.environment
             .insert(binding.to_owned(), (element, binding_span));
         let instruction_start = self.blocks[self.current_block.0 as usize]
@@ -492,11 +483,11 @@ impl<'a> Lowerer<'a> {
         if self
             .moved
             .iter()
-            .any(|moved| *moved != image && !moved_before.contains(moved))
+            .any(|moved| *moved != buffer && !moved_before.contains(moved))
         {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "image byte loop expression cannot consume another owned value",
+                    "buffer byte loop expression cannot consume another owned value",
                     self.program.expr(assignment.value).span,
                 )
                 .with_note("loop-carried ownership for additional values is not implemented yet"),
@@ -504,9 +495,9 @@ impl<'a> Lowerer<'a> {
             return;
         }
         let mapped = self.alloc(
-            Type::Image,
-            ValueKind::ImageByteMap {
-                image,
+            Type::Buffer,
+            ValueKind::BufferByteMap {
+                buffer,
                 element,
                 instructions,
                 result: value,
@@ -515,173 +506,7 @@ impl<'a> Lowerer<'a> {
             true,
         );
         self.environment
-            .insert(image_name.clone(), (mapped, image_name_span));
-    }
-
-    fn image_pixel_loop(
-        &mut self,
-        binding: &str,
-        _binding_span: crate::source::Span,
-        receiver: ExprId,
-        body: &[InnerStmt],
-        span: crate::source::Span,
-    ) {
-        let ExprKind::Name(image_name) = &self.program.expr(receiver).kind else {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "image pixel iteration requires a directly named owned Image",
-                    self.program.expr(receiver).span,
-                )
-                .with_note("bind the owned image to a local before iterating it"),
-            );
-            return;
-        };
-        let Some(image) = self.expression(receiver) else {
-            return;
-        };
-        let actual_image = self.values[image.0 as usize].ty;
-        if actual_image != Type::Image {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    format!(
-                        "image pixel iteration requires owned Image, not {}",
-                        actual_image.name()
-                    ),
-                    self.program.expr(receiver).span,
-                )
-                .with_note("ImageView is read-only and may alias"),
-            );
-            return;
-        }
-        if body.is_empty() {
-            self.diagnostics.push(
-                Diagnostic::error("image pixel loop body cannot be empty", span)
-                    .with_note("scale at least one channel, for example `p.r *= factor`"),
-            );
-            return;
-        }
-
-        let moved_before = self.moved.clone();
-        let mut seen = BTreeSet::new();
-        let mut channels = Vec::new();
-        for statement in body {
-            let InnerStmt::Assignment {
-                target,
-                op,
-                value,
-                span: assignment_span,
-            } = statement
-            else {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "initial image pixel loop body accepts only channel scale assignments",
-                        inner_statement_span(statement),
-                    )
-                    .with_note("supported form: `p.r *= factor`"),
-                );
-                return;
-            };
-            if *op != ast::AssignmentOp::Multiply {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "initial image pixel assignment requires `*=`, not `=`",
-                        *assignment_span,
-                    )
-                    .with_note("general channel replacement and conversion semantics are deferred"),
-                );
-                return;
-            }
-            let ExprKind::Member {
-                receiver: pixel,
-                name,
-                name_span,
-            } = &self.program.expr(*target).kind
-            else {
-                unreachable!("parser admits only member assignment targets")
-            };
-            if !matches!(&self.program.expr(*pixel).kind, ExprKind::Name(name) if name == binding) {
-                self.diagnostics.push(Diagnostic::error(
-                    format!("pixel loop assignment must target `{binding}.<channel>`"),
-                    self.program.expr(*target).span,
-                ));
-                return;
-            }
-            let channel = match name.as_str() {
-                "r" => Rgba8Channel::Red,
-                "g" => Rgba8Channel::Green,
-                "b" => Rgba8Channel::Blue,
-                "a" => Rgba8Channel::Alpha,
-                _ => {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            format!("RGBA8 pixel has no channel `{name}`"),
-                            *name_span,
-                        )
-                        .with_note("available channels are r, g, b, and a"),
-                    );
-                    return;
-                }
-            };
-            if !seen.insert(channel) {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!("RGBA8 channel `{name}` is scaled more than once in this loop"),
-                        *name_span,
-                    )
-                    .with_note("the initial pixel loop permits one scale per channel"),
-                );
-                return;
-            }
-            if expression_mentions_name(self.program, *value, binding) {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "pixel scale factor cannot read the pixel binding yet",
-                        self.program.expr(*value).span,
-                    )
-                    .with_note("this slice supports only `p.<channel> *= f32`"),
-                );
-                return;
-            }
-            let Some(factor) = self.expression(*value) else {
-                return;
-            };
-            let actual = self.values[factor.0 as usize].ty;
-            if actual != Type::F32 {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!(
-                            "RGBA8 channel scale factor must be f32, not {}",
-                            actual.name()
-                        ),
-                        self.program.expr(*value).span,
-                    )
-                    .with_note("pass an f32 parameter or expression as the scale factor"),
-                );
-                return;
-            }
-            channels.push((channel, factor));
-        }
-        if self.moved.iter().any(|moved| !moved_before.contains(moved)) {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "image pixel scale factor cannot consume an owned value",
-                    span,
-                )
-                .with_note("pixel-loop factors are evaluated once before iteration"),
-            );
-            return;
-        }
-
-        self.moved.insert(image);
-        let scaled = self.alloc(
-            Type::Image,
-            ValueKind::ImageRgba8Scale { image, channels },
-            span,
-            true,
-        );
-        let image_name_span = self.environment[image_name].1;
-        self.environment
-            .insert(image_name.clone(), (scaled, image_name_span));
+            .insert(buffer_name.clone(), (mapped, buffer_name_span));
     }
 
     fn require_byte_loop_result(&mut self, value: ValueId, syntax: ExprId) -> bool {
@@ -692,7 +517,7 @@ impl<'a> Lowerer<'a> {
         self.diagnostics.push(
             Diagnostic::error(
                 format!(
-                    "image byte assignment requires u8, not {}",
+                    "buffer byte assignment requires u8, not {}",
                     actual_value.name()
                 ),
                 self.program.expr(syntax).span,
@@ -966,7 +791,7 @@ impl<'a> Lowerer<'a> {
                     }
                     return self.world_read(&name, arguments, expression.span);
                 }
-                if name == "image_zero" {
+                if name == "buffer_zero" {
                     if asserted {
                         self.diagnostics.push(Diagnostic::error(
                             "inner runtime operations cannot use semantic identity assertions",
@@ -974,9 +799,9 @@ impl<'a> Lowerer<'a> {
                         ));
                         return None;
                     }
-                    return self.image_zero(arguments, expression.span);
+                    return self.buffer_zero(arguments, expression.span);
                 }
-                if name == "image_fill" {
+                if name == "buffer_fill" {
                     if asserted {
                         self.diagnostics.push(Diagnostic::error(
                             "inner runtime operations cannot use semantic identity assertions",
@@ -984,7 +809,7 @@ impl<'a> Lowerer<'a> {
                         ));
                         return None;
                     }
-                    return self.image_fill(arguments, expression.span);
+                    return self.buffer_fill(arguments, expression.span);
                 }
                 let Some(signature) = self.signatures.get(&name) else {
                     self.diagnostics.push(Diagnostic::error(
@@ -1182,58 +1007,61 @@ impl<'a> Lowerer<'a> {
         Some(self.alloc(result_type, ValueKind::RuntimeCall(call), span, true))
     }
 
-    fn image_zero(
+    fn buffer_zero(
         &mut self,
         arguments: &[ast::Argument],
         span: crate::source::Span,
     ) -> Option<ValueId> {
         if arguments.len() != 1 || arguments[0].name.is_some() {
             self.diagnostics.push(
-                Diagnostic::error("image_zero expects one positional Image argument", span)
-                    .with_note("example: cleared = image_zero(img)"),
+                Diagnostic::error("buffer_zero expects one positional Buffer argument", span)
+                    .with_note("example: cleared = buffer_zero(buffer)"),
             );
             return None;
         }
-        let image = self.expression(arguments[0].value)?;
-        let actual = self.values[image.0 as usize].ty;
-        if actual != Type::Image {
+        let buffer = self.expression(arguments[0].value)?;
+        let actual = self.values[buffer.0 as usize].ty;
+        if actual != Type::Buffer {
             self.diagnostics.push(
                 Diagnostic::error(
-                    format!("image_zero requires owned Image, not {}", actual.name()),
+                    format!("buffer_zero requires owned Buffer, not {}", actual.name()),
                     arguments[0].span,
                 )
-                .with_note("read-only ImageView values cannot be mutated"),
+                .with_note("read-only BufferView values cannot be mutated"),
             );
             return None;
         }
-        self.moved.insert(image);
-        Some(self.alloc(Type::Image, ValueKind::ImageZero { image }, span, true))
+        self.moved.insert(buffer);
+        Some(self.alloc(Type::Buffer, ValueKind::BufferZero { buffer }, span, true))
     }
 
-    fn image_fill(
+    fn buffer_fill(
         &mut self,
         arguments: &[ast::Argument],
         span: crate::source::Span,
     ) -> Option<ValueId> {
         if arguments.len() != 2 || arguments.iter().any(|argument| argument.name.is_some()) {
             self.diagnostics.push(
-                Diagnostic::error("image_fill expects positional Image and u8 arguments", span)
-                    .with_note("example: filled = image_fill(img, value)"),
+                Diagnostic::error(
+                    "buffer_fill expects positional Buffer and u8 arguments",
+                    span,
+                )
+                .with_note("example: filled = buffer_fill(buffer, value)"),
             );
             return None;
         }
-        let image = self.expression(arguments[0].value)?;
-        let actual_image = self.values[image.0 as usize].ty;
-        if actual_image != Type::Image {
+        let buffer = self.expression(arguments[0].value)?;
+        let actual_buffer = self.values[buffer.0 as usize].ty;
+        if actual_buffer != Type::Buffer {
             self.diagnostics.push(
                 Diagnostic::error(
                     format!(
-                        "image_fill requires owned Image, not {}",
-                        actual_image.name()
+                        "buffer_fill requires owned Buffer, not {}",
+                        actual_buffer.name()
                     ),
                     arguments[0].span,
                 )
-                .with_note("read-only ImageView values cannot be mutated"),
+                .with_note("read-only BufferView values cannot be mutated"),
             );
             return None;
         }
@@ -1243,7 +1071,7 @@ impl<'a> Lowerer<'a> {
             self.diagnostics.push(
                 Diagnostic::error(
                     format!(
-                        "image_fill requires u8 fill value, not {}",
+                        "buffer_fill requires u8 fill value, not {}",
                         actual_value.name()
                     ),
                     arguments[1].span,
@@ -1252,10 +1080,10 @@ impl<'a> Lowerer<'a> {
             );
             return None;
         }
-        self.moved.insert(image);
+        self.moved.insert(buffer);
         Some(self.alloc(
-            Type::Image,
-            ValueKind::ImageFill { image, value },
+            Type::Buffer,
+            ValueKind::BufferFill { buffer, value },
             span,
             true,
         ))
@@ -1343,6 +1171,20 @@ mod tests {
             transform.values[2].kind,
             ir::ValueKind::Binary { .. }
         ));
+    }
+
+    #[test]
+    fn image_is_not_a_tima_type() {
+        let diagnostics = compile(
+            "legacy-image.tima",
+            "transform legacy(value: Image) -> Image { return value }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("unknown inner transform type `Image`")
+        }));
     }
 
     #[test]
@@ -1510,8 +1352,8 @@ mod tests {
         );
 
         let diagnostics = compile(
-            "bad_image.tima",
-            "transform bad(left: ImageView, right: ImageView) -> bool { return left == right }\n",
+            "bad_buffer.tima",
+            "transform bad(left: BufferView, right: BufferView) -> bool { return left == right }\n",
         )
         .unwrap_err();
         assert!(
@@ -1667,11 +1509,11 @@ mod tests {
     }
 
     #[test]
-    fn moves_owned_images_through_inner_calls_and_rejects_aliases() {
+    fn moves_owned_buffers_through_inner_calls_and_rejects_aliases() {
         let compiled = compile(
             "safe.tima",
-            "transform choose(a: Image, b: Image) -> Image { return a }\n\
-             transform safe(x: Image, y: Image) -> Image {\n\
+            "transform choose(a: Buffer, b: Buffer) -> Buffer { return a }\n\
+             transform safe(x: Buffer, y: Buffer) -> Buffer {\n\
                  chosen = choose(x, y)\n\
                  return chosen\n\
              }\n",
@@ -1687,8 +1529,8 @@ mod tests {
 
         let diagnostics = compile(
             "test.tima",
-            "transform choose(a: Image, b: Image) -> Image { return a }\n\
-             transform unsafe_alias(x: Image) -> Image { return choose(x, x) }\n",
+            "transform choose(a: Buffer, b: Buffer) -> Buffer { return a }\n\
+             transform unsafe_alias(x: Buffer) -> Buffer { return choose(x, x) }\n",
         )
         .unwrap_err();
         assert!(
@@ -1699,8 +1541,8 @@ mod tests {
 
         let diagnostics = compile(
             "moved.tima",
-            "transform consume(img: Image) -> Image { return img }\n\
-             transform bad(img: Image) -> Image {\n\
+            "transform consume(img: Buffer) -> Buffer { return img }\n\
+             transform bad(img: Buffer) -> Buffer {\n\
                  result = consume(img)\n\
                  return img\n\
              }\n",
@@ -1714,26 +1556,26 @@ mod tests {
     }
 
     #[test]
-    fn lowers_consuming_owned_image_zero_and_rejects_use_after_move() {
+    fn lowers_consuming_owned_buffer_zero_and_rejects_use_after_move() {
         let compiled = compile(
             "test.tima",
-            "transform clear(img: Image) -> Image {\n\
-                 cleared = image_zero(img)\n\
+            "transform clear(img: Buffer) -> Buffer {\n\
+                 cleared = buffer_zero(img)\n\
                  return cleared\n\
              }\n",
         )
         .unwrap();
         assert!(matches!(
             compiled.transforms.transforms[0].values[1].kind,
-            ir::ValueKind::ImageZero {
-                image: ir::ValueId(0)
+            ir::ValueKind::BufferZero {
+                buffer: ir::ValueId(0)
             }
         ));
 
         let diagnostics = compile(
             "moved.tima",
-            "transform bad(img: Image) -> Image {\n\
-                 cleared = image_zero(img)\n\
+            "transform bad(img: Buffer) -> Buffer {\n\
+                 cleared = buffer_zero(img)\n\
                  return img\n\
              }\n",
         )
@@ -1746,22 +1588,22 @@ mod tests {
 
         let diagnostics = compile(
             "view.tima",
-            "transform bad(img: ImageView) -> ImageView { return image_zero(img) }\n",
+            "transform bad(img: BufferView) -> BufferView { return buffer_zero(img) }\n",
         )
         .unwrap_err();
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("requires owned Image"))
+                .any(|diagnostic| diagnostic.message.contains("requires owned Buffer"))
         );
     }
 
     #[test]
-    fn lowers_u8_image_fill_and_rejects_invalid_ownership_or_value_types() {
+    fn lowers_u8_buffer_fill_and_rejects_invalid_ownership_or_value_types() {
         let compiled = compile(
             "fill.tima",
-            "transform fill(img: Image, value: u8) -> Image {\n\
-                 filled = image_fill(img, value)\n\
+            "transform fill(img: Buffer, value: u8) -> Buffer {\n\
+                 filled = buffer_fill(img, value)\n\
                  return filled\n\
              }\n",
         )
@@ -1772,16 +1614,16 @@ mod tests {
         );
         assert!(matches!(
             compiled.transforms.transforms[0].values[2].kind,
-            ir::ValueKind::ImageFill {
-                image: ir::ValueId(0),
+            ir::ValueKind::BufferFill {
+                buffer: ir::ValueId(0),
                 value: ir::ValueId(1),
             }
         ));
 
         let diagnostics = compile(
             "moved.tima",
-            "transform bad(img: Image, value: u8) -> Image {\n\
-                 filled = image_fill(img, value)\n\
+            "transform bad(img: Buffer, value: u8) -> Buffer {\n\
+                 filled = buffer_fill(img, value)\n\
                  return img\n\
              }\n",
         )
@@ -1794,18 +1636,18 @@ mod tests {
 
         let diagnostics = compile(
             "view.tima",
-            "transform bad(img: ImageView, value: u8) -> ImageView { return image_fill(img, value) }\n",
+            "transform bad(img: BufferView, value: u8) -> BufferView { return buffer_fill(img, value) }\n",
         )
         .unwrap_err();
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("requires owned Image"))
+                .any(|diagnostic| diagnostic.message.contains("requires owned Buffer"))
         );
 
         let diagnostics = compile(
             "value.tima",
-            "transform bad(img: Image, value: i64) -> Image { return image_fill(img, value) }\n",
+            "transform bad(img: Buffer, value: i64) -> Buffer { return buffer_fill(img, value) }\n",
         )
         .unwrap_err();
         assert!(
@@ -1816,10 +1658,10 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_initial_image_byte_loop_to_owned_fill_ir() {
+    fn normalizes_initial_buffer_byte_loop_to_owned_fill_ir() {
         let compiled = compile(
             "loop.tima",
-            "transform fill(img: Image, value: u8) -> Image {\n\
+            "transform fill(img: Buffer, value: u8) -> Buffer {\n\
                  for byte in img.bytes { byte = value }\n\
                  return img\n\
              }\n",
@@ -1828,8 +1670,8 @@ mod tests {
         let transform = &compiled.transforms.transforms[0];
         assert!(matches!(
             transform.values[2].kind,
-            ir::ValueKind::ImageFill {
-                image: ir::ValueId(0),
+            ir::ValueKind::BufferFill {
+                buffer: ir::ValueId(0),
                 value: ir::ValueId(1),
             }
         ));
@@ -1840,7 +1682,7 @@ mod tests {
 
         let diagnostics = compile(
             "view.tima",
-            "transform bad(img: ImageView, value: u8) -> ImageView {\n\
+            "transform bad(img: BufferView, value: u8) -> BufferView {\n\
                  for byte in img.bytes { byte = value }\n\
                  return img\n\
              }\n",
@@ -1849,12 +1691,12 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("requires owned Image"))
+                .any(|diagnostic| diagnostic.message.contains("requires owned Buffer"))
         );
 
         let diagnostics = compile(
             "body.tima",
-            "transform bad(img: Image, value: u8) -> Image {\n\
+            "transform bad(img: Buffer, value: u8) -> Buffer {\n\
                  for byte in img.bytes { other = value }\n\
                  return img\n\
              }\n",
@@ -1868,7 +1710,7 @@ mod tests {
 
         let diagnostics = compile(
             "alias.tima",
-            "transform bad(img: Image, value: u8) -> Image {\n\
+            "transform bad(img: Buffer, value: u8) -> Buffer {\n\
                  alias = img\n\
                  for byte in img.bytes { byte = value }\n\
                  return alias\n\
@@ -1883,13 +1725,13 @@ mod tests {
     }
 
     #[test]
-    fn lowers_byte_dependent_image_loop_to_structured_map_ir() {
+    fn lowers_byte_dependent_buffer_loop_to_structured_map_ir() {
         let compiled = compile(
             "map.tima",
             "transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
                  if current == target { return replacement } else { return current }\n\
              }\n\
-             transform replace(img: Image, target: u8, replacement: u8) -> Image {\n\
+             transform replace(img: Buffer, target: u8, replacement: u8) -> Buffer {\n\
                  for byte in img.bytes { byte = choose(byte, target, replacement) }\n\
                  return img\n\
              }\n",
@@ -1899,12 +1741,12 @@ mod tests {
         assert_eq!(transform.blocks[0].instructions, [ir::ValueId(5)]);
         assert!(matches!(
             &transform.values[3].kind,
-            ir::ValueKind::ImageByteElement
+            ir::ValueKind::BufferByteElement
         ));
         assert!(matches!(
             &transform.values[5].kind,
-            ir::ValueKind::ImageByteMap {
-                image: ir::ValueId(0),
+            ir::ValueKind::BufferByteMap {
+                buffer: ir::ValueId(0),
                 element: ir::ValueId(3),
                 instructions,
                 result: ir::ValueId(4),
@@ -1917,8 +1759,8 @@ mod tests {
 
         let diagnostics = compile(
             "consume.tima",
-            "transform steal(img: Image, value: u8) -> u8 { return value }\n\
-             transform bad(img: Image, other: Image, value: u8) -> Image {\n\
+            "transform steal(img: Buffer, value: u8) -> u8 { return value }\n\
+             transform bad(img: Buffer, other: Buffer, value: u8) -> Buffer {\n\
                  for byte in img.bytes { byte = steal(other, byte) }\n\
                  return img\n\
              }\n",
@@ -1929,53 +1771,6 @@ mod tests {
                 .message
                 .contains("cannot consume another owned value")
         }));
-    }
-
-    #[test]
-    fn lowers_constrained_rgba8_pixel_scaling_and_rejects_broader_mutation() {
-        let compiled = compile(
-            "darken.tima",
-            "transform darken(img: Image, factor: f32) -> Image {\n\
-                 for p in img.pixels {\n\
-                     p.r *= factor\n\
-                     p.g *= factor\n\
-                     p.b *= factor\n\
-                 }\n\
-                 return img\n\
-             }\n",
-        )
-        .unwrap();
-        let transform = &compiled.transforms.transforms[0];
-        assert!(matches!(
-            &transform.values[2].kind,
-            ir::ValueKind::ImageRgba8Scale { image, channels }
-                if *image == ir::ValueId(0)
-                    && channels == &[
-                        (ir::Rgba8Channel::Red, ir::ValueId(1)),
-                        (ir::Rgba8Channel::Green, ir::ValueId(1)),
-                        (ir::Rgba8Channel::Blue, ir::ValueId(1)),
-                    ]
-        ));
-
-        let diagnostics = compile(
-            "replace.tima",
-            "transform replace(img: Image, factor: f32) -> Image {\n\
-                 for p in img.pixels { p.r = factor }\n\
-                 return img\n\
-             }\n",
-        )
-        .unwrap_err();
-        assert!(diagnostics[0].message.contains("requires `*=`"));
-
-        let diagnostics = compile(
-            "view.tima",
-            "transform bad(img: ImageView, factor: f32) -> ImageView {\n\
-                 for p in img.pixels { p.r *= factor }\n\
-                 return img\n\
-             }\n",
-        )
-        .unwrap_err();
-        assert!(diagnostics[0].message.contains("requires owned Image"));
     }
 
     #[test]
@@ -2000,11 +1795,11 @@ mod tests {
     }
 
     #[test]
-    fn owned_image_moves_are_checked_across_branch_continuations() {
+    fn owned_buffer_moves_are_checked_across_branch_continuations() {
         let diagnostics = compile(
             "join.tima",
-            "transform bad(img: Image, flag: bool) -> Image {\n\
-                 if flag { cleared = image_zero(img) } else {}\n\
+            "transform bad(img: Buffer, flag: bool) -> Buffer {\n\
+                 if flag { cleared = buffer_zero(img) } else {}\n\
                  return img\n\
              }\n",
         )
@@ -2017,8 +1812,8 @@ mod tests {
 
         compile(
             "returns.tima",
-            "transform clear_if(img: Image, flag: bool) -> Image {\n\
-                 if flag { return image_zero(img) } else { return img }\n\
+            "transform clear_if(img: Buffer, flag: bool) -> Buffer {\n\
+                 if flag { return buffer_zero(img) } else { return img }\n\
              }\n",
         )
         .unwrap();

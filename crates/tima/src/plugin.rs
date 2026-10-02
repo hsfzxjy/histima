@@ -11,14 +11,14 @@ use crate::registered::RegisteredTransform;
 use crate::registered_wasm::{
     PLUGIN_ABI_VERSION, PluginArgument, PluginResult, PluginResultType, RegisteredWasmPlugin,
 };
-use crate::runtime::{ImageFormat, OuterValue, ValueData};
+use crate::runtime::{OuterValue, ValueData};
 use crate::source::Span;
 
-/// Value types supported by registered-Wasm ABI v3 manifests.
+/// Value types supported by registered-Wasm ABI v4 manifests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginValueType {
     Bytes,
-    Rgba8Image,
+    Buffer,
     I64,
 }
 
@@ -27,7 +27,7 @@ impl PluginValueType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bytes => "bytes",
-            Self::Rgba8Image => "rgba8-image",
+            Self::Buffer => "buffer",
             Self::I64 => "i64",
         }
     }
@@ -35,7 +35,7 @@ impl PluginValueType {
     fn identity_tag(self) -> u8 {
         match self {
             Self::Bytes => 1,
-            Self::Rgba8Image => 2,
+            Self::Buffer => 2,
             Self::I64 => 3,
         }
     }
@@ -282,8 +282,8 @@ impl PreparedPluginInvocation<'_> {
                 (PluginValueType::Bytes, ValueData::Bytes(bytes)) => {
                     PluginArgument::BytesView(bytes)
                 }
-                (PluginValueType::Rgba8Image, ValueData::Image(image)) => {
-                    PluginArgument::ImageView(image)
+                (PluginValueType::Buffer, ValueData::Buffer(buffer)) => {
+                    PluginArgument::BufferView(buffer)
                 }
                 (PluginValueType::I64, ValueData::Integer(value)) => PluginArgument::I64(*value),
                 _ => unreachable!("plugin arguments are validated before execution"),
@@ -291,7 +291,7 @@ impl PreparedPluginInvocation<'_> {
         }
         let result_type = match self.transform.result {
             PluginValueType::Bytes => PluginResultType::Bytes,
-            PluginValueType::Rgba8Image => PluginResultType::Image,
+            PluginValueType::Buffer => PluginResultType::Buffer,
             PluginValueType::I64 => unreachable!("scalar plugin results are rejected at load"),
         };
         match self
@@ -300,7 +300,7 @@ impl PreparedPluginInvocation<'_> {
             .invoke(&arguments, result_type, self.call_span)?
         {
             PluginResult::Bytes(bytes) => Ok(OuterValue::plain(ValueData::Bytes(Arc::new(bytes)))),
-            PluginResult::Image(image) => Ok(OuterValue::image(image)),
+            PluginResult::Buffer(buffer) => Ok(OuterValue::buffer(buffer)),
         }
     }
 }
@@ -321,14 +321,12 @@ pub(crate) fn prepare_plugin_invocation<'a>(
         ));
     }
     for (parameter, (argument, span)) in transform.parameters.iter().zip(&arguments) {
-        let valid = match (parameter.value_type, &argument.data) {
-            (PluginValueType::Bytes, ValueData::Bytes(_)) => true,
-            (PluginValueType::Rgba8Image, ValueData::Image(image)) => {
-                image.format() == ImageFormat::Rgba8
-            }
-            (PluginValueType::I64, ValueData::Integer(_)) => true,
-            _ => false,
-        };
+        let valid = matches!(
+            (parameter.value_type, &argument.data),
+            (PluginValueType::Bytes, ValueData::Bytes(_))
+                | (PluginValueType::Buffer, ValueData::Buffer(_))
+                | (PluginValueType::I64, ValueData::Integer(_))
+        );
         if !valid {
             return Err(Diagnostic::error(
                 format!(
@@ -402,7 +400,7 @@ fn valid_identifier(value: &str) -> bool {
 fn type_name(value_type: PluginValueType) -> &'static str {
     match value_type {
         PluginValueType::Bytes => "immutable bytes",
-        PluginValueType::Rgba8Image => "an RGBA8 image",
+        PluginValueType::Buffer => "a Buffer",
         PluginValueType::I64 => "an integer",
     }
 }
@@ -424,7 +422,7 @@ mod tests {
                 name: "bytes".to_owned(),
                 value_type: PluginValueType::Bytes,
             }],
-            result: PluginValueType::Rgba8Image,
+            result: PluginValueType::Buffer,
             expected_module_content: byte_content_identity(&bytes),
             module_bytes: bytes,
         }
@@ -447,10 +445,10 @@ mod tests {
                 .execute()
                 .unwrap();
 
-        let ValueData::Image(image) = output.data else {
-            panic!("decoder did not return an image")
+        let ValueData::Buffer(buffer) = output.data else {
+            panic!("decoder did not return a Buffer")
         };
-        assert_eq!(image.to_vec(), [2, 4, 8, 255]);
+        assert_eq!(buffer.to_vec(), [2, 4, 8, 255]);
     }
 
     #[test]

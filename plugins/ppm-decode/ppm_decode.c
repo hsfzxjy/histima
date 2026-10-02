@@ -1,4 +1,4 @@
-// ASCII P3 decoder for Histima registered-Wasm plugin ABI v3.
+// ASCII P3 decoder for Histima registered-Wasm plugin ABI v4.
 
 #include "tima_plugin.h"
 
@@ -125,13 +125,13 @@ TimaU32 tima_transform(
         TIMA_FAIL(result, "channel sample count exceeds the image dimensions");
     }
 
-    result->words[0] = TIMA_VALUE_IMAGE;
+    result->words[0] = TIMA_VALUE_BUFFER;
     result->words[1] = output_pointer;
     result->words[2] = byte_length;
-    result->words[3] = TIMA_IMAGE_FORMAT_RGBA8;
-    result->words[4] = width;
-    result->words[5] = height;
-    result->words[6] = width * 4;
-    result->words[7] = 0;
+    result->words[3] = 3;
+    result->words[4] = height;
+    result->words[5] = width;
+    result->words[6] = 4;
+    result->words[7] = width * 4;
     return 0;
 }

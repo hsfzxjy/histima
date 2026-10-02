@@ -1,12 +1,11 @@
 use std::mem;
 use std::slice;
 
-const PLUGIN_ABI_VERSION: u32 = 3;
-const VALUE_IMAGE_VIEW: u32 = 2;
+const PLUGIN_ABI_VERSION: u32 = 4;
+const VALUE_BUFFER_VIEW: u32 = 2;
 const VALUE_I64: u32 = 3;
 const VALUE_BYTES: u32 = 4;
 const VALUE_DIAGNOSTIC: u32 = 255;
-const IMAGE_FORMAT_RGBA8: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,12 +61,12 @@ fn encode(arguments_pointer: u32, argument_count: u32) -> Result<Vec<u8>, &'stat
             argument_count as usize,
         )
     };
-    let image = arguments[0];
-    if image.words[0] != VALUE_IMAGE_VIEW {
-        return Err("png.encode expects an ImageView first");
+    let buffer = arguments[0];
+    if buffer.words[0] != VALUE_BUFFER_VIEW {
+        return Err("png.encode expects a BufferView first");
     }
-    if image.words[3] != IMAGE_FORMAT_RGBA8 {
-        return Err("png.encode requires RGBA8 pixels");
+    if buffer.words[3] != 3 || buffer.words[6] != 4 {
+        return Err("png.encode requires Buffer shape [height, width, 4]");
     }
     if arguments[1].words[0] != VALUE_I64 || arguments[1].words[3..].iter().any(|word| *word != 0) {
         return Err("png.encode expects an i64 compression second");
@@ -80,10 +79,10 @@ fn encode(arguments_pointer: u32, argument_count: u32) -> Result<Vec<u8>, &'stat
         return Err("png.encode compression must be from 1 through 9");
     }
 
-    let byte_length = image.words[2] as usize;
-    let width = image.words[4];
-    let height = image.words[5];
-    let stride = image.words[6] as usize;
+    let byte_length = buffer.words[2] as usize;
+    let height = buffer.words[4];
+    let width = buffer.words[5];
+    let stride = buffer.words[7] as usize;
     if width == 0 || height == 0 {
         return Err("png.encode image dimensions must be non-zero");
     }
@@ -99,7 +98,8 @@ fn encode(arguments_pointer: u32, argument_count: u32) -> Result<Vec<u8>, &'stat
     if byte_length != expected_length {
         return Err("png.encode image byte length is invalid");
     }
-    let input = unsafe { slice::from_raw_parts(image.words[1] as usize as *const u8, byte_length) };
+    let input =
+        unsafe { slice::from_raw_parts(buffer.words[1] as usize as *const u8, byte_length) };
     let packed_length = (height as usize)
         .checked_mul(row_length)
         .ok_or("png.encode packed byte length overflowed")?;

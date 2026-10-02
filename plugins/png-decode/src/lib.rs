@@ -2,11 +2,10 @@ use std::io::Cursor;
 use std::mem;
 use std::slice;
 
-const PLUGIN_ABI_VERSION: u32 = 3;
+const PLUGIN_ABI_VERSION: u32 = 4;
 const VALUE_BYTES_VIEW: u32 = 1;
-const VALUE_IMAGE: u32 = 5;
+const VALUE_BUFFER: u32 = 5;
 const VALUE_DIAGNOSTIC: u32 = 255;
-const IMAGE_FORMAT_RGBA8: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -53,16 +52,7 @@ pub extern "C" fn tima_transform(
     let pointer = pixels.as_mut_ptr() as usize as u32;
     let length = pixels.len() as u32;
     mem::forget(pixels);
-    result.words = [
-        VALUE_IMAGE,
-        pointer,
-        length,
-        IMAGE_FORMAT_RGBA8,
-        width,
-        height,
-        stride,
-        0,
-    ];
+    result.words = [VALUE_BUFFER, pointer, length, 3, height, width, 4, stride];
     0
 }
 

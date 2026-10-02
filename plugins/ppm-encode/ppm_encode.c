@@ -1,4 +1,4 @@
-// Deterministic ASCII P3 encoder for Histima registered-Wasm plugin ABI v3.
+// Deterministic ASCII P3 encoder for Histima registered-Wasm plugin ABI v4.
 
 #include "tima_plugin.h"
 
@@ -27,19 +27,19 @@ TimaU32 tima_transform(
     if (argument_count != 1) {
         TIMA_FAIL(result, "ppm.encode expects one argument");
     }
-    const TimaValue *image = (const TimaValue *)(TimaUPtr)arguments_pointer;
-    if (image->words[0] != TIMA_VALUE_IMAGE_VIEW) {
-        TIMA_FAIL(result, "ppm.encode expects an ImageView");
+    const TimaValue *buffer = (const TimaValue *)(TimaUPtr)arguments_pointer;
+    if (buffer->words[0] != TIMA_VALUE_BUFFER_VIEW) {
+        TIMA_FAIL(result, "ppm.encode expects a BufferView");
     }
-    if (image->words[3] != TIMA_IMAGE_FORMAT_RGBA8) {
-        TIMA_FAIL(result, "ppm.encode requires RGBA8 pixels");
+    if (buffer->words[3] != 3 || buffer->words[6] != 4) {
+        TIMA_FAIL(result, "ppm.encode requires Buffer shape [height, width, 4]");
     }
 
-    TimaU32 input_pointer = image->words[1];
-    TimaU32 input_length = image->words[2];
-    TimaU32 width = image->words[4];
-    TimaU32 height = image->words[5];
-    TimaU32 stride = image->words[6];
+    TimaU32 input_pointer = buffer->words[1];
+    TimaU32 input_length = buffer->words[2];
+    TimaU32 height = buffer->words[4];
+    TimaU32 width = buffer->words[5];
+    TimaU32 stride = buffer->words[7];
     if (width == 0 || height == 0) {
         TIMA_FAIL(result, "image dimensions must be non-zero");
     }

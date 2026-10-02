@@ -25,10 +25,10 @@ pub enum Type {
     Bytes,
     /// Read-only byte storage that may alias.
     BytesView,
-    /// Uniquely owned and mutable while an inner transform runs.
-    Image,
-    /// Read-only and permitted to alias other views.
-    ImageView,
+    /// Uniquely owned shaped byte storage, mutable while a transform runs.
+    Buffer,
+    /// Read-only shaped byte storage, permitted to alias other views.
+    BufferView,
 }
 
 impl Type {
@@ -42,8 +42,8 @@ impl Type {
             Self::StringView => "StringView",
             Self::Bytes => "Bytes",
             Self::BytesView => "BytesView",
-            Self::Image => "Image",
-            Self::ImageView => "ImageView",
+            Self::Buffer => "Buffer",
+            Self::BufferView => "BufferView",
         }
     }
 
@@ -52,7 +52,7 @@ impl Type {
     }
 
     pub fn is_owned(self) -> bool {
-        matches!(self, Self::String | Self::Bytes | Self::Image)
+        matches!(self, Self::String | Self::Bytes | Self::Buffer)
     }
 }
 
@@ -127,25 +127,6 @@ pub struct Value {
     pub span: Span,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Rgba8Channel {
-    Red,
-    Green,
-    Blue,
-    Alpha,
-}
-
-impl Rgba8Channel {
-    pub const fn offset(self) -> usize {
-        match self {
-            Self::Red => 0,
-            Self::Green => 1,
-            Self::Blue => 2,
-            Self::Alpha => 3,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum ValueKind {
     Parameter {
@@ -163,33 +144,27 @@ pub enum ValueKind {
         transform: TransformId,
         arguments: Vec<ValueId>,
     },
-    /// Consumes one uniquely owned image, zeros its byte storage in place, and
+    /// Consumes one uniquely owned buffer, zeros its byte storage in place, and
     /// produces the same owned storage under a new value ID.
-    ImageZero {
-        image: ValueId,
+    BufferZero {
+        buffer: ValueId,
     },
-    /// Consumes one uniquely owned image, fills its byte storage in place, and
+    /// Consumes one uniquely owned buffer, fills its byte storage in place, and
     /// produces the same owned storage under a new value ID.
-    ImageFill {
-        image: ValueId,
+    BufferFill {
+        buffer: ValueId,
         value: ValueId,
     },
-    /// Per-iteration `u8` value supplied by an enclosing `ImageByteMap`.
+    /// Per-iteration `u8` value supplied by an enclosing `BufferByteMap`.
     /// It is not an ordinary block instruction or a native boundary value.
-    ImageByteElement,
-    /// Consumes one uniquely owned image and evaluates a scalar instruction
+    BufferByteElement,
+    /// Consumes one uniquely owned buffer and evaluates a scalar instruction
     /// sequence once per byte, storing the `u8` result back into that byte.
-    ImageByteMap {
-        image: ValueId,
+    BufferByteMap {
+        buffer: ValueId,
         element: ValueId,
         instructions: Vec<ValueId>,
         result: ValueId,
-    },
-    /// Consumes one RGBA8 image and scales selected channels in logical pixels.
-    /// Factors are evaluated once before iteration; padding bytes are untouched.
-    ImageRgba8Scale {
-        image: ValueId,
-        channels: Vec<(Rgba8Channel, ValueId)>,
     },
     RuntimeCall(RuntimeCall),
 }

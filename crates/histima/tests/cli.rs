@@ -561,7 +561,7 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
     let source = test.path().join("source.ppm");
     let script = test.path().join("pipeline.tima");
     let changed_script = test.path().join("changed-transform.tima");
-    let output = test.path().join("darkened.ppm");
+    let output = test.path().join("copied.ppm");
     let restored = test.path().join("restored.ppm");
     fs::write(&source, b"P3\n1 1\n255\n200 100 50\n").unwrap();
     let source_locator = portable(&source);
@@ -570,15 +570,10 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
         &script,
         format!(
             "source = asset({source_locator:?})\n\
-             transform darken(img: Image, factor: f32) -> Image {{\n\
-                 for p in img.pixels {{\n\
-                     p.r *= factor\n\
-                     p.g *= factor\n\
-                     p.b *= factor\n\
-                 }}\n\
+             transform copy(img: Buffer) -> Buffer {{\n\
                  return img\n\
              }}\n\
-             out = source | read | ppm.decode | darken(0.5) | ppm.encode\n\
+             out = source | read | ppm.decode | copy | ppm.encode\n\
              saved = out | save({output_locator:?})\n\
              trace(out)\n"
         ),
@@ -593,8 +588,8 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
     assert!(stdout(&first).contains("execution_engine = interpreter"));
     assert!(stdout(&first).contains("artifact_cache = none"));
     assert!(stdout(&first).contains("result_cache_hits = 0"));
-    assert!(stdout(&first).contains("invoke darken"));
-    assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
+    assert!(stdout(&first).contains("invoke copy"));
+    assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n200 100 50\n");
     let recipe_id = field(&first, "recipe_id");
     let content_id = field(&first, "content_id");
     assert_eq!(recipe_id.len(), 64);
@@ -604,7 +599,7 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
     assert_success(&trace);
     assert!(stdout(&trace).contains("source "));
     assert!(stdout(&trace).contains("invoke ppm.decode"));
-    assert!(stdout(&trace).contains("invoke darken"));
+    assert!(stdout(&trace).contains("invoke copy"));
     assert!(stdout(&trace).contains("invoke ppm.encode"));
 
     let recipes = histima(["recipes", text(&workspace)]);
@@ -622,7 +617,7 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
     assert_eq!(field(&inspected_recipe, "argument_count"), "1");
     assert!(field(&inspected_recipe, "argument[0].semantic_identity").starts_with("recipe:"));
     assert_eq!(field(&inspected_recipe, "observation_count"), "0");
-    assert!(stdout(&inspected_recipe).contains("invoke darken"));
+    assert!(stdout(&inspected_recipe).contains("invoke copy"));
 
     let inspected_content = histima(["inspect", "content", text(&workspace), &content_id]);
     assert_success(&inspected_content);
@@ -636,7 +631,7 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
     assert_eq!(field(&replayed, "recipe_id"), recipe_id);
     assert_eq!(field(&replayed, "content_id"), content_id);
     assert!(stdout(&replayed).contains("execution_engine = interpreter"));
-    assert!(stdout(&replayed).contains("invoke darken"));
+    assert!(stdout(&replayed).contains("invoke copy"));
 
     let materialized = histima([
         "materialize",
@@ -645,7 +640,7 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
         text(&restored),
     ]);
     assert_success(&materialized);
-    assert_eq!(fs::read(&restored).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
+    assert_eq!(fs::read(&restored).unwrap(), b"P3\n1 1\n255\n200 100 50\n");
 
     let stats = histima(["stats", text(&workspace)]);
     assert_success(&stats);
@@ -657,8 +652,8 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
 
     let renamed = fs::read_to_string(&script)
         .unwrap()
-        .replace("transform darken", "transform shade")
-        .replace(" | darken(", " | shade(");
+        .replace("transform copy", "transform shade")
+        .replace(" | copy", " | shade");
     fs::write(&script, renamed).unwrap();
     fs::remove_file(&output).unwrap();
     let second = histima(["run", text(&workspace), text(&script), "--record", "out"]);
@@ -668,16 +663,16 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
     assert!(stdout(&second).contains("invoke shade"));
     assert_eq!(field(&second, "recipe_id"), recipe_id);
     assert_eq!(field(&second, "content_id"), content_id);
-    assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 50 25\n");
+    assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n200 100 50\n");
 
     let renamed_replay = histima(["replay", text(&workspace), text(&script), &recipe_id]);
     assert_success(&renamed_replay);
     assert_eq!(field(&renamed_replay, "content_id"), content_id);
-    assert!(stdout(&renamed_replay).contains("invoke darken"));
+    assert!(stdout(&renamed_replay).contains("invoke copy"));
 
     let semantically_changed = fs::read_to_string(&script)
         .unwrap()
-        .replace("p.r *= factor", "p.r *= 0.25");
+        .replace("return img", "return buffer_zero(img)");
     fs::write(&changed_script, semantically_changed).unwrap();
     let changed_transform = histima([
         "replay",
@@ -701,7 +696,7 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
     assert!(stdout(&changed).contains("result_cache_hits = 0"));
     assert_ne!(field(&changed, "recipe_id"), recipe_id);
     assert_ne!(field(&changed, "content_id"), content_id);
-    assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n50 40 30\n");
+    assert_eq!(fs::read(&output).unwrap(), b"P3\n1 1\n255\n100 80 60\n");
 }
 
 #[test]
@@ -710,7 +705,7 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
     let workspace = test.path().join("workspace");
     let source = test.path().join("source.png");
     let script = test.path().join("pipeline.tima");
-    let output = test.path().join("darkened.webp");
+    let output = test.path().join("copied.webp");
     fs::write(
         &source,
         encode_test_png(2, 1, &[100, 50, 20, 255, 200, 100, 50, 128]),
@@ -722,15 +717,10 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
         &script,
         format!(
             "source = asset({source_locator:?})\n\
-             transform darken(img: Image, factor: f32) -> Image {{\n\
-                 for p in img.pixels {{\n\
-                     p.r *= factor\n\
-                     p.g *= factor\n\
-                     p.b *= factor\n\
-                 }}\n\
+             transform copy(img: Buffer) -> Buffer {{\n\
                  return img\n\
              }}\n\
-             out = source | read | png.decode | darken(0.5) | webp.encode\n\
+             out = source | read | png.decode | copy | webp.encode\n\
              saved = out | save({output_locator:?})\n"
         ),
     )
@@ -761,7 +751,7 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
     let trace = histima(["trace", text(&workspace), &recipe_id]);
     assert_success(&trace);
     assert!(stdout(&trace).contains("invoke png.decode"));
-    assert!(stdout(&trace).contains("invoke darken"));
+    assert!(stdout(&trace).contains("invoke copy"));
     assert!(stdout(&trace).contains("invoke webp.encode"));
 
     let replay = histima(["replay", text(&workspace), text(&script), &recipe_id]);
@@ -783,15 +773,10 @@ fn cli_json_covers_the_workspace_lifecycle() {
         &script,
         format!(
             "source = asset({source_locator:?})\n\
-             transform darken(img: Image, factor: f32) -> Image {{\n\
-                 for p in img.pixels {{\n\
-                     p.r *= factor\n\
-                     p.g *= factor\n\
-                     p.b *= factor\n\
-                 }}\n\
+             transform copy(img: Buffer) -> Buffer {{\n\
                  return img\n\
              }}\n\
-             out = source | read | ppm.decode | darken(0.5) | ppm.encode\n"
+             out = source | read | ppm.decode | copy | ppm.encode\n"
         ),
     )
     .unwrap();
@@ -869,7 +854,7 @@ fn cli_json_covers_the_workspace_lifecycle() {
         "recipe"
     );
     assert_eq!(recipe["observations"].as_array().unwrap().len(), 0);
-    assert!(recipe["trace"].as_str().unwrap().contains("invoke darken"));
+    assert!(recipe["trace"].as_str().unwrap().contains("invoke copy"));
 
     let trace = histima(["trace", text(&workspace), &recipe_id, "--json"]);
     assert_success(&trace);
@@ -1067,8 +1052,8 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
     let transform_id = tima::identity::registered_wasm_transform_identity(
         "fixture.encode",
         1,
-        3,
-        &[("image", 2)],
+        4,
+        &[("buffer", 2)],
         1,
     );
     fs::write(
@@ -1076,13 +1061,13 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
         format!(
             "name = \"fixture.encode\"\n\
              semantic_version = 1\n\
-             abi_version = 3\n\
+             abi_version = 4\n\
              module = \"fixture.wasm\"\n\
              module_content = \"{module_content}\"\n\
              result = \"bytes\"\n\
              [[parameters]]\n\
-             name = \"image\"\n\
-             type = \"rgba8-image\"\n"
+             name = \"buffer\"\n\
+             type = \"buffer\"\n"
         ),
     )
     .unwrap();
@@ -1091,7 +1076,7 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
         "[plugins]\nmanifests = [\"plugins/fixture.toml\"]\n",
     )
     .unwrap();
-    let artifact_id = tima::identity::registered_wasm_artifact_identity(transform_id, &module, 3);
+    let artifact_id = tima::identity::registered_wasm_artifact_identity(transform_id, &module, 4);
     let plugins = histima(["plugins", text(&workspace), "--json"]);
     assert_success(&plugins);
     let plugins = json_output(&plugins);
@@ -1099,16 +1084,16 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
     let plugin = &plugins["plugins"][0];
     assert_eq!(plugin["name"], "fixture.encode");
     assert_eq!(plugin["semantic_version"], 1);
-    assert_eq!(plugin["abi_version"], 3);
+    assert_eq!(plugin["abi_version"], 4);
     assert_eq!(plugin["transform_id"], transform_id.to_string());
     assert_eq!(plugin["artifact_id"], artifact_id.to_string());
     assert_eq!(plugin["module_content_id"], module_content.to_string());
     assert_eq!(
         plugin["signature"],
-        "fixture.encode(image: rgba8-image) -> bytes"
+        "fixture.encode(buffer: buffer) -> bytes"
     );
-    assert_eq!(plugin["parameters"][0]["name"], "image");
-    assert_eq!(plugin["parameters"][0]["type"], "rgba8-image");
+    assert_eq!(plugin["parameters"][0]["name"], "buffer");
+    assert_eq!(plugin["parameters"][0]["type"], "buffer");
     assert_eq!(plugin["result"], "bytes");
 
     let transforms = histima(["transforms", text(&workspace), "--json"]);
@@ -1121,14 +1106,11 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
         .find(|transform| transform["name"] == "ppm.decode")
         .unwrap();
     assert_eq!(builtin["implementation"], "builtin-registered-wasm");
-    assert_eq!(builtin["semantic_version"], 2);
-    assert_eq!(
-        builtin["signature"],
-        "ppm.decode(bytes: bytes) -> rgba8-image"
-    );
+    assert_eq!(builtin["semantic_version"], 3);
+    assert_eq!(builtin["signature"], "ppm.decode(bytes: bytes) -> buffer");
     assert_eq!(
         builtin["transform_id"],
-        tima::identity::registered_transform_identity("ppm.decode", 2).to_string()
+        tima::identity::registered_transform_identity("ppm.decode", 3).to_string()
     );
     assert_eq!(builtin["artifact_id"], Value::Null);
     let external = transforms
@@ -1146,7 +1128,7 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
     assert_eq!(field(&human_plugins, "count"), "1");
     assert_eq!(
         field(&human_plugins, "plugin[0].signature"),
-        "fixture.encode(image: rgba8-image) -> bytes"
+        "fixture.encode(buffer: buffer) -> bytes"
     );
     fs::write(
         &script,

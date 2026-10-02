@@ -632,10 +632,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_owned_image_byte_iteration_in_the_shared_tree() {
+    fn parses_owned_buffer_byte_iteration_in_the_shared_tree() {
         let source = SourceFile::new(
             "test.tima",
-            "transform fill(img: Image, value: u8) -> Image {\n\
+            "transform fill(img: Buffer, value: u8) -> Buffer {\n\
                  for byte in img.bytes {\n\
                      byte = value\n\
                  }\n\
@@ -669,11 +669,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_rgba8_pixel_channel_scale_assignments() {
+    fn parses_member_compound_assignments() {
         let source = SourceFile::new(
             "test.tima",
-            "transform darken(img: Image, factor: f32) -> Image {\n\
-                 for p in img.pixels {\n\
+            "transform update(img: Buffer, factor: f32) -> Buffer {\n\
+                 for p in img.elements {\n\
                      p.r *= factor\n\
                      p.g *= factor\n\
                      p.b *= factor\n\

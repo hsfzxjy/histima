@@ -10,11 +10,9 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::abi::{
-    ABI_IMAGE_FORMAT_RGBA8, ABI_IMAGE_FORMAT_WORD, ABI_IMAGE_HEIGHT_WORD, ABI_IMAGE_STRIDE_WORD,
-    ABI_IMAGE_WIDTH_WORD, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_RUNTIME_USER_DATA_OFFSET,
-    ABI_RUNTIME_WORLD_CALL_OFFSET, ABI_STATUS_IMAGE_FORMAT, ABI_VALUE_BYTES,
-    ABI_WORLD_ENVIRONMENT_READ, ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET, TIMA_ABI_VERSION,
-    abi_callsite,
+    ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_RUNTIME_USER_DATA_OFFSET, ABI_RUNTIME_WORLD_CALL_OFFSET,
+    ABI_VALUE_BYTES, ABI_WORLD_ENVIRONMENT_READ, ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET,
+    TIMA_ABI_VERSION, abi_callsite,
 };
 use crate::ast::BinaryOp;
 use crate::backend::{ArtifactBackend, BackendArtifact};
@@ -28,9 +26,8 @@ pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 
 /// Ahead-of-time native object generation from backend-neutral Tima IR.
 ///
-/// The initial slice accepts scalar and owned/view buffer and image transforms,
-/// including native calls, byte maps, and RGBA8 scaling. Other typed IR is
-/// interpreted.
+/// The initial slice accepts scalars and owned/view strings and bytes. Generic
+/// shaped buffers currently remain on the typed-IR interpreter path.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CraneliftBackend;
 
@@ -300,7 +297,7 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
                 transform.span,
             )
             .with_note(
-                "supported boundary types are bool, u8, i64, f32, String, StringView, Bytes, BytesView, Image, and ImageView",
+                "supported boundary types are bool, u8, i64, f32, String, StringView, Bytes, and BytesView",
             ),
         );
         return diagnostics;
@@ -321,11 +318,13 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
             }
             ValueKind::Binary { .. } => {}
             ValueKind::Call { .. } => {}
-            ValueKind::ImageZero { .. }
-            | ValueKind::ImageFill { .. }
-            | ValueKind::ImageByteElement
-            | ValueKind::ImageByteMap { .. }
-            | ValueKind::ImageRgba8Scale { .. } => {}
+            ValueKind::BufferZero { .. }
+            | ValueKind::BufferFill { .. }
+            | ValueKind::BufferByteElement
+            | ValueKind::BufferByteMap { .. } => diagnostics.push(Diagnostic::error(
+                "generic Buffer operations are outside the current Cranelift AOT subset",
+                value.span,
+            )),
             ValueKind::RuntimeCall(
                 RuntimeCall::EnvironmentRead { .. }
                 | RuntimeCall::FileRead { .. }
@@ -435,50 +434,11 @@ fn lower_transform(
                         value.ty,
                         &values,
                     ),
-                    ValueKind::ImageZero { image } => {
-                        let image = required_image(&values, *image);
-                        emit_image_fill(&mut builder, image, None);
-                        LoweredValue::Image(image)
-                    }
-                    ValueKind::ImageFill { image, value } => {
-                        let image = required_image(&values, *image);
-                        emit_image_fill(
-                            &mut builder,
-                            image,
-                            Some(required_scalar(&values, *value)),
-                        );
-                        LoweredValue::Image(image)
-                    }
-                    ValueKind::ImageByteMap {
-                        image,
-                        element,
-                        instructions,
-                        result,
-                    } => {
-                        let image = required_image(&values, *image);
-                        emit_image_byte_map(
-                            &mut builder,
-                            runtime_context,
-                            image,
-                            *element,
-                            instructions,
-                            *result,
-                            transform,
-                            &function_refs,
-                            &mut values,
-                        );
-                        LoweredValue::Image(image)
-                    }
-                    ValueKind::ImageRgba8Scale { image, channels } => {
-                        let image = required_image(&values, *image);
-                        let channels = channels
-                            .iter()
-                            .map(|(channel, factor)| {
-                                (channel.offset(), required_scalar(&values, *factor))
-                            })
-                            .collect::<Vec<_>>();
-                        emit_image_rgba8_scale(&mut builder, image, &channels);
-                        LoweredValue::Image(image)
+                    ValueKind::BufferZero { .. }
+                    | ValueKind::BufferFill { .. }
+                    | ValueKind::BufferByteElement
+                    | ValueKind::BufferByteMap { .. } => {
+                        unreachable!("validation rejects generic Buffer operations")
                     }
                     ValueKind::RuntimeCall(call) => emit_world_call(
                         &mut builder,
@@ -489,7 +449,6 @@ fn lower_transform(
                         value.ty,
                         &values,
                     ),
-                    _ => unreachable!("validation rejects unsupported operations"),
                 };
                 values[id.0 as usize] = Some(lowered);
             }
@@ -557,7 +516,6 @@ fn world_call_signature(module: &ObjectModule) -> Signature {
 enum LoweredValue {
     Scalar(cranelift_codegen::ir::Value),
     Buffer([cranelift_codegen::ir::Value; 3]),
-    Image([cranelift_codegen::ir::Value; 7]),
 }
 
 fn lower_parameter(
@@ -595,22 +553,12 @@ fn load_abi_value(
             })
             .collect::<Vec<_>>()
     };
-    if matches!(
+    debug_assert!(matches!(
         ty,
         Type::String | Type::StringView | Type::Bytes | Type::BytesView
-    ) {
-        let words = load_words(builder, 3);
-        return LoweredValue::Buffer(words.try_into().unwrap());
-    }
-    debug_assert!(matches!(ty, Type::Image | Type::ImageView));
-    LoweredValue::Image(std::array::from_fn(|word| {
-        builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            pointer,
-            base + i32::try_from(word * 8).unwrap(),
-        )
-    }))
+    ));
+    let words = load_words(builder, 3);
+    LoweredValue::Buffer(words.try_into().unwrap())
 }
 
 fn store_result(
@@ -634,16 +582,6 @@ fn store_abi_value(
                 .store(MemFlagsData::new(), value, pointer, base);
         }
         LoweredValue::Buffer(words) => {
-            for (word, value) in words.into_iter().enumerate() {
-                builder.ins().store(
-                    MemFlagsData::new(),
-                    value,
-                    pointer,
-                    base + i32::try_from(word * 8).unwrap(),
-                );
-            }
-        }
-        LoweredValue::Image(words) => {
             for (word, value) in words.into_iter().enumerate() {
                 builder.ins().store(
                     MemFlagsData::new(),
@@ -782,218 +720,6 @@ fn emit_world_call(
     load_abi_value(builder, result_pointer, result_type, 0)
 }
 
-fn emit_image_fill(
-    builder: &mut FunctionBuilder<'_>,
-    image: [cranelift_codegen::ir::Value; 7],
-    fill: Option<cranelift_codegen::ir::Value>,
-) {
-    let header = builder.create_block();
-    let body = builder.create_block();
-    let done = builder.create_block();
-    builder.append_block_param(header, types::I64);
-    let zero = builder.ins().iconst(types::I64, 0);
-    builder.ins().jump(header, &[zero.into()]);
-
-    builder.switch_to_block(header);
-    let index = builder.block_params(header)[0];
-    let finished = builder.ins().icmp(
-        IntCC::UnsignedGreaterThanOrEqual,
-        index,
-        image[ABI_LENGTH_WORD],
-    );
-    builder.ins().brif(finished, done, &[], body, &[]);
-
-    builder.switch_to_block(body);
-    let address = builder.ins().iadd(image[ABI_POINTER_WORD], index);
-    let fill = fill.unwrap_or_else(|| builder.ins().iconst(types::I8, 0));
-    builder.ins().store(MemFlagsData::new(), fill, address, 0);
-    let one = builder.ins().iconst(types::I64, 1);
-    let next = builder.ins().iadd(index, one);
-    builder.ins().jump(header, &[next.into()]);
-
-    builder.switch_to_block(done);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_image_byte_map(
-    builder: &mut FunctionBuilder<'_>,
-    runtime_context: cranelift_codegen::ir::Value,
-    image: [cranelift_codegen::ir::Value; 7],
-    element: ValueId,
-    instructions: &[ValueId],
-    result: ValueId,
-    transform: &Transform,
-    function_refs: &[cranelift_codegen::ir::FuncRef],
-    values: &mut [Option<LoweredValue>],
-) {
-    let header = builder.create_block();
-    let body = builder.create_block();
-    let done = builder.create_block();
-    builder.append_block_param(header, types::I64);
-    let zero = builder.ins().iconst(types::I64, 0);
-    builder.ins().jump(header, &[zero.into()]);
-
-    builder.switch_to_block(header);
-    let index = builder.block_params(header)[0];
-    let finished = builder.ins().icmp(
-        IntCC::UnsignedGreaterThanOrEqual,
-        index,
-        image[ABI_LENGTH_WORD],
-    );
-    builder.ins().brif(finished, done, &[], body, &[]);
-
-    builder.switch_to_block(body);
-    let address = builder.ins().iadd(image[ABI_POINTER_WORD], index);
-    let byte = builder
-        .ins()
-        .load(types::I8, MemFlagsData::new(), address, 0);
-    values[element.0 as usize] = Some(LoweredValue::Scalar(byte));
-    for instruction in instructions {
-        let value = transform.value(*instruction);
-        let lowered = match &value.kind {
-            ValueKind::Constant(constant) => {
-                LoweredValue::Scalar(lower_constant(builder, constant, value.ty))
-            }
-            ValueKind::Binary { op, left, right } => LoweredValue::Scalar(lower_binary(
-                builder,
-                *op,
-                required_scalar(values, *left),
-                required_scalar(values, *right),
-                transform.value(*left).ty,
-            )),
-            ValueKind::Call {
-                transform: callee,
-                arguments,
-            } => emit_transform_call(
-                builder,
-                runtime_context,
-                function_refs[callee.0 as usize],
-                arguments,
-                value.ty,
-                values,
-            ),
-            _ => unreachable!("typed image byte maps contain scalar instructions"),
-        };
-        values[instruction.0 as usize] = Some(lowered);
-    }
-    builder.ins().store(
-        MemFlagsData::new(),
-        required_scalar(values, result),
-        address,
-        0,
-    );
-    let next = builder.ins().iadd_imm_u(index, 1);
-    builder.ins().jump(header, &[next.into()]);
-
-    builder.switch_to_block(done);
-}
-
-fn emit_image_rgba8_scale(
-    builder: &mut FunctionBuilder<'_>,
-    image: [cranelift_codegen::ir::Value; 7],
-    channels: &[(usize, cranelift_codegen::ir::Value)],
-) {
-    let valid_format = builder.create_block();
-    let invalid_format = builder.create_block();
-    let expected_format = builder
-        .ins()
-        .iconst(types::I64, i64::from(ABI_IMAGE_FORMAT_RGBA8));
-    let format_matches =
-        builder
-            .ins()
-            .icmp(IntCC::Equal, image[ABI_IMAGE_FORMAT_WORD], expected_format);
-    builder
-        .ins()
-        .brif(format_matches, valid_format, &[], invalid_format, &[]);
-    builder.switch_to_block(invalid_format);
-    let status = builder
-        .ins()
-        .iconst(types::I32, i64::from(ABI_STATUS_IMAGE_FORMAT));
-    builder.ins().return_(&[status]);
-    builder.switch_to_block(valid_format);
-
-    let row_header = builder.create_block();
-    let pixel_header = builder.create_block();
-    let pixel_body = builder.create_block();
-    let next_row = builder.create_block();
-    let done = builder.create_block();
-    builder.append_block_param(row_header, types::I64);
-    builder.append_block_param(pixel_header, types::I64);
-    builder.append_block_param(pixel_header, types::I64);
-
-    let zero = builder.ins().iconst(types::I64, 0);
-    builder.ins().jump(row_header, &[zero.into()]);
-
-    builder.switch_to_block(row_header);
-    let row = builder.block_params(row_header)[0];
-    let rows_finished = builder.ins().icmp(
-        IntCC::UnsignedGreaterThanOrEqual,
-        row,
-        image[ABI_IMAGE_HEIGHT_WORD],
-    );
-    builder.ins().brif(
-        rows_finished,
-        done,
-        &[],
-        pixel_header,
-        &[row.into(), zero.into()],
-    );
-
-    builder.switch_to_block(pixel_header);
-    let row = builder.block_params(pixel_header)[0];
-    let column = builder.block_params(pixel_header)[1];
-    let pixels_finished = builder.ins().icmp(
-        IntCC::UnsignedGreaterThanOrEqual,
-        column,
-        image[ABI_IMAGE_WIDTH_WORD],
-    );
-    builder
-        .ins()
-        .brif(pixels_finished, next_row, &[], pixel_body, &[]);
-
-    builder.switch_to_block(pixel_body);
-    let row_offset = builder.ins().imul(row, image[ABI_IMAGE_STRIDE_WORD]);
-    let pixel_offset = builder.ins().imul_imm_u(column, 4);
-    let offset = builder.ins().iadd(row_offset, pixel_offset);
-    let pixel = builder.ins().iadd(image[ABI_POINTER_WORD], offset);
-    for (channel, factor) in channels {
-        let address = builder
-            .ins()
-            .iadd_imm_u(pixel, i64::try_from(*channel).unwrap());
-        let byte = builder
-            .ins()
-            .load(types::I8, MemFlagsData::new(), address, 0);
-        let byte = builder.ins().uextend(types::I32, byte);
-        let byte = builder.ins().fcvt_from_uint(types::F32, byte);
-        let scaled = builder.ins().fmul(byte, *factor);
-        let converted = builder.ins().fcvt_to_uint_sat(types::I32, scaled);
-        let converted = builder.ins().ireduce(types::I8, converted);
-        let float_zero = builder.ins().f32const(Ieee32::with_bits(0.0f32.to_bits()));
-        let positive = builder.ins().fcmp(FloatCC::GreaterThan, scaled, float_zero);
-        let maximum_float = builder
-            .ins()
-            .f32const(Ieee32::with_bits(255.0f32.to_bits()));
-        let saturated = builder
-            .ins()
-            .fcmp(FloatCC::GreaterThanOrEqual, scaled, maximum_float);
-        let maximum = builder.ins().iconst(types::I8, 255);
-        let zero = builder.ins().iconst(types::I8, 0);
-        let upper_bounded = builder.ins().select(saturated, maximum, converted);
-        let result = builder.ins().select(positive, upper_bounded, zero);
-        builder.ins().store(MemFlagsData::new(), result, address, 0);
-    }
-    let next_column = builder.ins().iadd_imm_u(column, 1);
-    builder
-        .ins()
-        .jump(pixel_header, &[row.into(), next_column.into()]);
-
-    builder.switch_to_block(next_row);
-    let next_row = builder.ins().iadd_imm_u(row, 1);
-    builder.ins().jump(row_header, &[next_row.into()]);
-
-    builder.switch_to_block(done);
-}
-
 fn lower_constant(
     builder: &mut FunctionBuilder<'_>,
     constant: &Constant,
@@ -1076,12 +802,7 @@ fn native_boundary_type(ty: Type) -> bool {
     scalar_type(ty)
         || matches!(
             ty,
-            Type::String
-                | Type::StringView
-                | Type::Bytes
-                | Type::BytesView
-                | Type::Image
-                | Type::ImageView
+            Type::String | Type::StringView | Type::Bytes | Type::BytesView
         )
 }
 
@@ -1115,16 +836,6 @@ fn required_buffer(
 ) -> [cranelift_codegen::ir::Value; 3] {
     let LoweredValue::Buffer(value) = required_value(values, id) else {
         unreachable!("typed buffer operation has a buffer operand")
-    };
-    value
-}
-
-fn required_image(
-    values: &[Option<LoweredValue>],
-    id: ValueId,
-) -> [cranelift_codegen::ir::Value; 7] {
-    let LoweredValue::Image(value) = required_value(values, id) else {
-        unreachable!("typed image operation has an image operand")
     };
     value
 }

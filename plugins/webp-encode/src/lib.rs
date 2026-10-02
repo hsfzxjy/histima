@@ -1,12 +1,11 @@
 use std::mem;
 use std::slice;
 
-const PLUGIN_ABI_VERSION: u32 = 3;
-const VALUE_IMAGE_VIEW: u32 = 2;
+const PLUGIN_ABI_VERSION: u32 = 4;
+const VALUE_BUFFER_VIEW: u32 = 2;
 const VALUE_I64: u32 = 3;
 const VALUE_BYTES: u32 = 4;
 const VALUE_DIAGNOSTIC: u32 = 255;
-const IMAGE_FORMAT_RGBA8: u32 = 1;
 const MAX_DIMENSION: u32 = 16_383;
 
 #[repr(C)]
@@ -63,12 +62,12 @@ fn encode(arguments_pointer: u32, argument_count: u32) -> Result<Vec<u8>, String
             argument_count as usize,
         )
     };
-    let image = arguments[0];
-    if image.words[0] != VALUE_IMAGE_VIEW {
-        return Err("webp.encode expects an ImageView first".to_owned());
+    let buffer = arguments[0];
+    if buffer.words[0] != VALUE_BUFFER_VIEW {
+        return Err("webp.encode expects a BufferView first".to_owned());
     }
-    if image.words[3] != IMAGE_FORMAT_RGBA8 || image.words[7] != 0 {
-        return Err("webp.encode requires an RGBA8 image".to_owned());
+    if buffer.words[3] != 3 || buffer.words[6] != 4 {
+        return Err("webp.encode requires Buffer shape [height, width, 4]".to_owned());
     }
     let quality = arguments[1];
     if quality.words[0] != VALUE_I64 || quality.words[3..].iter().any(|word| *word != 0) {
@@ -82,13 +81,13 @@ fn encode(arguments_pointer: u32, argument_count: u32) -> Result<Vec<u8>, String
         return Err("webp.encode quality must be from 0 through 100".to_owned());
     }
 
-    let width = image.words[4];
-    let height = image.words[5];
+    let height = buffer.words[4];
+    let width = buffer.words[5];
     if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err("webp.encode dimensions must each be from 1 through 16383".to_owned());
     }
-    let byte_length = image.words[2] as usize;
-    let stride = image.words[6] as usize;
+    let byte_length = buffer.words[2] as usize;
+    let stride = buffer.words[7] as usize;
     let row_length = (width as usize)
         .checked_mul(4)
         .ok_or_else(|| "webp.encode row byte length overflowed".to_owned())?;
@@ -101,7 +100,8 @@ fn encode(arguments_pointer: u32, argument_count: u32) -> Result<Vec<u8>, String
     if byte_length != expected_length {
         return Err("webp.encode image byte length is invalid".to_owned());
     }
-    let input = unsafe { slice::from_raw_parts(image.words[1] as usize as *const u8, byte_length) };
+    let input =
+        unsafe { slice::from_raw_parts(buffer.words[1] as usize as *const u8, byte_length) };
     let packed_length = (height as usize)
         .checked_mul(row_length)
         .ok_or_else(|| "webp.encode packed byte length overflowed".to_owned())?;

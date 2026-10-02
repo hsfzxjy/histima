@@ -345,7 +345,7 @@ fn parse_recorded(
                 Error::catalog("stored string has no value")
             })?)))
         }
-        "bytes" | "list" | "record" | "image" => {
+        "bytes" | "list" | "record" | "buffer" => {
             if text.is_some() {
                 return Err(Error::catalog(format!(
                     "stored materialized {kind} unexpectedly has inline text"
@@ -358,7 +358,7 @@ fn parse_recorded(
                 "bytes" => "bytes",
                 "list" => "list",
                 "record" => "record",
-                "image" => "image",
+                "buffer" => "buffer",
                 _ => unreachable!(),
             };
             Ok(RecordedValue::Materialized { kind, content_id })

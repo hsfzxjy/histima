@@ -554,10 +554,10 @@ fn manifest_missing(field: &str, path: &Path) -> Error {
 fn manifest_value_type(value: &str, path: &Path) -> Result<PluginValueType> {
     match value {
         "bytes" => Ok(PluginValueType::Bytes),
-        "rgba8-image" => Ok(PluginValueType::Rgba8Image),
+        "buffer" => Ok(PluginValueType::Buffer),
         "i64" => Ok(PluginValueType::I64),
         _ => Err(Error::catalog(format!(
-            "plugin manifest {} has unsupported value type {value:?}; expected bytes, rgba8-image, or i64",
+            "plugin manifest {} has unsupported value type {value:?}; expected bytes, buffer, or i64",
             path.display()
         ))),
     }

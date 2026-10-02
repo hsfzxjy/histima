@@ -1514,7 +1514,7 @@ fn recorded_value(value: &RecordedValue) -> Result<(&'static str, Option<String>
         ),
         RecordedValue::String(value) => ("string", Some(value.to_string()), None),
         RecordedValue::Materialized { kind, content_id } => {
-            if !matches!(*kind, "bytes" | "list" | "record" | "image") {
+            if !matches!(*kind, "bytes" | "list" | "record" | "buffer") {
                 return Err(Error::catalog(format!(
                     "unsupported recorded materialized value kind {kind:?}"
                 )));

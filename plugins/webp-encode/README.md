@@ -1,6 +1,6 @@
 # WebP encoder plugin
 
-This registered-Wasm plugin implements `webp.encode(ImageView, i64) -> Bytes`
+This registered-Wasm plugin implements `webp.encode(BufferView, i64) -> Bytes`
 with the same pinned pure-Rust encoder and lossy configuration as the original
 host implementation. It has no WASI or other imports. Its input and output
 allocations are reclaimed when the per-invocation Wasm instance is dropped.

@@ -8,9 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use libloading::Library;
 
 use crate::abi::{
-    ABI_ALLOCATION_BYTES, ABI_ALLOCATION_IMAGE, ABI_ALLOCATION_STRING, ABI_CAPACITY_WORD,
-    ABI_IMAGE_FORMAT_WORD, ABI_IMAGE_HEIGHT_WORD, ABI_IMAGE_STRIDE_WORD, ABI_IMAGE_WIDTH_WORD,
-    ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_IMAGE_FORMAT, ABI_STATUS_OK, ABI_STATUS_RUNTIME,
+    ABI_ALLOCATION_BUFFER, ABI_ALLOCATION_BYTES, ABI_ALLOCATION_STRING, ABI_BUFFER_RANK_WORD,
+    ABI_CAPACITY_WORD, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_OK, ABI_STATUS_RUNTIME,
     ABI_WORLD_ENVIRONMENT_READ, ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET, AbiRuntimeContext,
     AbiValue, abi_callsite,
 };
@@ -68,15 +67,6 @@ impl NativeScalar {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct NativeImage {
-    pub bytes: Vec<u8>,
-    pub format: u32,
-    pub width: usize,
-    pub height: usize,
-    pub stride: usize,
-}
-
 #[derive(Debug, PartialEq)]
 pub(crate) struct NativeBuffer {
     pub bytes: Vec<u8>,
@@ -87,23 +77,12 @@ pub(crate) struct NativeBufferView<'a> {
     pub bytes: &'a [u8],
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct NativeImageView<'a> {
-    pub bytes: &'a [u8],
-    pub format: u32,
-    pub width: usize,
-    pub height: usize,
-    pub stride: usize,
-}
-
 pub(crate) enum NativeArgument<'a> {
     Scalar(NativeScalar),
     String(&'a mut NativeBuffer),
     StringView(NativeBufferView<'a>),
     Bytes(&'a mut NativeBuffer),
     BytesView(NativeBufferView<'a>),
-    Image(&'a mut NativeImage),
-    ImageView(NativeImageView<'a>),
 }
 
 impl NativeArgument<'_> {
@@ -114,8 +93,6 @@ impl NativeArgument<'_> {
             Self::StringView(_) => Type::StringView,
             Self::Bytes(_) => Type::Bytes,
             Self::BytesView(_) => Type::BytesView,
-            Self::Image(_) => Type::Image,
-            Self::ImageView(_) => Type::ImageView,
         }
     }
 
@@ -130,24 +107,6 @@ impl NativeArgument<'_> {
             Self::StringView(buffer) | Self::BytesView(buffer) => {
                 buffer_value(buffer.bytes.as_ptr(), buffer.bytes.len(), 0)
             }
-            Self::Image(image) => image_value(
-                image.bytes.as_ptr(),
-                image.bytes.len(),
-                image.bytes.capacity(),
-                image.format,
-                image.width,
-                image.height,
-                image.stride,
-            ),
-            Self::ImageView(image) => image_value(
-                image.bytes.as_ptr(),
-                image.bytes.len(),
-                0,
-                image.format,
-                image.width,
-                image.height,
-                image.stride,
-            ),
         }
     }
 }
@@ -162,8 +121,6 @@ pub(crate) enum NativeResult {
     OwnedBytesArgument(usize),
     OwnedBytesAllocation(NativeBuffer),
     BytesViewArgument(usize),
-    OwnedImageArgument(usize),
-    ImageViewArgument(usize),
 }
 
 fn buffer_value(pointer: *const u8, length: usize, capacity: usize) -> AbiValue {
@@ -236,9 +193,9 @@ unsafe extern "C" fn abi_allocate(
     let ty = match kind {
         ABI_ALLOCATION_STRING => Type::String,
         ABI_ALLOCATION_BYTES => Type::Bytes,
-        ABI_ALLOCATION_IMAGE => {
+        ABI_ALLOCATION_BUFFER => {
             return state.fail(Diagnostic::error(
-                "native image allocation requires layout metadata and is not available yet",
+                "native Buffer allocation is not implemented",
                 Span::default(),
             ));
         }
@@ -330,31 +287,10 @@ unsafe extern "C" fn abi_world_call(
     ABI_STATUS_OK
 }
 
-fn image_value(
-    pointer: *const u8,
-    length: usize,
-    capacity: usize,
-    format: u32,
-    width: usize,
-    height: usize,
-    stride: usize,
-) -> AbiValue {
-    let mut value = AbiValue::default();
-    value.words[ABI_POINTER_WORD] = pointer as usize as u64;
-    value.words[ABI_LENGTH_WORD] = length as u64;
-    value.words[ABI_CAPACITY_WORD] = capacity as u64;
-    value.words[ABI_IMAGE_FORMAT_WORD] = u64::from(format);
-    value.words[ABI_IMAGE_WIDTH_WORD] = width as u64;
-    value.words[ABI_IMAGE_HEIGHT_WORD] = height as u64;
-    value.words[ABI_IMAGE_STRIDE_WORD] = stride as u64;
-    value
-}
-
 #[derive(Clone, Debug)]
 struct NativeSignature {
     parameters: Vec<Type>,
     result: Type,
-    rgba8_failure_span: Option<Span>,
     span: Span,
 }
 
@@ -464,11 +400,6 @@ impl NativeModule {
                     .map(|parameter| parameter.ty)
                     .collect(),
                 result: transform.return_type,
-                rgba8_failure_span: reachable_rgba8_span(
-                    module,
-                    TransformId(*original_index as u32),
-                    &mut vec![false; module.transforms.len()],
-                ),
                 span: transform.span,
             });
             for (value_index, value) in transform.values.iter().enumerate() {
@@ -594,12 +525,6 @@ impl NativeModule {
         if let Some(diagnostic) = state.diagnostic.take() {
             return Err(diagnostic);
         }
-        if status == ABI_STATUS_IMAGE_FORMAT {
-            return Err(Diagnostic::error(
-                "image pixel iteration requires RGBA8 format",
-                signature.rgba8_failure_span.unwrap_or(signature.span),
-            ));
-        }
         if status != ABI_STATUS_OK {
             return Err(Diagnostic::error(
                 format!("native transform returned ABI status {status}"),
@@ -632,12 +557,6 @@ impl NativeModule {
                 (Type::BytesView, NativeArgument::BytesView(_)) => {
                     Ok(NativeResult::BytesViewArgument(index))
                 }
-                (Type::Image, NativeArgument::Image(_)) => {
-                    Ok(NativeResult::OwnedImageArgument(index))
-                }
-                (Type::ImageView, NativeArgument::ImageView(_)) => {
-                    Ok(NativeResult::ImageViewArgument(index))
-                }
                 _ => continue,
             };
         }
@@ -666,7 +585,7 @@ impl NativeModule {
 
 fn copy_string_view(descriptor: AbiValue, span: Span) -> Result<String, Diagnostic> {
     if descriptor.words[ABI_CAPACITY_WORD] != 0
-        || descriptor.words[ABI_IMAGE_FORMAT_WORD..]
+        || descriptor.words[ABI_BUFFER_RANK_WORD..]
             .iter()
             .any(|word| *word != 0)
     {
@@ -699,28 +618,6 @@ fn copy_string_view(descriptor: AbiValue, span: Span) -> Result<String, Diagnost
     std::str::from_utf8(bytes)
         .map(str::to_owned)
         .map_err(|_| Diagnostic::error("native StringView result is not valid UTF-8", span))
-}
-
-fn reachable_rgba8_span(
-    module: &TypedModule,
-    id: TransformId,
-    visiting: &mut [bool],
-) -> Option<Span> {
-    let index = id.0 as usize;
-    if visiting[index] {
-        return None;
-    }
-    visiting[index] = true;
-    let transform = module.get(id);
-    let span = transform.values.iter().find_map(|value| match &value.kind {
-        ValueKind::ImageRgba8Scale { .. } => Some(value.span),
-        ValueKind::Call {
-            transform: callee, ..
-        } => reachable_rgba8_span(module, *callee, visiting),
-        _ => None,
-    });
-    visiting[index] = false;
-    span
 }
 
 fn link_load_image(object_path: &Path, export_count: usize) -> Result<PathBuf, Diagnostic> {
@@ -841,13 +738,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        NativeArgument, NativeBuffer, NativeBufferView, NativeCallState, NativeImage,
-        NativeImageView, NativeModule, NativeResult, NativeScalar, abi_allocate,
+        NativeArgument, NativeBuffer, NativeBufferView, NativeCallState, NativeModule,
+        NativeResult, NativeScalar, abi_allocate,
     };
-    use crate::abi::{
-        ABI_ALLOCATION_BYTES, ABI_IMAGE_FORMAT_OPAQUE_BYTES, ABI_IMAGE_FORMAT_RGBA8,
-        ABI_POINTER_WORD, ABI_STATUS_OK, AbiValue,
-    };
+    use crate::abi::{ABI_ALLOCATION_BYTES, ABI_POINTER_WORD, ABI_STATUS_OK, AbiValue};
     use crate::backend::cache::ArtifactCacheStatus;
     use crate::capability::{CapabilitySession, World};
     use crate::ir::{TransformId, Type};
@@ -1164,234 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn links_native_calls_and_maps_image_bytes_through_a_scalar_callee() {
-        let compiled = crate::compile(
-            "calls.tima",
-            "transform checked(left: i64, right: i64) -> i64 { return left + right }\n\
-             transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
-                 if current == target { return replacement } else { return current }\n\
-             }\n\
-             transform replace(img: Image, target: u8, replacement: u8) -> Image {\n\
-                 for byte in img.bytes { byte = choose(byte, target, replacement) }\n\
-                 return img\n\
-             }\n\
-             transform choose_once(current: u8, target: u8, replacement: u8) -> u8 {\n\
-                 return choose(current, target, replacement)\n\
-             }\n\
-             transform clear(img: Image) -> Image { return image_zero(img) }\n\
-             transform clear_through_call(img: Image) -> Image { return clear(img) }\n",
-        )
-        .unwrap();
-        let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
-            .unwrap()
-            .unwrap();
-        assert!(!native.contains(TransformId(0)));
-        for id in 1..=5 {
-            assert!(native.contains(TransformId(id)));
-        }
-
-        let mut image = NativeImage {
-            bytes: vec![1, 2, 1, 3],
-            format: ABI_IMAGE_FORMAT_OPAQUE_BYTES,
-            width: 2,
-            height: 2,
-            stride: 2,
-        };
-        {
-            let mut arguments = [
-                NativeArgument::Image(&mut image),
-                NativeArgument::Scalar(NativeScalar::U8(1)),
-                NativeArgument::Scalar(NativeScalar::U8(9)),
-            ];
-            assert_eq!(
-                native.invoke(TransformId(2), &mut arguments).unwrap(),
-                NativeResult::OwnedImageArgument(0)
-            );
-        }
-        assert_eq!(image.bytes, vec![9, 2, 9, 3]);
-
-        assert_eq!(
-            native
-                .invoke_scalars(
-                    TransformId(3),
-                    &[
-                        NativeScalar::U8(4),
-                        NativeScalar::U8(4),
-                        NativeScalar::U8(7),
-                    ],
-                )
-                .unwrap(),
-            NativeScalar::U8(7)
-        );
-
-        let mut image = NativeImage {
-            bytes: vec![8, 7, 6, 5],
-            format: ABI_IMAGE_FORMAT_OPAQUE_BYTES,
-            width: 2,
-            height: 2,
-            stride: 2,
-        };
-        {
-            let mut arguments = [NativeArgument::Image(&mut image)];
-            assert_eq!(
-                native.invoke(TransformId(5), &mut arguments).unwrap(),
-                NativeResult::OwnedImageArgument(0)
-            );
-        }
-        assert_eq!(image.bytes, vec![0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn executes_owned_and_view_image_operations_through_descriptors() {
-        let compiled = crate::compile(
-            "images.tima",
-            "transform fill(img: Image, value: u8) -> Image { return image_fill(img, value) }\n\
-             transform view(img: ImageView) -> ImageView { return img }\n\
-             transform zero(img: Image) -> Image { return image_zero(img) }\n\
-             transform adjust(img: Image, r: f32, g: f32, b: f32, a: f32) -> Image {\n\
-                 for p in img.pixels {\n\
-                     p.r *= r\n\
-                     p.g *= g\n\
-                     p.b *= b\n\
-                     p.a *= a\n\
-                 }\n\
-                 return img\n\
-             }\n\
-             transform adjust_through_call(img: Image, factor: f32) -> Image {\n\
-                 return adjust(img, factor, factor, factor, factor)\n\
-             }\n\
-             transform prepare_and_adjust(img: Image, factor: f32) -> Image {\n\
-                 prepared = zero(img)\n\
-                 for p in prepared.pixels { p.r *= factor }\n\
-                 return prepared\n\
-             }\n",
-        )
-        .unwrap();
-        let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
-            .unwrap()
-            .unwrap();
-
-        let mut image = NativeImage {
-            bytes: vec![1, 2, 3, 4],
-            format: 0,
-            width: 2,
-            height: 2,
-            stride: 2,
-        };
-        let owned_pointer = image.bytes.as_ptr();
-        {
-            let mut arguments = [
-                NativeArgument::Image(&mut image),
-                NativeArgument::Scalar(NativeScalar::U8(7)),
-            ];
-            assert_eq!(
-                native.invoke(TransformId(0), &mut arguments).unwrap(),
-                NativeResult::OwnedImageArgument(0)
-            );
-        }
-        assert_eq!(image.bytes, vec![7, 7, 7, 7]);
-        assert_eq!(image.bytes.as_ptr(), owned_pointer);
-
-        let bytes = vec![9, 8, 7, 6];
-        let mut arguments = [NativeArgument::ImageView(NativeImageView {
-            bytes: &bytes,
-            format: 0,
-            width: 2,
-            height: 2,
-            stride: 2,
-        })];
-        assert_eq!(
-            native.invoke(TransformId(1), &mut arguments).unwrap(),
-            NativeResult::ImageViewArgument(0)
-        );
-        assert_eq!(bytes, vec![9, 8, 7, 6]);
-
-        let mut image = NativeImage {
-            bytes: vec![5, 4, 3, 2],
-            format: 0,
-            width: 2,
-            height: 2,
-            stride: 2,
-        };
-        {
-            let mut arguments = [NativeArgument::Image(&mut image)];
-            assert_eq!(
-                native.invoke(TransformId(2), &mut arguments).unwrap(),
-                NativeResult::OwnedImageArgument(0)
-            );
-        }
-        assert_eq!(image.bytes, vec![0, 0, 0, 0]);
-
-        let mut image = NativeImage {
-            bytes: vec![101, 200, 200, 1, 2, 3, 4, 5, 99, 100],
-            format: ABI_IMAGE_FORMAT_RGBA8,
-            width: 2,
-            height: 1,
-            stride: 10,
-        };
-        {
-            let mut arguments = [
-                NativeArgument::Image(&mut image),
-                NativeArgument::Scalar(NativeScalar::F32(0.5)),
-                NativeArgument::Scalar(NativeScalar::F32(2.0)),
-                NativeArgument::Scalar(NativeScalar::F32(f32::NAN)),
-                NativeArgument::Scalar(NativeScalar::F32(f32::INFINITY)),
-            ];
-            assert_eq!(
-                native.invoke(TransformId(3), &mut arguments).unwrap(),
-                NativeResult::OwnedImageArgument(0)
-            );
-        }
-        assert_eq!(image.bytes, vec![50, 255, 0, 255, 1, 6, 0, 255, 99, 100]);
-
-        let mut opaque = NativeImage {
-            bytes: vec![1, 2, 3, 4],
-            format: ABI_IMAGE_FORMAT_OPAQUE_BYTES,
-            width: 1,
-            height: 1,
-            stride: 4,
-        };
-        let mut arguments = [
-            NativeArgument::Image(&mut opaque),
-            NativeArgument::Scalar(NativeScalar::F32(1.0)),
-            NativeArgument::Scalar(NativeScalar::F32(1.0)),
-            NativeArgument::Scalar(NativeScalar::F32(1.0)),
-            NativeArgument::Scalar(NativeScalar::F32(1.0)),
-        ];
-        let error = native.invoke(TransformId(3), &mut arguments).unwrap_err();
-        assert!(error.message.contains("requires RGBA8 format"));
-
-        let mut opaque = NativeImage {
-            bytes: vec![1, 2, 3, 4],
-            format: ABI_IMAGE_FORMAT_OPAQUE_BYTES,
-            width: 1,
-            height: 1,
-            stride: 4,
-        };
-        let mut arguments = [
-            NativeArgument::Image(&mut opaque),
-            NativeArgument::Scalar(NativeScalar::F32(0.5)),
-        ];
-        let error = native.invoke(TransformId(4), &mut arguments).unwrap_err();
-        assert!(error.message.contains("requires RGBA8 format"));
-
-        let mut opaque = NativeImage {
-            bytes: vec![1, 2, 3, 4],
-            format: ABI_IMAGE_FORMAT_OPAQUE_BYTES,
-            width: 1,
-            height: 1,
-            stride: 4,
-        };
-        let mut arguments = [
-            NativeArgument::Image(&mut opaque),
-            NativeArgument::Scalar(NativeScalar::F32(0.5)),
-        ];
-        let error = native.invoke(TransformId(5), &mut arguments).unwrap_err();
-        assert!(error.message.contains("requires RGBA8 format"));
-    }
-
-    #[test]
-    fn modules_without_supported_transforms_need_no_load_image() {
+    fn modules_without_supported_transforms_need_no_load_library() {
         let compiled = crate::compile(
             "interpreted.tima",
             "transform checked(left: i64, right: i64) -> i64 { return left + right }\n",

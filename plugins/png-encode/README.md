@@ -1,6 +1,6 @@
 # PNG encoder plugin
 
-This registered-Wasm plugin implements `png.encode(ImageView, i64) -> Bytes`
+This registered-Wasm plugin implements `png.encode(BufferView, i64) -> Bytes`
 with the same pinned `png` crate and deterministic settings as the original
 host implementation. It has no WASI or other imports. Its input and output
 allocations are reclaimed when the per-invocation Wasm instance is dropped.

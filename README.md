@@ -21,19 +21,17 @@ The repository currently provides:
 
 The typed IR is the semantic compiler boundary. Native compilation uses
 ahead-of-time Cranelift, not JIT. WebAssembly is reserved for separately
-registered plugin transforms whose ABI is still deferred. Tima does not
-generate or execute WebAssembly for inner-language transforms.
+registered plugin transforms; Tima does not generate WebAssembly for
+inner-language transforms.
 
 The AOT Cranelift slice can emit a host relocatable object with `cargo run -p
-tima -- emit-object program.tima`, or link and execute supported scalar and
-image transforms with `cargo run -p tima -- run-native program.tima`. The
-latter is a hybrid path: unsupported transforms remain interpreted. Its native
-ABI supports zero-copy immutable image views and ownership transfer for image
-identity, zero, fill, byte-map, and RGBA8 channel-scaling operations. Supported
-inner transform calls are linked in the same artifact; a caller falls back to
-the interpreter when any transitive callee is unsupported. Histima still uses
-the interpreter while the remaining buffer operations and World callbacks are
-implemented.
+tima -- emit-object program.tima`, or link and execute supported scalar,
+String, and Bytes transforms with `cargo run -p tima -- run-native
+program.tima`. The latter is a hybrid path: Buffer operations and other
+unsupported transforms remain interpreted. Supported inner transform calls
+are linked in the same artifact; a caller falls back to the interpreter when
+any transitive callee is unsupported. Histima still uses the interpreter while
+the remaining Buffer operations and World callbacks are implemented.
 
 ## Build and try it
 
@@ -120,39 +118,34 @@ remains integer division. Fractions are currently outer-only.
 ```tima
 source = asset("cat.png")
 
-transform darken(img: Image, factor: f32) -> Image {
-    for p in img.pixels {
-        p.r *= factor
-        p.g *= factor
-        p.b *= factor
-    }
-    return img
+transform copy(buffer: Buffer) -> Buffer {
+    return buffer
 }
 
 out =
     source
     | read
     | png.decode
-    | darken(0.8)
+    | copy
     | webp.encode(quality=85)
 
 derivation = trace(out)
 replayed = replay(out)
 ```
 
-Outer composites are immutable. Inner owned values such as `Image`, `Bytes`,
-and `String` are unique and consumable; `ImageView`, `BytesView`, and
+Outer composites are immutable. Inner owned values such as `Buffer`, `Bytes`,
+and `String` are unique and consumable; `BufferView`, `BytesView`, and
 `StringView` are read-only and may alias. Returning to outer code freezes the
 value. Dynamic outer tags, lineage, and cache metadata do not enter inner
 representations.
 
-Image support currently includes opaque byte rows and validated RGBA8 storage,
-owned byte loops, `image_zero`, `image_fill`, and constrained RGBA8 channel
-scaling. Registered deterministic codecs currently include PPM and PNG
-decode/encode and WebP encode. They use the same Transform/Recipe/Content
-identity, lineage, cache, and replay model as user transforms. The PPM, PNG,
-and WebP implementations all run as fuel- and memory-bounded registered-Wasm
-plugins.
+`Buffer` is general rank-1-through-rank-3 shaped `u8` storage with dense inner
+dimensions and an explicit outer stride. It has no image format in the Tima
+type system. Registered deterministic codecs currently include PPM and PNG
+decode/encode and WebP encode; their ordinary transform contracts interpret
+`[height, width, 4]` buffers as RGBA8. They use the same
+Transform/Recipe/Content identity, lineage, cache, and replay model as user
+transforms and run as fuel- and memory-bounded registered-Wasm plugins.
 
 Any outer value with one selected semantic identity can be pinned as
 `value#hash`, where `hash` is a full lowercase identity or prefix. Transform
@@ -234,18 +227,18 @@ manifests = ["plugins/example-encode.toml"]
 # <workspace>/plugins/example-encode.toml
 name = "example.encode"
 semantic_version = 1
-abi_version = 3
+abi_version = 4
 module = "example_encode.wasm"
 module_content = "<64-character Tima Content ID of the module bytes>"
 result = "bytes"
 
 [[parameters]]
-name = "image"
-type = "rgba8-image"
+name = "buffer"
+type = "buffer"
 ```
 
-The current manifest types are `bytes`, `rgba8-image`, and `i64`; results are
-limited to `bytes` or `rgba8-image`. Manifest and module paths are resolved and
+The current manifest types are `bytes`, `buffer`, and `i64`; results are
+limited to `bytes` or `buffer`. Manifest and module paths are resolved and
 required to remain inside the canonical workspace. Opening the workspace
 verifies the declared module Content ID, ABI version, signature, exports,
 absence of imports/WASI, and transform-name uniqueness before compiling the

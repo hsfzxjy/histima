@@ -333,8 +333,8 @@ mod tests {
         let source = SourceFile::new(
             "test",
             "transform f(flag: bool, x: f32) -> f32 { if flag { return x } else { return x } }\n\
-             transform fill(img: Image, value: u8) -> Image { for byte in img.bytes { byte = value }; return img }\n\
-             transform darken(img: Image, factor: f32) -> Image { for p in img.pixels { p.r *= factor }; return img }\n\
+             transform fill(img: Buffer, value: u8) -> Buffer { for byte in img.bytes { byte = value }; return img }\n\
+             transform update(img: Buffer, factor: f32) -> Buffer { for p in img.elements { p.r *= factor }; return img }\n\
              y = 1 | f\n comparisons = a == b != c < d <= e > f >= g",
         );
         let tokens = lex(&source).unwrap();

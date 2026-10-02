@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use crate::diagnostic::Diagnostic;
 use crate::identity::{TransformIdentity, registered_transform_identity};
-use crate::runtime::{ImageFormat, ImageValue, OuterValue, ValueData};
+use crate::runtime::{BufferValue, OuterValue, ValueData};
 use crate::source::Span;
 
-const PPM_DECODE_TRANSFORM_VERSION: u32 = 2;
-const PPM_ENCODE_TRANSFORM_VERSION: u32 = 2;
-const PNG_DECODE_TRANSFORM_VERSION: u32 = 2;
-const PNG_ENCODE_TRANSFORM_VERSION: u32 = 3;
+const PPM_DECODE_TRANSFORM_VERSION: u32 = 3;
+const PPM_ENCODE_TRANSFORM_VERSION: u32 = 3;
+const PNG_DECODE_TRANSFORM_VERSION: u32 = 3;
+const PNG_ENCODE_TRANSFORM_VERSION: u32 = 4;
 const PNG_DEFAULT_COMPRESSION: i64 = 6;
-const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 2;
+const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 3;
 const WEBP_DEFAULT_QUALITY: i64 = 85;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,7 +21,7 @@ pub enum BuiltinDefaultValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltinValueType {
     Bytes,
-    Rgba8Image,
+    Buffer,
     I64,
 }
 
@@ -29,7 +29,7 @@ impl BuiltinValueType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bytes => "bytes",
-            Self::Rgba8Image => "rgba8-image",
+            Self::Buffer => "buffer",
             Self::I64 => "i64",
         }
     }
@@ -92,9 +92,9 @@ const BYTES_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
     value_type: BuiltinValueType::Bytes,
     default: None,
 };
-const IMAGE_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
-    name: "image",
-    value_type: BuiltinValueType::Rgba8Image,
+const BUFFER_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
+    name: "buffer",
+    value_type: BuiltinValueType::Buffer,
     default: None,
 };
 const COMPRESSION_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
@@ -113,30 +113,30 @@ const REGISTERED_TRANSFORMS: &[RegisteredTransform] = &[
         name: "ppm.decode",
         semantic_version: PPM_DECODE_TRANSFORM_VERSION,
         parameters: &[BYTES_PARAMETER],
-        result: BuiltinValueType::Rgba8Image,
+        result: BuiltinValueType::Buffer,
         validate: validate_bytes,
         execute: execute_decode_ppm,
     },
     RegisteredTransform {
         name: "ppm.encode",
         semantic_version: PPM_ENCODE_TRANSFORM_VERSION,
-        parameters: &[IMAGE_PARAMETER],
+        parameters: &[BUFFER_PARAMETER],
         result: BuiltinValueType::Bytes,
-        validate: validate_rgba8,
+        validate: validate_rgba_buffer,
         execute: execute_encode_ppm,
     },
     RegisteredTransform {
         name: "png.decode",
         semantic_version: PNG_DECODE_TRANSFORM_VERSION,
         parameters: &[BYTES_PARAMETER],
-        result: BuiltinValueType::Rgba8Image,
+        result: BuiltinValueType::Buffer,
         validate: validate_bytes,
         execute: execute_decode_png,
     },
     RegisteredTransform {
         name: "png.encode",
         semantic_version: PNG_ENCODE_TRANSFORM_VERSION,
-        parameters: &[IMAGE_PARAMETER, COMPRESSION_PARAMETER],
+        parameters: &[BUFFER_PARAMETER, COMPRESSION_PARAMETER],
         result: BuiltinValueType::Bytes,
         validate: validate_png_encode,
         execute: execute_encode_png,
@@ -144,7 +144,7 @@ const REGISTERED_TRANSFORMS: &[RegisteredTransform] = &[
     RegisteredTransform {
         name: "webp.encode",
         semantic_version: WEBP_ENCODE_TRANSFORM_VERSION,
-        parameters: &[IMAGE_PARAMETER, QUALITY_PARAMETER],
+        parameters: &[BUFFER_PARAMETER, QUALITY_PARAMETER],
         result: BuiltinValueType::Bytes,
         validate: validate_webp_encode,
         execute: execute_encode_webp,
@@ -245,16 +245,16 @@ fn validate_bytes(arguments: &[(OuterValue, Span)], _span: Span) -> Result<(), D
     }
 }
 
-fn validate_rgba8(arguments: &[(OuterValue, Span)], _span: Span) -> Result<(), Diagnostic> {
-    let ValueData::Image(image) = &arguments[0].0.data else {
+fn validate_rgba_buffer(arguments: &[(OuterValue, Span)], _span: Span) -> Result<(), Diagnostic> {
+    let ValueData::Buffer(buffer) = &arguments[0].0.data else {
         return Err(Diagnostic::error(
-            "encoder expects an image value",
+            "encoder expects a Buffer value",
             arguments[0].1,
         ));
     };
-    if image.format() != ImageFormat::Rgba8 {
+    if buffer.shape().len() != 3 || buffer.shape()[2] != 4 {
         return Err(Diagnostic::error(
-            "encoder requires an RGBA8 image",
+            "encoder requires a rank-3 byte Buffer shaped [height, width, 4]",
             arguments[0].1,
         ));
     }
@@ -262,7 +262,7 @@ fn validate_rgba8(arguments: &[(OuterValue, Span)], _span: Span) -> Result<(), D
 }
 
 fn validate_png_encode(arguments: &[(OuterValue, Span)], span: Span) -> Result<(), Diagnostic> {
-    validate_rgba8(arguments, span)?;
+    validate_rgba_buffer(arguments, span)?;
     let ValueData::Integer(compression) = arguments[1].0.data else {
         return Err(Diagnostic::error(
             "png.encode compression must be an integer from 1 through 9",
@@ -279,7 +279,7 @@ fn validate_png_encode(arguments: &[(OuterValue, Span)], span: Span) -> Result<(
 }
 
 fn validate_webp_encode(arguments: &[(OuterValue, Span)], span: Span) -> Result<(), Diagnostic> {
-    validate_rgba8(arguments, span)?;
+    validate_rgba_buffer(arguments, span)?;
     let ValueData::Integer(quality) = arguments[1].0.data else {
         return Err(Diagnostic::error(
             "webp.encode quality must be an integer from 0 through 100",
@@ -302,14 +302,14 @@ fn execute_decode_ppm(
     let ValueData::Bytes(bytes) = &arguments[0].0.data else {
         unreachable!()
     };
-    decode_ppm(bytes, arguments[0].1).map(OuterValue::image)
+    decode_ppm(bytes, arguments[0].1).map(OuterValue::buffer)
 }
 
 fn execute_encode_ppm(
     arguments: &[(OuterValue, Span)],
     _span: Span,
 ) -> Result<OuterValue, Diagnostic> {
-    let ValueData::Image(image) = &arguments[0].0.data else {
+    let ValueData::Buffer(image) = &arguments[0].0.data else {
         unreachable!()
     };
     encode_ppm(image, arguments[0].1)
@@ -323,14 +323,14 @@ fn execute_decode_png(
     let ValueData::Bytes(bytes) = &arguments[0].0.data else {
         unreachable!()
     };
-    decode_png(bytes, arguments[0].1).map(OuterValue::image)
+    decode_png(bytes, arguments[0].1).map(OuterValue::buffer)
 }
 
 fn execute_encode_png(
     arguments: &[(OuterValue, Span)],
     _span: Span,
 ) -> Result<OuterValue, Diagnostic> {
-    let ValueData::Image(image) = &arguments[0].0.data else {
+    let ValueData::Buffer(image) = &arguments[0].0.data else {
         unreachable!()
     };
     let ValueData::Integer(compression) = arguments[1].0.data else {
@@ -344,7 +344,7 @@ fn execute_encode_webp(
     arguments: &[(OuterValue, Span)],
     _span: Span,
 ) -> Result<OuterValue, Diagnostic> {
-    let ValueData::Image(image) = &arguments[0].0.data else {
+    let ValueData::Buffer(image) = &arguments[0].0.data else {
         unreachable!()
     };
     let ValueData::Integer(quality) = arguments[1].0.data else {
@@ -354,23 +354,23 @@ fn execute_encode_webp(
         .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::new(bytes))))
 }
 
-fn decode_ppm(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
+fn decode_ppm(bytes: &[u8], span: Span) -> Result<BufferValue, Diagnostic> {
     crate::registered_wasm::decode_ppm(bytes, span)
 }
 
-fn encode_ppm(image: &ImageValue, span: Span) -> Result<Vec<u8>, Diagnostic> {
+fn encode_ppm(image: &BufferValue, span: Span) -> Result<Vec<u8>, Diagnostic> {
     crate::registered_wasm::encode_ppm(image, span)
 }
 
-fn decode_png(bytes: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
+fn decode_png(bytes: &[u8], span: Span) -> Result<BufferValue, Diagnostic> {
     crate::registered_wasm::decode_png(bytes, span)
 }
 
-fn encode_png(image: &ImageValue, compression: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
+fn encode_png(image: &BufferValue, compression: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
     crate::registered_wasm::encode_png(image, i64::from(compression), span)
 }
 
-fn encode_webp(image: &ImageValue, quality: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
+fn encode_webp(image: &BufferValue, quality: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
     crate::registered_wasm::encode_webp(image, i64::from(quality), span)
 }
 
@@ -387,7 +387,7 @@ mod tests {
         assert_eq!(transforms[0].name, "ppm.decode");
         assert_eq!(
             transforms[0].signature(),
-            "ppm.decode(bytes: bytes) -> rgba8-image"
+            "ppm.decode(bytes: bytes) -> buffer"
         );
         assert_eq!(
             transforms[0].transform_id,
@@ -395,11 +395,11 @@ mod tests {
         );
         assert_eq!(
             transforms[3].signature(),
-            "png.encode(image: rgba8-image, compression: i64 = 6) -> bytes"
+            "png.encode(buffer: buffer, compression: i64 = 6) -> bytes"
         );
         assert_eq!(
             transforms[4].signature(),
-            "webp.encode(image: rgba8-image, quality: i64 = 85) -> bytes"
+            "webp.encode(buffer: buffer, quality: i64 = 85) -> bytes"
         );
     }
 
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn ppm_encoding_ignores_alpha_and_row_padding() {
-        let image = ImageValue::new_rgba8(1, 1, 6, vec![1, 2, 3, 4, 99, 100]).unwrap();
+        let image = BufferValue::new(vec![1, 1, 4], 6, vec![1, 2, 3, 4, 99, 100]).unwrap();
 
         assert_eq!(
             encode_ppm(&image, Span::default()).unwrap(),
@@ -426,8 +426,12 @@ mod tests {
 
     #[test]
     fn png_encoding_is_deterministic_and_ignores_row_padding() {
-        let image =
-            ImageValue::new_rgba8(2, 1, 10, vec![1, 2, 3, 4, 200, 150, 100, 50, 99, 100]).unwrap();
+        let image = BufferValue::new(
+            vec![1, 2, 4],
+            10,
+            vec![1, 2, 3, 4, 200, 150, 100, 50, 99, 100],
+        )
+        .unwrap();
 
         let first = encode_png(&image, 6, Span::default()).unwrap();
         let second = encode_png(&image, 6, Span::default()).unwrap();
@@ -437,9 +441,8 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, low_compression);
         assert_eq!(&first[..8], b"\x89PNG\r\n\x1a\n");
-        assert_eq!(decoded.width(), 2);
-        assert_eq!(decoded.height(), 1);
-        assert_eq!(decoded.stride(), 8);
+        assert_eq!(decoded.shape(), &[1, 2, 4]);
+        assert_eq!(decoded.outer_stride(), 8);
         assert_eq!(decoded.bytes(), &[1, 2, 3, 4, 200, 150, 100, 50]);
         assert_eq!(
             byte_content_identity(&first).to_string(),
@@ -449,7 +452,8 @@ mod tests {
 
     #[test]
     fn png_compression_is_source_spanned_and_range_checked() {
-        let image = OuterValue::image(ImageValue::new_rgba8(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
+        let image =
+            OuterValue::buffer(BufferValue::new(vec![1, 1, 4], 4, vec![1, 2, 3, 4]).unwrap());
         let compression_span = Span::new(17, 18);
 
         for compression in [0, 10] {
@@ -489,8 +493,12 @@ mod tests {
 
     #[test]
     fn webp_encoding_is_deterministic_preserves_alpha_and_ignores_row_padding() {
-        let image =
-            ImageValue::new_rgba8(2, 1, 10, vec![1, 2, 3, 4, 200, 150, 100, 50, 99, 100]).unwrap();
+        let image = BufferValue::new(
+            vec![1, 2, 4],
+            10,
+            vec![1, 2, 3, 4, 200, 150, 100, 50, 99, 100],
+        )
+        .unwrap();
 
         let first = encode_webp(&image, 85, Span::default()).unwrap();
         let second = encode_webp(&image, 85, Span::default()).unwrap();
@@ -519,7 +527,7 @@ mod tests {
                 pixels.extend_from_slice(&[x.wrapping_mul(7), y.wrapping_mul(7), x ^ y, 255]);
             }
         }
-        let image = ImageValue::new_rgba8(32, 32, 32 * 4, pixels).unwrap();
+        let image = BufferValue::new(vec![32, 32, 4], 32 * 4, pixels).unwrap();
 
         let encoded = encode_webp(&image, 85, Span::default()).unwrap();
         let decoded = webp_rust::decode(&encoded).unwrap();
@@ -530,7 +538,8 @@ mod tests {
 
     #[test]
     fn webp_quality_is_source_spanned_and_range_checked() {
-        let image = OuterValue::image(ImageValue::new_rgba8(1, 1, 4, vec![1, 2, 3, 4]).unwrap());
+        let image =
+            OuterValue::buffer(BufferValue::new(vec![1, 1, 4], 4, vec![1, 2, 3, 4]).unwrap());
         let quality_span = Span::new(17, 20);
 
         for quality in [-1, 101] {
@@ -579,7 +588,7 @@ mod tests {
 
         let decoded = decode_png(&encoded, Span::default()).unwrap();
 
-        assert_eq!(decoded.format(), ImageFormat::Rgba8);
+        assert_eq!(decoded.shape(), &[1, 2, 4]);
         assert_eq!(decoded.bytes(), &[5, 5, 5, 255, 200, 200, 200, 255]);
     }
 
@@ -599,7 +608,7 @@ mod tests {
 
         let decoded = decode_png(&encoded, Span::default()).unwrap();
 
-        assert_eq!(decoded.format(), ImageFormat::Rgba8);
+        assert_eq!(decoded.shape(), &[1, 2, 4]);
         assert_eq!(decoded.bytes(), &[10, 20, 30, 7, 200, 150, 100, 255]);
     }
 

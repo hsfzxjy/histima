@@ -1,6 +1,6 @@
 # PNG decoder plugin
 
-This registered-Wasm plugin implements `png.decode(BytesView) -> Image` with
+This registered-Wasm plugin implements `png.decode(BytesView) -> Buffer` with
 the same pinned `png` crate and RGBA8 normalization rules as the original host
 implementation. Animated PNG is rejected explicitly. The module has no WASI
 or other imports, and its allocations are reclaimed with the per-invocation

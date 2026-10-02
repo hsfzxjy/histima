@@ -5,19 +5,18 @@ use wasmi::{
     StoreLimitsBuilder, TypedFunc,
 };
 
-use crate::abi::ABI_IMAGE_FORMAT_RGBA8;
 use crate::diagnostic::Diagnostic;
-use crate::runtime::ImageValue;
+use crate::runtime::BufferValue;
 use crate::source::Span;
 
-pub(crate) const PLUGIN_ABI_VERSION: u32 = 3;
+pub(crate) const PLUGIN_ABI_VERSION: u32 = 4;
 const VALUE_WORDS: usize = 8;
 const VALUE_BYTES: usize = VALUE_WORDS * size_of::<u32>();
 const VALUE_BYTES_VIEW: u32 = 1;
-const VALUE_IMAGE_VIEW: u32 = 2;
+const VALUE_BUFFER_VIEW: u32 = 2;
 const VALUE_I64: u32 = 3;
 const VALUE_BYTES_RESULT: u32 = 4;
-const VALUE_IMAGE_RESULT: u32 = 5;
+const VALUE_BUFFER_RESULT: u32 = 5;
 const VALUE_DIAGNOSTIC: u32 = 255;
 const MAX_LINEAR_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -37,25 +36,25 @@ struct PluginState {
 
 pub(crate) enum PluginArgument<'a> {
     BytesView(&'a [u8]),
-    ImageView(&'a ImageValue),
+    BufferView(&'a BufferValue),
     I64(i64),
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum PluginResultType {
     Bytes,
-    Image,
+    Buffer,
 }
 
 pub(crate) enum PluginResult {
     Bytes(Vec<u8>),
-    Image(ImageValue),
+    Buffer(BufferValue),
 }
 
 /// One validated, separately compiled registered-Wasm artifact.
 ///
-/// ABI v3 admits only the concrete native-safe types exercised by the current
-/// codecs: immutable byte/image views, `i64`, and owned byte/image results.
+/// ABI v4 admits immutable bytes and shaped byte buffers, `i64`, and owned
+/// bytes and shaped byte-buffer results.
 pub(crate) struct RegisteredWasmPlugin {
     name: String,
     engine: Engine,
@@ -212,16 +211,16 @@ impl RegisteredWasmPlugin {
             PluginResultType::Bytes if result[0] == VALUE_BYTES_RESULT => self
                 .read_bytes_result(memory, &store, result, span)
                 .map(PluginResult::Bytes),
-            PluginResultType::Image if result[0] == VALUE_IMAGE_RESULT => self
-                .read_image_result(memory, &store, result, span)
-                .map(PluginResult::Image),
+            PluginResultType::Buffer if result[0] == VALUE_BUFFER_RESULT => self
+                .read_buffer_result(memory, &store, result, span)
+                .map(PluginResult::Buffer),
             PluginResultType::Bytes => Err(self.diagnostic(
                 span,
                 format!("returned value kind {} instead of owned Bytes", result[0]),
             )),
-            PluginResultType::Image => Err(self.diagnostic(
+            PluginResultType::Buffer => Err(self.diagnostic(
                 span,
-                format!("returned value kind {} instead of owned Image", result[0]),
+                format!("returned value kind {} instead of owned Buffer", result[0]),
             )),
         }
     }
@@ -269,19 +268,23 @@ impl RegisteredWasmPlugin {
                     0,
                 ])
             }
-            PluginArgument::ImageView(image) => {
-                let byte_length = image.byte_len();
-                let pointer = image
+            PluginArgument::BufferView(buffer) => {
+                let byte_length = buffer.byte_len();
+                let pointer = buffer
                     .with_bytes(|bytes| self.stage_bytes(bytes, memory, allocate, store, span))?;
+                let shape = buffer.shape();
+                let dimension = |index, field| {
+                    u32_field(self, shape.get(index).copied().unwrap_or(0), field, span)
+                };
                 Ok([
-                    VALUE_IMAGE_VIEW,
+                    VALUE_BUFFER_VIEW,
                     pointer as u32,
-                    u32_field(self, byte_length, "image byte length", span)?,
-                    image.format().abi_tag(),
-                    u32_field(self, image.width(), "image width", span)?,
-                    u32_field(self, image.height(), "image height", span)?,
-                    u32_field(self, image.stride(), "image stride", span)?,
-                    0,
+                    u32_field(self, byte_length, "buffer byte length", span)?,
+                    shape.len() as u32,
+                    dimension(0, "buffer dimension 0")?,
+                    dimension(1, "buffer dimension 1")?,
+                    dimension(2, "buffer dimension 2")?,
+                    u32_field(self, buffer.outer_stride(), "buffer outer stride", span)?,
                 ])
             }
             PluginArgument::I64(value) => {
@@ -312,7 +315,7 @@ impl RegisteredWasmPlugin {
             return Err(self.diagnostic(
                 span,
                 format!(
-                    "argument is {} bytes; ABI v3 permits at most {MAX_ARGUMENT_BYTES}",
+                    "argument is {} bytes; ABI v4 permits at most {MAX_ARGUMENT_BYTES}",
                     bytes.len()
                 ),
             ));
@@ -357,31 +360,31 @@ impl RegisteredWasmPlugin {
         self.read_bounded_bytes(memory, store, words[1], words[2], MAX_RESULT_BYTES, span)
     }
 
-    fn read_image_result(
+    fn read_buffer_result(
         &self,
         memory: Memory,
         store: &Store<PluginState>,
         words: [u32; VALUE_WORDS],
         span: Span,
-    ) -> Result<ImageValue, Diagnostic> {
-        if words[7] != 0 {
-            return Err(self.diagnostic(span, "owned Image result has a non-zero reserved word"));
-        }
-        if words[3] != ABI_IMAGE_FORMAT_RGBA8 {
+    ) -> Result<BufferValue, Diagnostic> {
+        let rank = words[3] as usize;
+        if !(1..=3).contains(&rank) {
             return Err(self.diagnostic(
                 span,
-                format!("returned unsupported image format {}", words[3]),
+                format!("owned Buffer result has unsupported rank {rank}"),
             ));
         }
-        let pixels =
+        if words[4 + rank..7].iter().any(|dimension| *dimension != 0) {
+            return Err(self.diagnostic(span, "owned Buffer result has non-zero unused dimensions"));
+        }
+        let bytes =
             self.read_bounded_bytes(memory, store, words[1], words[2], MAX_RESULT_BYTES, span)?;
-        ImageValue::new_rgba8(
-            words[4] as usize,
-            words[5] as usize,
-            words[6] as usize,
-            pixels,
-        )
-        .map_err(|error| self.diagnostic(span, format!("invalid image metadata: {error}")))
+        let shape = words[4..4 + rank]
+            .iter()
+            .map(|dimension| *dimension as usize)
+            .collect::<Vec<_>>();
+        BufferValue::new(shape, words[7] as usize, bytes)
+            .map_err(|error| self.diagnostic(span, format!("invalid Buffer metadata: {error}")))
     }
 
     fn read_guest_diagnostic(
@@ -423,7 +426,7 @@ impl RegisteredWasmPlugin {
         if length > maximum {
             return Err(self.diagnostic(
                 span,
-                format!("result is {length} bytes; ABI v3 permits at most {maximum}"),
+                format!("result is {length} bytes; ABI v4 permits at most {maximum}"),
             ));
         }
         let mut bytes = vec![0; length];
@@ -514,34 +517,34 @@ fn webp_encoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
         .map_err(String::as_str)
 }
 
-pub(crate) fn decode_ppm(input: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
+pub(crate) fn decode_ppm(input: &[u8], span: Span) -> Result<BufferValue, Diagnostic> {
     let plugin = ppm_decoder()
         .map_err(|error| Diagnostic::error(format!("ppm.decode Wasm plugin: {error}"), span))?;
     match plugin.invoke(
         &[PluginArgument::BytesView(input)],
-        PluginResultType::Image,
+        PluginResultType::Buffer,
         span,
     )? {
-        PluginResult::Image(image) => Ok(image),
+        PluginResult::Buffer(image) => Ok(image),
         PluginResult::Bytes(_) => unreachable!(),
     }
 }
 
-pub(crate) fn encode_ppm(image: &ImageValue, span: Span) -> Result<Vec<u8>, Diagnostic> {
+pub(crate) fn encode_ppm(image: &BufferValue, span: Span) -> Result<Vec<u8>, Diagnostic> {
     let plugin = ppm_encoder()
         .map_err(|error| Diagnostic::error(format!("ppm.encode Wasm plugin: {error}"), span))?;
     match plugin.invoke(
-        &[PluginArgument::ImageView(image)],
+        &[PluginArgument::BufferView(image)],
         PluginResultType::Bytes,
         span,
     )? {
         PluginResult::Bytes(bytes) => Ok(bytes),
-        PluginResult::Image(_) => unreachable!(),
+        PluginResult::Buffer(_) => unreachable!(),
     }
 }
 
 pub(crate) fn encode_png(
-    image: &ImageValue,
+    image: &BufferValue,
     compression: i64,
     span: Span,
 ) -> Result<Vec<u8>, Diagnostic> {
@@ -549,32 +552,32 @@ pub(crate) fn encode_png(
         .map_err(|error| Diagnostic::error(format!("png.encode Wasm plugin: {error}"), span))?;
     match plugin.invoke(
         &[
-            PluginArgument::ImageView(image),
+            PluginArgument::BufferView(image),
             PluginArgument::I64(compression),
         ],
         PluginResultType::Bytes,
         span,
     )? {
         PluginResult::Bytes(bytes) => Ok(bytes),
-        PluginResult::Image(_) => unreachable!(),
+        PluginResult::Buffer(_) => unreachable!(),
     }
 }
 
-pub(crate) fn decode_png(input: &[u8], span: Span) -> Result<ImageValue, Diagnostic> {
+pub(crate) fn decode_png(input: &[u8], span: Span) -> Result<BufferValue, Diagnostic> {
     let plugin = png_decoder()
         .map_err(|error| Diagnostic::error(format!("png.decode Wasm plugin: {error}"), span))?;
     match plugin.invoke(
         &[PluginArgument::BytesView(input)],
-        PluginResultType::Image,
+        PluginResultType::Buffer,
         span,
     )? {
-        PluginResult::Image(image) => Ok(image),
+        PluginResult::Buffer(image) => Ok(image),
         PluginResult::Bytes(_) => unreachable!(),
     }
 }
 
 pub(crate) fn encode_webp(
-    image: &ImageValue,
+    image: &BufferValue,
     quality: i64,
     span: Span,
 ) -> Result<Vec<u8>, Diagnostic> {
@@ -582,14 +585,14 @@ pub(crate) fn encode_webp(
         .map_err(|error| Diagnostic::error(format!("webp.encode Wasm plugin: {error}"), span))?;
     match plugin.invoke(
         &[
-            PluginArgument::ImageView(image),
+            PluginArgument::BufferView(image),
             PluginArgument::I64(quality),
         ],
         PluginResultType::Bytes,
         span,
     )? {
         PluginResult::Bytes(bytes) => Ok(bytes),
-        PluginResult::Image(_) => unreachable!(),
+        PluginResult::Buffer(_) => unreachable!(),
     }
 }
 
@@ -611,7 +614,7 @@ mod tests {
         assert_eq!(png_encoder.module.imports().count(), 0);
         assert_eq!(webp_encoder.module.imports().count(), 0);
 
-        let semantic = registered_transform_identity("ppm.decode", 2);
+        let semantic = registered_transform_identity("ppm.decode", 3);
         let artifact =
             registered_wasm_artifact_identity(semantic, PPM_DECODE_WASM, PLUGIN_ABI_VERSION);
         let changed =
@@ -626,14 +629,16 @@ mod tests {
             Span::default(),
         )
         .unwrap();
-        assert_eq!(decoded.width(), 2);
-        assert_eq!(decoded.height(), 1);
-        assert_eq!(decoded.stride(), 8);
+        assert_eq!(decoded.shape(), &[1, 2, 4]);
+        assert_eq!(decoded.outer_stride(), 8);
         assert_eq!(decoded.bytes(), &[1, 2, 3, 255, 4, 5, 6, 255]);
 
-        let padded =
-            ImageValue::new_rgba8(1, 2, 6, vec![1, 2, 3, 4, 99, 100, 4, 5, 6, 7, 101, 102])
-                .unwrap();
+        let padded = BufferValue::new(
+            vec![2, 1, 4],
+            6,
+            vec![1, 2, 3, 4, 99, 100, 4, 5, 6, 7, 101, 102],
+        )
+        .unwrap();
         assert_eq!(
             encode_ppm(&padded, Span::default()).unwrap(),
             b"P3\n1 2\n255\n1 2 3\n4 5 6\n"

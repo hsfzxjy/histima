@@ -19,21 +19,19 @@ pub struct AbiValue {
 pub const ABI_POINTER_WORD: usize = 0;
 pub const ABI_LENGTH_WORD: usize = 1;
 pub const ABI_CAPACITY_WORD: usize = 2;
-pub const ABI_IMAGE_FORMAT_WORD: usize = 3;
-pub const ABI_IMAGE_WIDTH_WORD: usize = 4;
-pub const ABI_IMAGE_HEIGHT_WORD: usize = 5;
-pub const ABI_IMAGE_STRIDE_WORD: usize = 6;
-
-pub const ABI_IMAGE_FORMAT_OPAQUE_BYTES: u32 = 0;
-pub const ABI_IMAGE_FORMAT_RGBA8: u32 = 1;
+pub const ABI_BUFFER_RANK_WORD: usize = 3;
+pub const ABI_BUFFER_DIMENSION_0_WORD: usize = 4;
+pub const ABI_BUFFER_DIMENSION_1_WORD: usize = 5;
+pub const ABI_BUFFER_DIMENSION_2_WORD: usize = 6;
+pub const ABI_BUFFER_OUTER_STRIDE_WORD: usize = 7;
 
 pub const ABI_STATUS_OK: i32 = 0;
-pub const ABI_STATUS_IMAGE_FORMAT: i32 = 1;
+pub const ABI_STATUS_BUFFER_LAYOUT: i32 = 1;
 pub const ABI_STATUS_RUNTIME: i32 = 2;
 
 pub const ABI_ALLOCATION_STRING: u32 = 1;
 pub const ABI_ALLOCATION_BYTES: u32 = 2;
-pub const ABI_ALLOCATION_IMAGE: u32 = 3;
+pub const ABI_ALLOCATION_BUFFER: u32 = 3;
 
 pub const ABI_WORLD_ENVIRONMENT_READ: u32 = 1;
 pub const ABI_WORLD_FILE_READ: u32 = 2;
@@ -102,10 +100,10 @@ pub fn lower_type(ty: Type) -> AbiType {
         Type::F32 => AbiType {
             ownership: Ownership::Scalar,
         },
-        Type::String | Type::Bytes | Type::Image => AbiType {
+        Type::String | Type::Bytes | Type::Buffer => AbiType {
             ownership: Ownership::Owned,
         },
-        Type::StringView | Type::BytesView | Type::ImageView => AbiType {
+        Type::StringView | Type::BytesView | Type::BufferView => AbiType {
             ownership: Ownership::ReadOnlyView,
         },
     }

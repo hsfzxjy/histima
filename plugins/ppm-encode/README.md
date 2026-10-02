@@ -1,8 +1,9 @@
 # PPM encoder plugin
 
 This is the encoding half of the first concrete consumer of Histima's
-registered-Wasm plugin ABI. `ppm_encode.c` reads an immutable RGBA8 image view,
-including its explicit stride, and returns deterministic ASCII P3 bytes.
+registered-Wasm plugin ABI. `ppm_encode.c` reads an immutable Buffer view whose
+shape is `[height, width, 4]`, interprets it as RGBA8, and returns deterministic
+ASCII P3 bytes.
 
 Rebuild the checked-in artifact from the repository root:
 

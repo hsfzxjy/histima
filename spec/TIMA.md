@@ -42,11 +42,11 @@ Tima source
 The interpreter is the Histima product execution engine in this version. The
 standalone Tima runtime can emit, cache, link, load, and execute host artifacts
 for a subset of the same typed IR, while interpreting unsupported transforms.
-The native subset includes scalar code and initial owned/view image operations.
-This remains an additive implementation of `TypedIR -> NativeArtifact`;
-Cranelift IR is not Tima's semantic IR and JIT execution is not planned.
-WebAssembly is reserved for separately registered plugin transforms, whose ABI
-is not yet part of this contract.
+The native subset includes scalar, String, and Bytes code. Generic Buffer
+operations currently remain interpreted. This remains an additive
+implementation of `TypedIR -> NativeArtifact`; Cranelift IR is not Tima's
+semantic IR and JIT execution is not planned. WebAssembly is reserved for
+separately registered plugin transforms through the ABI in section 11.
 
 ## 2. Core invariants
 
@@ -54,11 +54,11 @@ These rules take precedence over optimization choices.
 
 1. Outer composite values are immutable. An outer value visible through one
    binding must not be changed by invoking a transform through another binding.
-2. An inner `Image` is uniquely owned and mutable for the duration of a
+2. An inner `Buffer` is uniquely owned and mutable for the duration of a
    transform invocation.
-3. An inner `ImageView` is read-only and may alias other views.
+3. An inner `BufferView` is read-only and may alias other views.
 4. Two owned inner parameters must not alias mutable storage, even if the
-   caller supplies the same outer image twice.
+   caller supplies the same outer buffer twice.
 5. An inner value returned to outer code is frozen before it becomes visible.
    Freezing should transfer ownership when it is safe to do so.
 6. Outer and inner values do not share a universal object representation.
@@ -158,7 +158,7 @@ characters:
 darken#4f26a3(img, 0.8)
 bytes | png.decode#0123456789abcdef
 source = read(asset("cat.png"))#89abcdef
-result = darken(image, 0.8)#fedcba98
+result = process(input, 0.8)#fedcba98
 ```
 
 The hexadecimal text is a full identity or a prefix. `value#hash` evaluates
@@ -263,7 +263,7 @@ Outer calls may use positional arguments, named arguments, or both:
 ```tima
 darken(img, 0.8)
 darken(img=img, factor=0.8)
-webp.encode(image, quality=85)
+webp.encode(buffer, quality=85)
 darken#4f26a3(img, 0.8)
 ```
 
@@ -314,11 +314,11 @@ The outer runtime has these value kinds:
 - immutable list;
 - immutable string-keyed record;
 - logical asset locator;
-- immutable image;
+- immutable shaped byte buffer;
 - transform callable;
 - immutable lineage value.
 
-Bytes, images, transform callables, assets, and lineage values are created by
+Bytes, buffers, transform callables, assets, and lineage values are created by
 the runtime or host operations; they have no general literal syntax.
 
 All outer composites use immutable value semantics. Bindings may not currently
@@ -341,7 +341,7 @@ operands cannot be mixed.
 Equality is defined only for two values of the same scalar kind: `null`,
 `bool`, integer, float, fraction, or string. Ordering is defined only for two
 integers, two floats, or two fractions. Equality or ordering of lists, records,
-assets, images, transforms, bytes, or lineage values is unsupported. Fraction
+assets, buffers, transforms, bytes, or lineage values is unsupported. Fraction
 equality and ordering are mathematical because values are canonical and exact.
 
 Binary expression results do not automatically inherit operand lineage.
@@ -442,7 +442,7 @@ observed content identities.
 
 Every parameter and result has an explicit native-safe type. Transform names
 and parameter names must be unique in their respective scopes. The names
-`environment_i64`, `image_zero`, and `image_fill` are reserved inner runtime
+`environment_i64`, `buffer_zero`, and `buffer_fill` are reserved inner runtime
 operations.
 
 ### 7.1 Types
@@ -459,8 +459,8 @@ The implemented inner types are:
 | `StringView` | Read-only, aliasable UTF-8 storage |
 | `Bytes` | Uniquely owned byte storage |
 | `BytesView` | Read-only, aliasable byte storage |
-| `Image` | Uniquely owned, mutable image storage |
-| `ImageView` | Read-only, aliasable image view |
+| `Buffer` | Uniquely owned, mutable shaped `u8` storage |
+| `BufferView` | Read-only, aliasable shaped `u8` storage |
 
 `u8` has no literal suffix. Integer literals are `i64`; a `u8` normally enters
 through a parameter or byte-loop element. An outer integer crosses a `u8`
@@ -477,8 +477,7 @@ Transform bodies support:
 name = expression
 return expression
 if condition { statements } else { statements }
-for element in image.bytes { ... }
-for pixel in image.pixels { ... }
+for byte in buffer.bytes { ... }
 ```
 
 Inner local bindings are inferred, immutable, and cannot shadow parameters or
@@ -500,48 +499,51 @@ arithmetic. `i64` arithmetic is checked; overflow and division by zero abort
 the invocation with a diagnostic. `u8` arithmetic is unsupported.
 
 Equality supports same-typed `bool`, `u8`, `i64`, and `f32`. Ordering supports
-same-typed `u8`, `i64`, and `f32`. Image equality is unsupported.
+same-typed `u8`, `i64`, and `f32`. Buffer equality is unsupported.
 
 Outer-only syntax and values—including `null`, lists, records, general member
-access outside World calls or a constrained image loop, and pipelines—are
+access outside World calls or the constrained Buffer byte loop, and pipelines—are
 rejected inside transforms.
 
 ### 7.4 Calls and ownership
 
 Calling another transform requires an exact argument count and exact types.
-Passing an owned `String`, `Bytes`, or `Image` consumes that inner value. Using
+Passing an owned `String`, `Bytes`, or `Buffer` consumes that inner value. Using
 the consumed value again is an error, including after any branch on which it
 may have been consumed. Passing the same owned value to two owned parameters
 is therefore rejected.
 
 Owned values transfer directly between inner calls; they are not boxed as
-outer values between calls. `StringView`, `BytesView`, and `ImageView`
+outer values between calls. `StringView`, `BytesView`, and `BufferView`
 arguments do not transfer ownership and may alias.
 
-## 8. Implemented image operations
+## 8. Implemented Buffer operations
 
-### 8.1 Image layouts
+### 8.1 Buffer layout
 
-An image carries `width`, `height`, byte `stride`, storage bytes, and a semantic
-format:
+A `Buffer` is shaped `u8` storage with rank one through three. The dimensions
+after the first are dense. `outer_stride` is the number of bytes between
+successive slices of the first dimension and may include padding:
 
-- **opaque-bytes**: byte-oriented storage with `len == stride * height`;
-- **RGBA8**: four interleaved 8-bit channels in red, green, blue, alpha order,
-  with `stride >= width * 4` and `len == stride * height`.
+- rank 1 requires `outer_stride == shape[0]` and
+  `byte_length == shape[0]`;
+- rank 2 or 3 requires `outer_stride >= product(shape[1..])` and
+  `byte_length == shape[0] * outer_stride`.
 
-Layout multiplication must not overflow. Format and layout participate in
-content identity. Results are revalidated before freezing.
+Layout multiplication must not overflow. Shape, outer stride, and every
+storage byte—including padding—participate in Content identity. Results are
+revalidated before freezing. Tima assigns no pixel format, channel meaning,
+color space, or other image semantics to a Buffer. Such interpretation belongs
+to an ordinary transform contract.
 
-Byte operations support both formats. Pixel operations require RGBA8.
+### 8.2 `buffer_zero(buffer)`
 
-### 8.2 `image_zero(image)`
+This inner-only operation consumes an owned `Buffer`, sets every storage byte
+to zero in place, and returns ownership of the same storage.
 
-This inner-only operation consumes an owned `Image`, sets every storage byte to
-zero in place, and returns ownership of the same storage.
+### 8.3 `buffer_fill(buffer, value)`
 
-### 8.3 `image_fill(image, value)`
-
-This inner-only operation consumes an owned `Image`, fills every storage byte
+This inner-only operation consumes an owned `Buffer`, fills every storage byte
 with a `u8`, and returns ownership of the same storage.
 
 ### 8.4 Byte loop
@@ -549,16 +551,16 @@ with a `u8`, and returns ownership of the same storage.
 The implemented byte loop is:
 
 ```tima
-for byte in img.bytes {
+for byte in buffer.bytes {
     byte = expression
 }
 ```
 
-`img` must be a directly named owned `Image`. The body must contain exactly one
-assignment to the loop binding and its expression must produce `u8`.
+`buffer` must be a directly named owned `Buffer`. The body must contain exactly
+one assignment to the loop binding and its expression must produce `u8`.
 
 If the expression does not use `byte`, the loop has the same typed-IR meaning
-as `image_fill`; this canonicalization makes equivalent source forms share
+as `buffer_fill`; this canonicalization makes equivalent source forms share
 Transform identity. If it uses `byte`, the expression is evaluated once per
 storage byte and the result replaces that byte. A byte-loop expression may not
 consume another owned value.
@@ -566,44 +568,20 @@ consume another owned value.
 General loop bodies, nested loops, indexing, `break`, and `continue` are
 unsupported.
 
-### 8.5 RGBA8 pixel loop
-
-The implemented pixel loop is:
-
-```tima
-for p in img.pixels {
-    p.r *= red_factor
-    p.g *= green_factor
-    p.b *= blue_factor
-    p.a *= alpha_factor
-}
-```
-
-`img` must be a directly named owned `Image` whose runtime format is RGBA8.
-The body must contain one or more `*=` statements. Each of `r`, `g`, `b`, and
-`a` may appear at most once. Each factor must be `f32`, must not read `p`, and
-is evaluated once before iteration. A factor may not consume an owned value.
-
-For stored channel byte `c` and factor `f`, scaling computes `c * f`, truncates
-the fractional part, saturates values above 255, and maps non-positive or NaN
-results to zero. Positive infinity maps to 255. Unmentioned channels and row
-padding remain unchanged.
-
-General pixel expressions and `=` channel replacement are unsupported.
-
 ## 9. Outer/inner boundary, memory, and ABI
 
 Scalars are range- and type-checked at the boundary. The interpreter lowers
-outer strings, bytes, and images into distinct inner representations. Owned
+outer strings, bytes, and buffers into distinct inner representations. Owned
 parameters receive detached mutable storage; views retain immutable shared
 storage and may alias. Multiple owned arguments and simultaneous owned/view
 arguments therefore cannot expose a mutable alias.
 
-Returned owned storage is frozen into an immutable outer value. String and byte
-outer storage retains an owned allocation behind immutable reference counting,
-so a uniquely held value can move into an owned inner parameter and back out
-without reallocating. Shared values detach once before mutation. Lineage is
-attached beside the outer payload and never enters the inner representation.
+Returned owned storage is frozen into an immutable outer value. String, byte,
+and Buffer outer storage retain owned allocations behind immutable reference
+counting, so a uniquely held value can move into an owned inner parameter and
+back out without reallocating. Shared values detach once before mutation.
+Lineage is attached beside the outer payload and never enters the inner
+representation.
 
 The implemented AOT entry ABI is C-compatible. ABI version 2 uses one fixed
 descriptor per statically typed value:
@@ -622,13 +600,9 @@ int32_t tima_transform_N(
 
 The statically checked transform signature determines how each descriptor is
 interpreted. `bool`, `u8`, `i64`, and `f32` use word 0 with the scalar encoding
-defined by their type. An `Image` or `ImageView` uses words 0 through 6 for its
-data pointer, byte length, capacity, format, width, height, and row stride;
-views have zero capacity. Format tag 0 denotes opaque bytes and tag 1 denotes
-RGBA8. Word 7 is reserved. Status zero means success; status 1 reports that an
-RGBA8 operation received another image format. Status 2 reports a host callback
-failure; the host retains the source-spanned diagnostic rather than placing
-diagnostic objects in the ABI. Other nonzero statuses are reserved.
+defined by their type. Status zero means success. Status 2 reports a host
+callback failure; the host retains the source-spanned diagnostic rather than
+placing diagnostic objects in the ABI. Other nonzero statuses are reserved.
 
 `String`, `StringView`, `Bytes`, and `BytesView` use words 0 through 2 for data
 pointer, byte length, and capacity. Views have zero capacity. String bytes are
@@ -641,7 +615,7 @@ not allocate at runtime. If a literal-derived view is returned to the outer
 layer, the host copies it into immutable outer storage before the native module
 can be unloaded; artifact memory never becomes outer value storage.
 
-Before a native call, an owned String, Bytes, or Image value is uniquely
+Before a native call, an owned String or Bytes value is uniquely
 detached from immutable outer storage. Native code may mutate owned allocations
 in place subject to the statically known value type. A returned owned
 descriptor must identify exactly one compatible owned argument of the same
@@ -656,8 +630,12 @@ host user data, a checked String/Bytes allocator, and a World-call trampoline.
 Allocations remain in host call state and can be frozen only when the returned
 descriptor exactly identifies a registered allocation of the expected static
 type. World calls may directly register an already-owned host buffer, avoiding
-a copy solely for ABI transfer. Image allocation is reserved until its layout
-metadata contract is defined.
+a copy solely for ABI transfer.
+
+`Buffer` and `BufferView` do not cross this AOT ABI in v0. A transform whose
+transitive call graph accepts, returns, or operates on Buffer values remains on
+the typed-IR interpreter. This backend limitation does not change Buffer
+language semantics or identity.
 
 Generated code receives only the callback table, function pointers, and opaque
 user data. No Rust layout, dynamic outer tag, lineage, or cache metadata is
@@ -722,11 +700,11 @@ registry is not general native-library FFI.
 
 | Transform | Parameters | Result | Contract |
 | --- | --- | --- | --- |
-| `ppm.decode` | `bytes` | RGBA8 image | ASCII P3 only; non-zero dimensions; max value 255 |
-| `ppm.encode` | `image` | bytes | Deterministic ASCII P3; RGBA8 input |
-| `png.decode` | `bytes` | RGBA8 image | Still PNG; supported grayscale/RGB/palette/alpha forms; APNG rejected |
-| `png.encode` | `image`, `compression=6` | bytes | RGBA8; compression integer 1 through 9; fixed deterministic settings |
-| `webp.encode` | `image`, `quality=85` | bytes | Lossy still WebP; RGBA8; quality integer 0 through 100; alpha preserved losslessly |
+| `ppm.decode` | `bytes` | `Buffer` | ASCII P3 only; returns shape `[height, width, 4]`; max value 255 |
+| `ppm.encode` | `buffer` | bytes | Deterministic ASCII P3; requires shape `[height, width, 4]` interpreted as RGBA8 |
+| `png.decode` | `bytes` | `Buffer` | Still PNG; returns RGBA8 bytes with shape `[height, width, 4]`; APNG rejected |
+| `png.encode` | `buffer`, `compression=6` | bytes | Requires shape `[height, width, 4]` interpreted as RGBA8; compression 1 through 9 |
+| `webp.encode` | `buffer`, `quality=85` | bytes | Requires shape `[height, width, 4]` interpreted as RGBA8; quality 0 through 100 |
 
 Omitting a default and spelling its canonical value produce identical lineage
 arguments and Recipe IDs. A registered-transform implementation change that
@@ -740,17 +718,17 @@ ID. Workspace plugins additionally report their ABI, Artifact, and module
 Content IDs. Transforms declared inside a Tima source file belong to that
 compilation and are intentionally not a workspace registry.
 
-### 11.1 Registered-Wasm ABI v3
+### 11.1 Registered-Wasm ABI v4
 
 The current ABI is intentionally the exact slice required by the registered
-PPM, PNG, and WebP codecs: immutable bytes and image inputs, signed integer
-configuration, and owned bytes and image results. PNG decoding normalizes
-supported still-image color forms to RGBA8 inside the sandbox and rejects
-APNG. A module:
+PPM, PNG, and WebP codecs: immutable Bytes and Buffer inputs, signed integer
+configuration, and owned Bytes and Buffer results. The ABI attaches only
+generic shape and stride metadata to Buffer values; codec-specific RGBA8
+interpretation is not a Tima type or descriptor tag. A module:
 
 - is Wasm32 and imports nothing (in particular, it has no WASI);
 - exports `memory`;
-- exports `tima_abi_version() -> i32`, which returns `3`;
+- exports `tima_abi_version() -> i32`, which returns `4`;
 - exports `tima_reset()` and `tima_alloc(length: i32) -> i32` for one
   invocation's guest arena;
 - exports `tima_transform(arguments: i32, argument_count: i32,
@@ -763,19 +741,21 @@ little-endian `u32` words. The current descriptor kinds are:
 | Kind | Meaning | Words |
 | --- | --- | --- |
 | `1` | immutable `BytesView` argument | `[kind, data, length, 0, 0, 0, 0, 0]` |
-| `2` | immutable `ImageView` argument | `[kind, data, length, format, width, height, stride, 0]` |
+| `2` | immutable `BufferView` argument | `[kind, data, length, rank, dim0, dim1, dim2, outer_stride]` |
 | `3` | signed `i64` argument | `[kind, low-32, high-32, 0, 0, 0, 0, 0]` |
 | `4` | owned `Bytes` result | `[kind, data, length, 0, 0, 0, 0, 0]` |
-| `5` | owned `Image` result | `[kind, data, length, format, width, height, stride, 0]` |
+| `5` | owned `Buffer` result | `[kind, data, length, rank, dim0, dim1, dim2, outer_stride]` |
 | `255` | UTF-8 diagnostic | `[kind, data, length, 0, 0, 0, 0, 0]` |
 
-Image format `1` is RGBA8. A zero `tima_transform` status means its result
-descriptor is initialized. Other statuses, kinds, formats, non-zero reserved
-words, invalid ranges, and invalid image layouts fail the invocation. The
-`i64` words encode the canonical little-endian two's-complement bit pattern.
+A Buffer rank is 1 through 3 and unused dimension words must be zero. Its shape,
+outer stride, and byte length must satisfy section 8.1. A zero
+`tima_transform` status means its result descriptor is initialized. Other
+statuses, kinds, non-zero reserved words, invalid ranges, and invalid Buffer
+layouts fail the invocation. The `i64` words encode the canonical little-endian
+two's-complement bit pattern.
 
 The host runs plugins in a fuel-metered interpreter, with no JIT, and limits
-linear memory to 64 MiB. ABI v3 limits each argument payload to 32 MiB, result
+linear memory to 64 MiB. ABI v4 limits each argument payload to 32 MiB, result
 bytes to 64 MiB, and diagnostic text to 4096 bytes; the combined argument,
 descriptor, scratch, and result storage must also fit the linear-memory limit.
 An immutable input crosses the sandbox boundary once into guest memory. The
@@ -794,7 +774,7 @@ observable behavior requires a semantic version bump.
 
 ### 11.2 Workspace-local plugin registration
 
-Histima workspaces may explicitly opt into external ABI-v3 modules through
+Histima workspaces may explicitly opt into external ABI-v4 modules through
 `.histima.toml`:
 
 ```toml
@@ -807,21 +787,21 @@ Each listed TOML manifest contains exactly these fields:
 ```toml
 name = "example.encode"
 semantic_version = 1
-abi_version = 3
+abi_version = 4
 module = "example_encode.wasm"
 module_content = "<module byte Content ID>"
 result = "bytes"
 
 [[parameters]]
-name = "image"
-type = "rgba8-image"
+name = "buffer"
+type = "buffer"
 ```
 
 The transform name is exactly two Tima identifiers separated by one dot and
 may not collide with a built-in or another configured plugin. Parameters are
 ordered, uniquely named, and currently have no defaults. Parameter types are
-`bytes`, `rgba8-image`, or `i64`; result type is `bytes` or `rgba8-image`.
-These spellings map directly to ABI-v3 immutable views, scalar arguments, and
+`bytes`, `buffer`, or `i64`; result type is `bytes` or `buffer`.
+These spellings map directly to ABI-v4 immutable views, scalar arguments, and
 owned results.
 
 Manifest paths are relative to the workspace. Module paths are relative to
@@ -878,9 +858,9 @@ hexadecimal characters. Each identity kind has a distinct hash domain.
 - **Recipe ID** identifies one semantic invocation. It includes Transform ID,
   ordered semantic argument identities, and sorted/deduplicated observed
   Dependency IDs.
-- **Content ID** identifies a materialized typed value. Type and image format/
-  layout are part of identity. Raw imported bytes use a separate untyped-byte
-  content domain.
+- **Content ID** identifies a materialized typed value. Type and Buffer shape,
+  outer stride, and storage bytes are part of identity. Raw imported bytes use
+  a separate untyped-byte content domain.
 - **Source ID** identifies a locator together with its observed source content.
 - **Dependency ID** identifies capability, precise key, and observed content.
 - **Artifact ID** identifies compiled native code for one Transform ID and also
@@ -987,12 +967,11 @@ Examples include:
 
 - an outer-only value used inside a transform;
 - a dynamic outer value that cannot cross a typed inner parameter;
-- use of an owned image after it has moved;
+- use of an owned Buffer after it has moved;
 - a read-only view passed to a mutating operation;
-- an RGBA8 pixel operation applied to opaque-byte storage;
 - an unavailable runtime capability;
 - changed source or dependency content during replay;
-- an invalid native value or image layout at the outer/inner boundary.
+- an invalid Buffer layout at the outer/inner or plugin boundary.
 
 ## 14. Execution and backend contract
 
@@ -1013,7 +992,7 @@ load image with Clang, and executes supported transforms through the native ABI.
 standard LLVM installation on Windows or `clang` from `PATH`.
 
 The implemented subset admits scalar parameters and results of `bool`, `u8`,
-`i64`, or `f32`, plus owned and view `String`, `Bytes`, and `Image` boundaries;
+`i64`, or `f32`, plus owned and view `String` and `Bytes` boundaries;
 scalar constants, comparisons, control flow, and `f32` arithmetic; and direct
 calls whose complete callee closure is native-compatible. Calls marshal the
 same fixed descriptors through native stack storage, forward the runtime
@@ -1021,15 +1000,8 @@ context, and propagate failure status to the outermost invocation. String and
 byte descriptors currently support identity returns and passthrough call
 chains; they have no native mutation operations yet.
 
-`Image` and `ImageView` may cross the descriptor boundary. Identity returns,
-owned `image_zero` and `image_fill`, byte-map loops, and RGBA8 channel scaling
-are compiled. Native byte maps evaluate their typed scalar instruction sequence
-once per storage byte, including calls. Native RGBA8 operations validate the
-runtime format before addressing pixels and preserve the scalar conversion and
-row-padding semantics in section 8.5.
-
 Checked `i64` arithmetic, general string operations, newly allocated native
-images, and `environment_i64` are not compiled. String literals are emitted as
+Buffers, and `environment_i64` are not compiled. String literals are emitted as
 read-only object data. `env.read`, `file.read`, and `http.get` are therefore
 compiled for both literal keys and keys supplied by native-compatible
 `StringView` values. They call the host through the runtime context, retain
@@ -1087,28 +1059,23 @@ Future support for any item above requires an explicit specification update.
 ```tima
 source = asset("cat.png")
 
-transform darken(img: Image, factor: f32) -> Image {
-    for p in img.pixels {
-        p.r *= factor
-        p.g *= factor
-        p.b *= factor
-    }
-    return img
+transform copy(buffer: Buffer) -> Buffer {
+    return buffer
 }
 
 out =
     source
     | read
     | png.decode
-    | darken(0.8)
+    | copy
     | webp.encode(quality=85)
 
 derivation = trace(out)
 replayed = replay(out)
 ```
 
-The source asset remains immutable. `darken` receives unique mutable image
-storage, the returned image is frozen before `webp.encode` sees it, each
+The source asset remains immutable. `copy` receives unique mutable Buffer
+storage, the returned Buffer is frozen before `webp.encode` sees it, each
 transform result carries semantic lineage, and valid Recipe results may be
 reused without changing that lineage. Future compiled artifacts will remain
 execution details outside semantic lineage.

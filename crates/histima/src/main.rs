@@ -1106,13 +1106,11 @@ fn display(value: &OuterValue) -> String {
                 .join(", ")
         ),
         ValueData::Asset(asset) => format!("asset({:?})", asset.locator),
-        ValueData::Image(image) => format!(
-            "image(format={}, width={}, height={}, stride={}, bytes={})",
-            image.format(),
-            image.width(),
-            image.height(),
-            image.stride(),
-            image.byte_len()
+        ValueData::Buffer(buffer) => format!(
+            "buffer(shape={:?}, outer_stride={}, bytes={})",
+            buffer.shape(),
+            buffer.outer_stride(),
+            buffer.byte_len()
         ),
         ValueData::Transform(id) => format!("<transform {}>", id.0),
         ValueData::Lineage(lineage) => lineage.render(),
