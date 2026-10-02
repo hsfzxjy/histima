@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
+use tima::fraction::Fraction;
 use tima::identity::{
     ContentIdentity, DependencyIdentity, RecipeIdentity, SemanticValueIdentity, SourceIdentity,
     TransformIdentity, content_identity,
@@ -314,6 +315,30 @@ fn parse_recorded(
             })?;
             Ok(RecordedValue::Float(f32::from_bits(bits)))
         }
+        "fraction" => {
+            require_no_content(kind, &content)?;
+            let text = text.ok_or_else(|| Error::catalog("stored fraction has no value"))?;
+            let (numerator, denominator) = text.split_once('/').ok_or_else(|| {
+                Error::catalog(format!(
+                    "stored fraction is not numerator/denominator: {text:?}"
+                ))
+            })?;
+            let numerator = numerator.parse::<i64>().map_err(|error| {
+                Error::catalog(format!(
+                    "invalid stored fraction numerator {numerator:?}: {error}"
+                ))
+            })?;
+            let denominator = denominator.parse::<i64>().map_err(|error| {
+                Error::catalog(format!(
+                    "invalid stored fraction denominator {denominator:?}: {error}"
+                ))
+            })?;
+            Fraction::new(numerator, denominator)
+                .map(RecordedValue::Fraction)
+                .map_err(|error| {
+                    Error::catalog(format!("invalid stored fraction {text:?}: {error}"))
+                })
+        }
         "string" => {
             require_no_content(kind, &content)?;
             Ok(RecordedValue::String(Arc::new(text.ok_or_else(|| {
@@ -407,6 +432,9 @@ fn validate_argument(
         RecordedValue::Float(value) => {
             content_identity(&OuterValue::plain(ValueData::Float(*value)))
         }
+        RecordedValue::Fraction(value) => {
+            content_identity(&OuterValue::plain(ValueData::Fraction(*value)))
+        }
         RecordedValue::String(value) => {
             content_identity(&OuterValue::plain(ValueData::String(value.clone())))
         }
@@ -447,4 +475,21 @@ where
 {
     text.parse::<T>()
         .map_err(|error| Error::catalog(format!("invalid stored {kind} ID {text:?}: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_fraction_is_reduced_and_validated_by_content_identity() {
+        let expected = Fraction::new(1, 2).unwrap();
+        let semantic = content_identity(&OuterValue::plain(ValueData::Fraction(expected)))
+            .unwrap()
+            .into();
+        let parsed = parse_recorded("fraction", Some("2/4".to_owned()), None, semantic).unwrap();
+
+        assert_eq!(parsed, RecordedValue::Fraction(expected));
+        validate_argument(&parsed, semantic, None).unwrap();
+    }
 }

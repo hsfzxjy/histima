@@ -1462,6 +1462,11 @@ fn recorded_value(value: &RecordedValue) -> Result<(&'static str, Option<String>
         RecordedValue::Bool(value) => ("bool", Some(u8::from(*value).to_string()), None),
         RecordedValue::Integer(value) => ("i64", Some(value.to_string()), None),
         RecordedValue::Float(value) => ("f32", Some(format!("{:08x}", value.to_bits())), None),
+        RecordedValue::Fraction(value) => (
+            "fraction",
+            Some(format!("{}/{}", value.numerator(), value.denominator())),
+            None,
+        ),
         RecordedValue::String(value) => ("string", Some(value.to_string()), None),
         RecordedValue::Materialized { kind, content_id } => {
             if !matches!(*kind, "bytes" | "list" | "record" | "image") {
@@ -1672,5 +1677,14 @@ mod tests {
             Some("a\u{e000}".to_owned())
         );
         assert_eq!(string_prefix_upper_bound("\u{10ffff}"), None);
+    }
+
+    #[test]
+    fn fraction_arguments_use_canonical_catalog_text() {
+        let value = RecordedValue::Fraction(tima::fraction::Fraction::new(2, 4).unwrap());
+        assert_eq!(
+            recorded_value(&value).unwrap(),
+            ("fraction", Some("1/2".to_owned()), None)
+        );
     }
 }

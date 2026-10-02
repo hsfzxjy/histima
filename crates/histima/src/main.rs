@@ -1030,6 +1030,7 @@ fn display_recorded_value(value: &RecordedValue) -> String {
         RecordedValue::Bool(value) => value.to_string(),
         RecordedValue::Integer(value) => value.to_string(),
         RecordedValue::Float(value) => value.to_string(),
+        RecordedValue::Fraction(value) => value.to_string(),
         RecordedValue::String(value) => format!("{value:?}"),
         RecordedValue::Materialized { kind, content_id } => {
             format!("{kind}:{content_id}")
@@ -1089,6 +1090,7 @@ fn display(value: &OuterValue) -> String {
         ValueData::Bool(value) => value.to_string(),
         ValueData::Integer(value) => value.to_string(),
         ValueData::Float(value) => value.to_string(),
+        ValueData::Fraction(value) => value.to_string(),
         ValueData::String(value) => format!("{value:?}"),
         ValueData::Bytes(value) => format!("bytes({})", value.len()),
         ValueData::List(values) => format!(

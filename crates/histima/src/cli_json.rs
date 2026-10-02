@@ -430,6 +430,11 @@ fn recorded_value(value: &RecordedValue) -> Value {
             "bits": format!("{:08x}", value.to_bits()),
             "display": value.to_string(),
         }),
+        RecordedValue::Fraction(value) => json!({
+            "kind": "fraction",
+            "numerator": value.numerator(),
+            "denominator": value.denominator(),
+        }),
         RecordedValue::String(value) => {
             json!({"kind": "string", "value": value.as_ref()})
         }
@@ -462,6 +467,11 @@ fn outer_value(value: &OuterValue) -> Value {
             "type": "f32",
             "bits": format!("{:08x}", value.to_bits()),
             "display": value.to_string(),
+        }),
+        ValueData::Fraction(value) => json!({
+            "type": "fraction",
+            "numerator": value.numerator(),
+            "denominator": value.denominator(),
         }),
         ValueData::String(value) => json!({"type": "string", "value": value.as_ref()}),
         ValueData::Bytes(value) => json!({"type": "bytes", "byte_length": value.len()}),

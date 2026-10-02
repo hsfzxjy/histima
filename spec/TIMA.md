@@ -285,6 +285,7 @@ The outer runtime has these value kinds:
 - `bool`;
 - `i64` integer;
 - `f32` float;
+- exact outer `fraction`;
 - immutable UTF-8 string;
 - immutable bytes;
 - immutable list;
@@ -306,19 +307,43 @@ Outer arithmetic requires two operands of the same numeric kind:
 
 - integer arithmetic is checked `i64` arithmetic; overflow and division by
   zero are errors;
-- float arithmetic is `f32` arithmetic.
+- float arithmetic is `f32` arithmetic;
+- fraction arithmetic is exact, checked rational arithmetic. Fractions are
+  always reduced to a signed numerator and positive denominator; zero is
+  canonicalized to `fraction(0, 1)`.
 
-There are no implicit numeric conversions.
+There are no implicit numeric conversions. Integer, float, and fraction
+operands cannot be mixed.
 
 Equality is defined only for two values of the same scalar kind: `null`,
-`bool`, integer, float, or string. Ordering is defined only for two integers or
-two floats of the same kind. Equality or ordering of lists, records, assets,
-images, transforms, bytes, or lineage values is unsupported.
+`bool`, integer, float, fraction, or string. Ordering is defined only for two
+integers, two floats, or two fractions. Equality or ordering of lists, records,
+assets, images, transforms, bytes, or lineage values is unsupported. Fraction
+equality and ordering are mathematical because values are canonical and exact.
 
 Binary expression results do not automatically inherit operand lineage.
 Lineage is recorded at source and transform boundaries.
 
 ### 6.3 Outer builtins
+
+#### `fraction(numerator, denominator)`
+
+`fraction` accepts two `i64` integers. The denominator must be positive. It
+returns an immutable exact rational value reduced to lowest terms. The current
+surface constructor and arithmetic require the reduced numerator and positive
+denominator to fit the constructor's `i64` range; overflow, a non-positive
+denominator, and division by zero are errors.
+
+`fraction` is outer-only. It is deliberately absent from the inner type system,
+typed IR, native ABI, and registered-Wasm ABI until a concrete transform needs
+exact rational arithmetic. It has no dedicated literal syntax in v0.
+
+#### `f32.from_fraction(value)`
+
+`f32.from_fraction` explicitly converts one fraction to `f32`. Conversion
+rounds the exact rational to the nearest IEEE-754 single-precision value, with
+ties resolved toward an even significand. There is no implicit fraction-to-
+float conversion.
 
 #### `f32.from_bits(bits)`
 
@@ -912,6 +937,9 @@ Finite non-negative floats use an exactly round-tripping decimal literal.
 Every other `f32` bit pattern uses `f32.from_bits`, so recipe-expression
 generation preserves negative values, signed zero, infinities, subnormals, and
 NaN payloads bit for bit.
+Recorded fractions use canonical `fraction(numerator, denominator)` source.
+Negative numerators are reconstructed with checked integer subtraction because
+unary negation is not yet part of Tima syntax.
 
 `--input <tima-expression>` replaces the deepest value on the primary
 first-argument chain. The supplied text must itself be exactly one one-line

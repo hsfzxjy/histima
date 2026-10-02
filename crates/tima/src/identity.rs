@@ -426,6 +426,11 @@ fn encode_outer_value(
             hasher.u8(3);
             hasher.u32(value.to_bits());
         }
+        ValueData::Fraction(value) => {
+            hasher.u8(9);
+            hasher.i64(value.numerator());
+            hasher.u64(value.denominator());
+        }
         ValueData::String(value) => {
             hasher.u8(4);
             hasher.bytes(value.as_bytes());
@@ -1223,6 +1228,24 @@ mod tests {
         assert_ne!(
             content_identity(&opaque).unwrap(),
             content_identity(&rgba).unwrap()
+        );
+    }
+
+    #[test]
+    fn equivalent_fractions_have_one_content_identity() {
+        let first = OuterValue::plain(ValueData::Fraction(
+            crate::fraction::Fraction::new(1, 2).unwrap(),
+        ));
+        let second = OuterValue::plain(ValueData::Fraction(
+            crate::fraction::Fraction::new(2, 4).unwrap(),
+        ));
+        assert_eq!(
+            content_identity(&first).unwrap(),
+            content_identity(&second).unwrap()
+        );
+        assert_ne!(
+            content_identity(&first).unwrap(),
+            content_identity(&OuterValue::plain(ValueData::Float(0.5))).unwrap()
         );
     }
 

@@ -13,6 +13,7 @@ pub mod backend;
 pub mod cache;
 pub mod capability;
 pub mod diagnostic;
+pub mod fraction;
 pub mod identity;
 pub mod ir;
 pub mod lexer;

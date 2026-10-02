@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::ast::Item;
+use crate::fraction::Fraction;
 use crate::identity::{
     ContentIdentity, DependencyIdentity, IdentityError, RecipeIdentity, SemanticValueIdentity,
     SourceIdentity, TransformIdentity, content_identity, dependency_identity, recipe_identity,
@@ -68,6 +69,7 @@ pub enum RecordedValue {
     Bool(bool),
     Integer(i64),
     Float(f32),
+    Fraction(Fraction),
     String(Arc<String>),
     Materialized {
         kind: &'static str,
@@ -400,6 +402,11 @@ fn render_recorded_expression(value: &RecordedValue) -> Result<RenderedExpressio
             )));
         }
         RecordedValue::Float(value) => float_literal(*value),
+        RecordedValue::Fraction(value) => format!(
+            "fraction({}, {})",
+            signed_integer_expression(value.numerator()),
+            value.denominator()
+        ),
         RecordedValue::String(value) => string_literal(value)?,
         RecordedValue::Source { locator, source_id } => {
             format!("read(asset({}))#{source_id}", string_literal(locator)?)
@@ -414,6 +421,16 @@ fn render_recorded_expression(value: &RecordedValue) -> Result<RenderedExpressio
         text,
         is_pipeline: false,
     })
+}
+
+fn signed_integer_expression(value: i64) -> String {
+    if value >= 0 {
+        return value.to_string();
+    }
+    if value == i64::MIN {
+        return format!("0 - {} - 1", i64::MAX);
+    }
+    format!("0 - {}", value.unsigned_abs())
 }
 
 fn string_literal(value: &str) -> Result<String, LineageError> {
@@ -472,6 +489,7 @@ impl LineageArgument {
             ValueData::Bool(value) => RecordedValue::Bool(*value),
             ValueData::Integer(value) => RecordedValue::Integer(*value),
             ValueData::Float(value) => RecordedValue::Float(*value),
+            ValueData::Fraction(value) => RecordedValue::Fraction(*value),
             ValueData::String(value) => RecordedValue::String(value.clone()),
             ValueData::Bytes(_) => RecordedValue::Materialized {
                 kind: "bytes",
@@ -616,6 +634,7 @@ impl fmt::Display for RecordedValue {
             Self::Bool(value) => value.fmt(formatter),
             Self::Integer(value) => value.fmt(formatter),
             Self::Float(value) => value.fmt(formatter),
+            Self::Fraction(value) => value.fmt(formatter),
             Self::String(value) => write!(formatter, "{value:?}"),
             Self::Materialized { kind, content_id } => {
                 write!(formatter, "<{kind} content={content_id}>")
@@ -921,6 +940,27 @@ mod tests {
                 panic!("expected generated f32")
             };
             assert_eq!(value.to_bits(), expected);
+        }
+    }
+
+    #[test]
+    fn recipe_expression_fraction_values_round_trip_canonically() {
+        for expected in [
+            Fraction::new(2, 4).unwrap(),
+            Fraction::new(-5, 7).unwrap(),
+            Fraction::new(i64::MIN, i64::MAX).unwrap(),
+        ] {
+            let rendered = render_recorded_expression(&RecordedValue::Fraction(expected)).unwrap();
+            let compiled = crate::compile(
+                "fraction-roundtrip.tima",
+                format!("out = {}\n", rendered.text),
+            )
+            .unwrap();
+            let execution = crate::runtime::execute(&compiled).unwrap();
+            assert_eq!(
+                execution.bindings["out"].data,
+                ValueData::Fraction(expected)
+            );
         }
     }
 }

@@ -151,6 +151,7 @@ fn display(value: &OuterValue) -> String {
         ValueData::Bool(value) => value.to_string(),
         ValueData::Integer(value) => value.to_string(),
         ValueData::Float(value) => value.to_string(),
+        ValueData::Fraction(value) => value.to_string(),
         ValueData::String(value) => format!("{value:?}"),
         ValueData::Bytes(value) => format!("bytes({})", value.len()),
         ValueData::List(values) => format!(

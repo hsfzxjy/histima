@@ -109,6 +109,11 @@ embedded in a Tima file. Recorded `f32` arguments round-trip bit exactly;
 ordinary values remain decimal while exceptional representations use the
 outer-only `f32.from_bits(...)` constructor.
 
+Outer orchestration also has exact canonical fractions. Construct them with
+`fraction(numerator, denominator)`, use checked arithmetic only with other
+fractions, and convert explicitly with `f32.from_fraction(...)`. Fractions are
+currently outer-only and have no literal shorthand.
+
 ## A small Tima program
 
 ```tima

@@ -16,6 +16,7 @@ use crate::backend::native::{
 use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
 use crate::diagnostic::Diagnostic;
+use crate::fraction::{Fraction, FractionError};
 use crate::identity::{ContentIdentity, SemanticValueIdentity, content_identity};
 use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueId, ValueKind};
 use crate::lineage::{
@@ -59,6 +60,7 @@ pub enum ValueData {
     Bool(bool),
     Integer(i64),
     Float(f32),
+    Fraction(Fraction),
     String(Arc<String>),
     Bytes(Arc<Vec<u8>>),
     List(Arc<[OuterValue]>),
@@ -889,6 +891,7 @@ fn replay_argument(
         RecordedValue::Bool(value) => OuterValue::plain(ValueData::Bool(*value)),
         RecordedValue::Integer(value) => OuterValue::plain(ValueData::Integer(*value)),
         RecordedValue::Float(value) => OuterValue::plain(ValueData::Float(*value)),
+        RecordedValue::Fraction(value) => OuterValue::plain(ValueData::Fraction(*value)),
         RecordedValue::String(value) => OuterValue::plain(ValueData::String(value.clone())),
         RecordedValue::Materialized { content_id, .. } => {
             if let Some(value) = cache
@@ -1298,6 +1301,24 @@ impl Interpreter<'_, '_, '_> {
             }
             return self.f32_from_bits(evaluated, span);
         }
+        if name == "f32.from_fraction" {
+            if asserted {
+                return Err(Diagnostic::error(
+                    "outer builtins cannot use semantic identity assertions",
+                    callee_expression.span,
+                ));
+            }
+            return self.f32_from_fraction(evaluated, span);
+        }
+        if name == "fraction" {
+            if asserted {
+                return Err(Diagnostic::error(
+                    "outer builtins cannot use semantic identity assertions",
+                    callee_expression.span,
+                ));
+            }
+            return self.fraction(evaluated, span);
+        }
         if name == "read" {
             if asserted {
                 return Err(Diagnostic::error(
@@ -1470,6 +1491,55 @@ impl Interpreter<'_, '_, '_> {
             )
         })?;
         Ok(OuterValue::plain(ValueData::Float(f32::from_bits(bits))))
+    }
+
+    fn f32_from_fraction(
+        &self,
+        arguments: Vec<(Option<String>, OuterValue, Span)>,
+        span: Span,
+    ) -> Result<OuterValue, Diagnostic> {
+        let mut arguments =
+            order_outer_arguments("f32.from_fraction", &["value"], arguments, span)?;
+        let (argument, argument_span) = arguments
+            .pop()
+            .expect("f32.from_fraction has one normalized argument");
+        let ValueData::Fraction(value) = argument.data else {
+            return Err(Diagnostic::error(
+                "f32.from_fraction expects a fraction value",
+                argument_span,
+            ));
+        };
+        Ok(OuterValue::plain(ValueData::Float(value.to_f32())))
+    }
+
+    fn fraction(
+        &self,
+        arguments: Vec<(Option<String>, OuterValue, Span)>,
+        span: Span,
+    ) -> Result<OuterValue, Diagnostic> {
+        let mut arguments =
+            order_outer_arguments("fraction", &["numerator", "denominator"], arguments, span)?;
+        let (denominator, denominator_span) = arguments
+            .pop()
+            .expect("fraction has two normalized arguments");
+        let (numerator, numerator_span) = arguments
+            .pop()
+            .expect("fraction has two normalized arguments");
+        let ValueData::Integer(numerator) = numerator.data else {
+            return Err(Diagnostic::error(
+                "fraction numerator must be an integer",
+                numerator_span,
+            ));
+        };
+        let ValueData::Integer(denominator) = denominator.data else {
+            return Err(Diagnostic::error(
+                "fraction denominator must be an integer",
+                denominator_span,
+            ));
+        };
+        let value = Fraction::new(numerator, denominator)
+            .map_err(|error| Diagnostic::error(error.to_string(), denominator_span))?;
+        Ok(OuterValue::plain(ValueData::Fraction(value)))
     }
 
     fn read(
@@ -1719,9 +1789,12 @@ fn outer_binary(
             (ValueData::Float(left), ValueData::Float(right)) => {
                 ValueData::Float(float_arithmetic(op, left, right))
             }
+            (ValueData::Fraction(left), ValueData::Fraction(right)) => {
+                ValueData::Fraction(fraction_binary(op, left, right, span)?)
+            }
             _ => {
                 return Err(Diagnostic::error(
-                    "outer arithmetic requires two integers or two floats",
+                    "outer arithmetic requires two integers, two floats, or two fractions",
                     span,
                 ));
             }
@@ -1732,6 +1805,7 @@ fn outer_binary(
             (ValueData::Bool(left), ValueData::Bool(right)) => left == right,
             (ValueData::Integer(left), ValueData::Integer(right)) => left == right,
             (ValueData::Float(left), ValueData::Float(right)) => left == right,
+            (ValueData::Fraction(left), ValueData::Fraction(right)) => left == right,
             (ValueData::String(left), ValueData::String(right)) => left == right,
             _ => {
                 return Err(Diagnostic::error(
@@ -1749,9 +1823,12 @@ fn outer_binary(
             (ValueData::Float(left), ValueData::Float(right)) => {
                 ValueData::Bool(float_comparison(op, left, right))
             }
+            (ValueData::Fraction(left), ValueData::Fraction(right)) => {
+                ValueData::Bool(fraction_comparison(op, left, right))
+            }
             _ => {
                 return Err(Diagnostic::error(
-                    "outer ordering requires two integers or two floats",
+                    "outer ordering requires two integers, two floats, or two fractions",
                     span,
                 ));
             }
@@ -1781,6 +1858,31 @@ fn float_arithmetic(op: BinaryOp, left: f32, right: f32) -> f32 {
     }
 }
 
+fn fraction_binary(
+    op: BinaryOp,
+    left: Fraction,
+    right: Fraction,
+    span: Span,
+) -> Result<Fraction, Diagnostic> {
+    let result = match op {
+        BinaryOp::Add => left.checked_add(right),
+        BinaryOp::Subtract => left.checked_sub(right),
+        BinaryOp::Multiply => left.checked_mul(right),
+        BinaryOp::Divide => left.checked_div(right),
+        _ => unreachable!("fraction_binary is called only for arithmetic"),
+    };
+    result.map_err(|error| {
+        let message = match error {
+            FractionError::DivisionByZero => "fraction division by zero",
+            FractionError::Overflow => "fraction arithmetic overflow",
+            FractionError::NonPositiveDenominator => {
+                unreachable!("canonical fraction arithmetic keeps a positive denominator")
+            }
+        };
+        Diagnostic::error(message, span)
+    })
+}
+
 fn integer_comparison(op: BinaryOp, left: i64, right: i64) -> bool {
     match op {
         BinaryOp::Equal => left == right,
@@ -1802,6 +1904,18 @@ fn float_comparison(op: BinaryOp, left: f32, right: f32) -> bool {
         BinaryOp::Greater => left > right,
         BinaryOp::GreaterEqual => left >= right,
         _ => unreachable!("float_comparison is called only for comparisons"),
+    }
+}
+
+fn fraction_comparison(op: BinaryOp, left: Fraction, right: Fraction) -> bool {
+    match op {
+        BinaryOp::Equal => left == right,
+        BinaryOp::NotEqual => left != right,
+        BinaryOp::Less => left < right,
+        BinaryOp::LessEqual => left <= right,
+        BinaryOp::Greater => left > right,
+        BinaryOp::GreaterEqual => left >= right,
+        _ => unreachable!("fraction_comparison is called only for comparisons"),
     }
 }
 
@@ -2547,6 +2661,7 @@ mod tests {
     use crate::backend::native::NativeModule;
     use crate::cache::TransformResultCache;
     use crate::capability::RuntimeCapabilities;
+    use crate::fraction::Fraction;
     use crate::identity::{
         ContentIdentity, byte_content_identity, content_identity, source_identity,
     };
@@ -2665,6 +2780,81 @@ mod tests {
         .unwrap();
         let diagnostics = execute(&compiled).unwrap_err();
         assert!(diagnostics[0].message.contains("0..=4294967295"));
+    }
+
+    #[test]
+    fn outer_fractions_are_exact_canonical_values() {
+        let compiled = crate::compile(
+            "fractions.tima",
+            "half = fraction(2, 4)\n\
+             sum = half + fraction(1, 3)\n\
+             difference = fraction(1, 3) - half\n\
+             product = half * fraction(2, 3)\n\
+             quotient = half / fraction(2, 3)\n\
+             same = half == fraction(3, 6)\n\
+             ordered = fraction(1, 3) < half\n\
+             rounded = f32.from_fraction(fraction(1, 3))\n",
+        )
+        .unwrap();
+        let execution = execute(&compiled).unwrap();
+
+        assert_eq!(
+            execution.bindings["half"].data,
+            ValueData::Fraction(Fraction::new(1, 2).unwrap())
+        );
+        assert_eq!(
+            execution.bindings["sum"].data,
+            ValueData::Fraction(Fraction::new(5, 6).unwrap())
+        );
+        assert_eq!(
+            execution.bindings["difference"].data,
+            ValueData::Fraction(Fraction::new(-1, 6).unwrap())
+        );
+        assert_eq!(
+            execution.bindings["product"].data,
+            ValueData::Fraction(Fraction::new(1, 3).unwrap())
+        );
+        assert_eq!(
+            execution.bindings["quotient"].data,
+            ValueData::Fraction(Fraction::new(3, 4).unwrap())
+        );
+        assert_eq!(execution.bindings["same"].data, ValueData::Bool(true));
+        assert_eq!(execution.bindings["ordered"].data, ValueData::Bool(true));
+        assert_eq!(
+            execution.bindings["rounded"].data,
+            ValueData::Float(1.0f32 / 3.0)
+        );
+    }
+
+    #[test]
+    fn outer_fractions_reject_invalid_and_mixed_arithmetic() {
+        let invalid = crate::compile("invalid-fraction.tima", "out = fraction(1, 0)\n").unwrap();
+        let diagnostic = execute(&invalid).unwrap_err();
+        assert!(
+            diagnostic
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("denominator must be positive"))
+        );
+
+        let divided = crate::compile(
+            "divide-fraction.tima",
+            "out = fraction(1, 2) / fraction(0, 1)\n",
+        )
+        .unwrap();
+        let diagnostic = execute(&divided).unwrap_err();
+        assert!(
+            diagnostic
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("division by zero"))
+        );
+
+        let mixed = crate::compile("mixed-fraction.tima", "out = fraction(1, 2) + 1\n").unwrap();
+        let diagnostic = execute(&mixed).unwrap_err();
+        assert!(
+            diagnostic
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("two fractions"))
+        );
     }
 
     #[test]
