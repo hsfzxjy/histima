@@ -12,6 +12,7 @@ pub enum TokenKind {
     Identifier(String),
     Integer(i64),
     Float(f64),
+    Fraction(i64, i64),
     String(String),
     Transform,
     Uses,
@@ -190,12 +191,44 @@ impl Lexer<'_> {
         while self.current().is_some_and(|byte| byte.is_ascii_digit()) {
             self.position += 1;
         }
+        let numerator_end = self.position;
         let is_float =
             self.current() == Some(b'.') && self.peek().is_some_and(|byte| byte.is_ascii_digit());
         if is_float {
             self.position += 1;
             while self.current().is_some_and(|byte| byte.is_ascii_digit()) {
                 self.position += 1;
+            }
+        }
+        let is_fraction = !is_float
+            && self.current() == Some(b'/')
+            && self.peek().is_some_and(|byte| byte.is_ascii_digit());
+        if is_fraction {
+            self.position += 1;
+            let denominator_start = self.position;
+            while self.current().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.position += 1;
+            }
+            if self.current() == Some(b'.') && self.peek().is_some_and(|byte| byte.is_ascii_digit())
+            {
+                self.position = numerator_end;
+            } else {
+                let numerator = self.text[start..numerator_end].parse::<i64>();
+                let denominator = self.text[denominator_start..self.position].parse::<i64>();
+                match (numerator, denominator) {
+                    (Ok(numerator), Ok(denominator)) => {
+                        self.push(TokenKind::Fraction(numerator, denominator), start);
+                    }
+                    (Err(_), _) => self.diagnostics.push(Diagnostic::error(
+                        "fraction numerator is outside the i64 range",
+                        Span::new(start, numerator_end),
+                    )),
+                    (_, Err(_)) => self.diagnostics.push(Diagnostic::error(
+                        "fraction denominator is outside the i64 range",
+                        Span::new(denominator_start, self.position),
+                    )),
+                }
+                return;
             }
         }
         let text = &self.text[start..self.position];
@@ -360,6 +393,40 @@ mod tests {
                 .iter()
                 .any(|token| token.kind == TokenKind::IdentityHash("f".to_owned()))
         );
+    }
+
+    #[test]
+    fn adjacent_integer_slash_is_a_fraction_but_spaced_slash_is_division() {
+        let source = SourceFile::new("test.tima", "a = 1/3\nb = 1 / 3\nc = 1/3.0\n");
+        let tokens = lex(&source).unwrap();
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::Fraction(1, 3))
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::Slash)
+                .count(),
+            2
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::Float(3.0))
+        );
+    }
+
+    #[test]
+    fn fraction_components_must_fit_i64() {
+        for (source, component) in [
+            ("9223372036854775808/1", "numerator"),
+            ("1/9223372036854775808", "denominator"),
+        ] {
+            let diagnostics = lex(&SourceFile::new("test.tima", source)).unwrap_err();
+            assert!(diagnostics[0].message.contains(component));
+        }
     }
 
     #[test]

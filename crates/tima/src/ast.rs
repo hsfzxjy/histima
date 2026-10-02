@@ -107,6 +107,7 @@ pub enum ExprKind {
     Bool(bool),
     Integer(i64),
     Float(f64),
+    Fraction(i64, i64),
     String(String),
     Name(String),
     List(Vec<ExprId>),

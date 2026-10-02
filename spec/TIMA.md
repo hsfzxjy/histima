@@ -112,6 +112,7 @@ true
 false
 42
 3.5
+1/3
 "cat.png"
 [1, 2, 3]
 {name: "cat", sizes: [1, 2]}
@@ -121,6 +122,14 @@ Integer tokens are unsigned decimal text parsed into `i64`; negative literals
 are not currently available because unary negation is unsupported. A float
 token requires digits on both sides of one decimal point. Exponents and type
 suffixes are unsupported.
+
+Two unsigned integer components joined by `/` with no intervening whitespace
+form one exact fraction literal: `1/3`. Both components must fit `i64`, and the
+denominator must be positive. Whitespace is semantically significant only for
+this lexical distinction: `1 / 3` is the existing integer division expression,
+while `1/3` is a fraction value. If either side is not an integer token, `/`
+remains division; for example, `1/3.0` divides an integer by a float and is
+rejected as mixed arithmetic at runtime.
 
 Strings are double-quoted. The supported escapes are `\n`, `\r`, `\t`, `\"`,
 and `\\`. A string cannot contain an unescaped newline.
@@ -334,9 +343,11 @@ surface constructor and arithmetic require the reduced numerator and positive
 denominator to fit the constructor's `i64` range; overflow, a non-positive
 denominator, and division by zero are errors.
 
-`fraction` is outer-only. It is deliberately absent from the inner type system,
-typed IR, native ABI, and registered-Wasm ABI until a concrete transform needs
-exact rational arithmetic. It has no dedicated literal syntax in v0.
+`fraction` and fraction literals are outer-only. Fractions are deliberately
+absent from the inner type system, typed IR, native ABI, and registered-Wasm ABI
+until a concrete transform needs exact rational arithmetic. The constructor
+remains useful for computed or negative numerators, which cannot be written as
+one unsigned fraction token.
 
 #### `f32.from_fraction(value)`
 
@@ -937,9 +948,10 @@ Finite non-negative floats use an exactly round-tripping decimal literal.
 Every other `f32` bit pattern uses `f32.from_bits`, so recipe-expression
 generation preserves negative values, signed zero, infinities, subnormals, and
 NaN payloads bit for bit.
-Recorded fractions use canonical `fraction(numerator, denominator)` source.
-Negative numerators are reconstructed with checked integer subtraction because
-unary negation is not yet part of Tima syntax.
+Recorded non-negative fractions use canonical `numerator/denominator` source.
+Negative numerators use `fraction(numerator, denominator)` and are reconstructed
+with checked integer subtraction because unary negation is not yet part of Tima
+syntax.
 
 `--input <tima-expression>` replaces the deepest value on the primary
 first-argument chain. The supplied text must itself be exactly one one-line

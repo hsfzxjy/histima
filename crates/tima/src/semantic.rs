@@ -1042,6 +1042,7 @@ impl<'a> Lowerer<'a> {
                 ))
             }
             ExprKind::Null
+            | ExprKind::Fraction(_, _)
             | ExprKind::List(_)
             | ExprKind::Record(_)
             | ExprKind::Member { .. }
@@ -1320,6 +1321,7 @@ fn expression_mentions_name(program: &ast::Program, expression: ExprId, name: &s
         | ExprKind::Bool(_)
         | ExprKind::Integer(_)
         | ExprKind::Float(_)
+        | ExprKind::Fraction(_, _)
         | ExprKind::String(_) => false,
     }
 }
@@ -1556,6 +1558,10 @@ mod tests {
     fn rejects_dynamic_values_in_inner_code() {
         let diagnostics =
             compile("test.tima", "transform bad(x: f32) -> f32 { return [x] }\n").unwrap_err();
+        assert!(diagnostics[0].message.contains("outer-only"));
+
+        let diagnostics =
+            compile("test.tima", "transform bad() -> i64 { return 1/3 }\n").unwrap_err();
         assert!(diagnostics[0].message.contains("outer-only"));
     }
 

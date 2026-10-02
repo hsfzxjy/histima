@@ -400,6 +400,9 @@ impl Parser {
             TokenKind::False => ExprKind::Bool(false),
             TokenKind::Integer(value) => ExprKind::Integer(value),
             TokenKind::Float(value) => ExprKind::Float(value),
+            TokenKind::Fraction(numerator, denominator) => {
+                ExprKind::Fraction(numerator, denominator)
+            }
             TokenKind::String(value) => ExprKind::String(value),
             TokenKind::Identifier(name) => ExprKind::Name(name),
             TokenKind::LeftParen => {
@@ -566,6 +569,29 @@ mod tests {
         assert!(matches!(
             program.expr(binding.value).kind,
             ExprKind::Record(_)
+        ));
+    }
+
+    #[test]
+    fn parses_adjacent_fraction_separately_from_integer_division() {
+        let source = SourceFile::new("test.tima", "compact = 1/3\nspaced = 1 / 3\n");
+        let program = parse(&source).unwrap();
+        let Item::Binding(compact) = &program.items[0] else {
+            panic!("expected compact binding")
+        };
+        assert!(matches!(
+            program.expr(compact.value).kind,
+            ExprKind::Fraction(1, 3)
+        ));
+        let Item::Binding(spaced) = &program.items[1] else {
+            panic!("expected spaced binding")
+        };
+        assert!(matches!(
+            program.expr(spaced.value).kind,
+            ExprKind::Binary {
+                op: BinaryOp::Divide,
+                ..
+            }
         ));
     }
 

@@ -1147,6 +1147,11 @@ impl Interpreter<'_, '_, '_> {
             ExprKind::Bool(value) => OuterValue::plain(ValueData::Bool(*value)),
             ExprKind::Integer(value) => OuterValue::plain(ValueData::Integer(*value)),
             ExprKind::Float(value) => OuterValue::plain(ValueData::Float(*value as f32)),
+            ExprKind::Fraction(numerator, denominator) => {
+                let value = Fraction::new(*numerator, *denominator)
+                    .map_err(|error| Diagnostic::error(error.to_string(), expression.span))?;
+                OuterValue::plain(ValueData::Fraction(value))
+            }
             ExprKind::String(value) => {
                 OuterValue::plain(ValueData::String(Arc::new(value.clone())))
             }
@@ -2787,6 +2792,9 @@ mod tests {
         let compiled = crate::compile(
             "fractions.tima",
             "half = fraction(2, 4)\n\
+             literal = 2/4\n\
+             literal_sum = 1/2 + 1/3\n\
+             integer_division = 1 / 3\n\
              sum = half + fraction(1, 3)\n\
              difference = fraction(1, 3) - half\n\
              product = half * fraction(2, 3)\n\
@@ -2801,6 +2809,18 @@ mod tests {
         assert_eq!(
             execution.bindings["half"].data,
             ValueData::Fraction(Fraction::new(1, 2).unwrap())
+        );
+        assert_eq!(
+            execution.bindings["literal"].data,
+            ValueData::Fraction(Fraction::new(1, 2).unwrap())
+        );
+        assert_eq!(
+            execution.bindings["literal_sum"].data,
+            ValueData::Fraction(Fraction::new(5, 6).unwrap())
+        );
+        assert_eq!(
+            execution.bindings["integer_division"].data,
+            ValueData::Integer(0)
         );
         assert_eq!(
             execution.bindings["sum"].data,
@@ -2830,6 +2850,14 @@ mod tests {
     fn outer_fractions_reject_invalid_and_mixed_arithmetic() {
         let invalid = crate::compile("invalid-fraction.tima", "out = fraction(1, 0)\n").unwrap();
         let diagnostic = execute(&invalid).unwrap_err();
+        assert!(
+            diagnostic
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("denominator must be positive"))
+        );
+
+        let invalid_literal = crate::compile("invalid-literal.tima", "out = 1/0\n").unwrap();
+        let diagnostic = execute(&invalid_literal).unwrap_err();
         assert!(
             diagnostic
                 .iter()

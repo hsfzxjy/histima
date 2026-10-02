@@ -402,11 +402,7 @@ fn render_recorded_expression(value: &RecordedValue) -> Result<RenderedExpressio
             )));
         }
         RecordedValue::Float(value) => float_literal(*value),
-        RecordedValue::Fraction(value) => format!(
-            "fraction({}, {})",
-            signed_integer_expression(value.numerator()),
-            value.denominator()
-        ),
+        RecordedValue::Fraction(value) => fraction_literal(*value),
         RecordedValue::String(value) => string_literal(value)?,
         RecordedValue::Source { locator, source_id } => {
             format!("read(asset({}))#{source_id}", string_literal(locator)?)
@@ -431,6 +427,17 @@ fn signed_integer_expression(value: i64) -> String {
         return format!("0 - {} - 1", i64::MAX);
     }
     format!("0 - {}", value.unsigned_abs())
+}
+
+fn fraction_literal(value: Fraction) -> String {
+    if value.numerator() >= 0 {
+        return format!("{}/{}", value.numerator(), value.denominator());
+    }
+    format!(
+        "fraction({}, {})",
+        signed_integer_expression(value.numerator()),
+        value.denominator()
+    )
 }
 
 fn string_literal(value: &str) -> Result<String, LineageError> {
