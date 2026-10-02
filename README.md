@@ -136,9 +136,11 @@ identity, lineage, cache, and replay model as user transforms. The PPM, PNG,
 and WebP implementations all run as fuel- and memory-bounded registered-Wasm
 plugins.
 
-Transform references can assert semantic identity as `name#hash`, where `hash`
-is a full Transform ID or lowercase prefix. The assertion does not itself
-change semantic identity.
+Any outer value with one selected semantic identity can be pinned as
+`value#hash`, where `hash` is a full lowercase identity or prefix. Transform
+values/calls use Transform ID, observed sources use Source ID, derived values
+use Recipe ID, and otherwise materialized values use Content ID. The assertion
+returns the value unchanged and is not lookup by hash.
 
 ## The World boundary
 

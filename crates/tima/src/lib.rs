@@ -68,7 +68,7 @@ pub fn compile_with_plugins(
     let syntax = parser::parse(&source)?;
     let transforms = semantic::check(&syntax)?;
     let identities = identity::transform_identities(&transforms)?;
-    validate_identity_qualifiers(&syntax, &transforms, &identities, &plugins)?;
+    validate_callable_identity_assertions(&syntax, &transforms, &identities, &plugins)?;
     Ok(CompiledProgram {
         source,
         syntax,
@@ -78,25 +78,48 @@ pub fn compile_with_plugins(
     })
 }
 
-fn validate_identity_qualifiers(
+fn validate_callable_identity_assertions(
     syntax: &Program,
     transforms: &TypedModule,
     identities: &TransformIdentities,
     plugins: &plugin::PluginRegistry,
 ) -> Result<(), Vec<Diagnostic>> {
+    let callable_assertions = syntax
+        .expressions
+        .iter()
+        .filter_map(|expression| match &expression.kind {
+            ast::ExprKind::Call { callee, .. }
+                if matches!(
+                    syntax.expr(*callee).kind,
+                    ast::ExprKind::IdentityAsserted { .. }
+                ) =>
+            {
+                Some(*callee)
+            }
+            ast::ExprKind::Pipeline { stage, .. }
+                if matches!(
+                    syntax.expr(*stage).kind,
+                    ast::ExprKind::IdentityAsserted { .. }
+                ) =>
+            {
+                Some(*stage)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let mut diagnostics = Vec::new();
-    for expression in &syntax.expressions {
-        let ast::ExprKind::IdentityQualified {
-            callable,
+    for assertion in callable_assertions {
+        let ast::ExprKind::IdentityAsserted {
+            value,
             prefix,
             prefix_span,
-        } = &expression.kind
+        } = &syntax.expr(assertion).kind
         else {
-            continue;
+            unreachable!("callable assertion IDs were filtered above")
         };
-        let Some(name) = callable_name(syntax, *callable) else {
+        let Some(name) = callable_name(syntax, *value) else {
             diagnostics.push(Diagnostic::error(
-                "semantic identity qualifier must follow a transform name",
+                "a callable identity assertion must follow a transform name",
                 *prefix_span,
             ));
             continue;
@@ -108,7 +131,7 @@ fn validate_identity_qualifiers(
             .or_else(|| plugins.find(&name).map(|value| value.identity()));
         let Some(actual) = actual else {
             diagnostics.push(Diagnostic::error(
-                format!("no semantic transform named `{name}` can be identity-qualified"),
+                format!("no semantic transform named `{name}` can be identity-asserted"),
                 *prefix_span,
             ));
             continue;
@@ -121,7 +144,7 @@ fn validate_identity_qualifiers(
                     ),
                     *prefix_span,
                 )
-                .with_note("update or remove the identity qualifier to use this definition"),
+                    .with_note("update or remove the identity assertion to use this definition"),
             );
         }
     }
@@ -141,7 +164,7 @@ fn callable_name(program: &Program, expression: ast::ExprId) -> Option<String> {
             };
             Some(format!("{namespace}.{name}"))
         }
-        ast::ExprKind::IdentityQualified { .. } => None,
+        ast::ExprKind::IdentityAsserted { .. } => None,
         _ => None,
     }
 }
@@ -176,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_identity_qualifiers_reject_changed_definitions() {
+    fn callable_identity_assertions_reject_changed_definitions() {
         let diagnostics = compile(
             "mismatch.tima",
             "transform keep(x: f32) -> f32 { return x }\nout = keep#00000000(1.0)\n",

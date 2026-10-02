@@ -197,12 +197,19 @@ impl Lineage {
     }
 }
 
+/// Selects the identity that represents an outer value in recipes and
+/// postfix identity assertions. Derivation identity deliberately takes
+/// precedence over equal materialized content.
+pub fn semantic_value_identity(value: &OuterValue) -> Result<SemanticValueIdentity, IdentityError> {
+    match value.lineage.as_ref().and_then(Lineage::semantic_identity) {
+        Some(identity) => Ok(identity),
+        None => Ok(content_identity(value)?.into()),
+    }
+}
+
 impl LineageArgument {
     pub fn record(name: impl Into<Arc<str>>, value: &OuterValue) -> Result<Self, IdentityError> {
-        let semantic_identity = match value.lineage.as_ref().and_then(Lineage::semantic_identity) {
-            Some(identity) => identity,
-            None => content_identity(value)?.into(),
-        };
+        let semantic_identity = semantic_value_identity(value)?;
         let recorded = match &value.data {
             ValueData::Null => RecordedValue::Null,
             ValueData::Bool(value) => RecordedValue::Bool(*value),

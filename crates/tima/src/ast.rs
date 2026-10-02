@@ -120,8 +120,8 @@ pub enum ExprKind {
         name: String,
         name_span: Span,
     },
-    IdentityQualified {
-        callable: ExprId,
+    IdentityAsserted {
+        value: ExprId,
         prefix: String,
         prefix_span: Span,
     },

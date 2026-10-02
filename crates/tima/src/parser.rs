@@ -377,8 +377,8 @@ impl Parser {
                 };
                 let span = self.expr(expression).span.join(token.span);
                 expression = self.alloc(
-                    ExprKind::IdentityQualified {
-                        callable: expression,
+                    ExprKind::IdentityAsserted {
+                        value: expression,
                         prefix,
                         prefix_span: token.span,
                     },
@@ -741,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_identity_qualified_namespaced_pipeline_stages() {
+    fn parses_identity_asserted_namespaced_pipeline_stages() {
         let source = SourceFile::new("test.tima", "out = bytes | png.decode#0123abcd\n");
         let program = parse(&source).unwrap();
         let Item::Binding(binding) = &program.items[0] else {
@@ -750,18 +750,30 @@ mod tests {
         let ExprKind::Pipeline { stage, .. } = program.expr(binding.value).kind else {
             panic!("expected pipeline")
         };
-        let ExprKind::IdentityQualified {
-            callable, prefix, ..
-        } = &program.expr(stage).kind
-        else {
-            panic!("expected identity-qualified stage")
+        let ExprKind::IdentityAsserted { value, prefix, .. } = &program.expr(stage).kind else {
+            panic!("expected identity-asserted stage")
         };
         assert_eq!(prefix, "0123abcd");
         assert!(matches!(
-            &program.expr(*callable).kind,
+            &program.expr(*value).kind,
             ExprKind::Member { receiver, name, .. }
                 if name == "decode"
                     && matches!(&program.expr(*receiver).kind, ExprKind::Name(name) if name == "png")
         ));
+    }
+
+    #[test]
+    fn parses_identity_assertions_on_arbitrary_expressions() {
+        let source = SourceFile::new("test.tima", "out = (value + 1)#0123abcd\n");
+        let program = parse(&source).unwrap();
+        let Item::Binding(binding) = &program.items[0] else {
+            panic!("expected binding")
+        };
+        let ExprKind::IdentityAsserted { value, prefix, .. } = &program.expr(binding.value).kind
+        else {
+            panic!("expected identity assertion")
+        };
+        assert_eq!(prefix, "0123abcd");
+        assert!(matches!(program.expr(*value).kind, ExprKind::Binary { .. }));
     }
 }

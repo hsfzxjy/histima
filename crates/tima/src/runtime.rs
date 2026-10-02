@@ -16,9 +16,11 @@ use crate::backend::native::{
 use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
 use crate::diagnostic::Diagnostic;
-use crate::identity::{ContentIdentity, content_identity};
+use crate::identity::{ContentIdentity, SemanticValueIdentity, content_identity};
 use crate::ir::{Constant, RuntimeCall, Terminator, TransformId, Type, ValueId, ValueKind};
-use crate::lineage::{Lineage, LineageArgument, LineageNode, RecordedValue};
+use crate::lineage::{
+    Lineage, LineageArgument, LineageNode, RecordedValue, semantic_value_identity,
+};
 use crate::plugin::{PluginTransform, prepare_plugin_invocation};
 use crate::registered::{RegisteredTransform, prepare_registered_invocation};
 use crate::source::Span;
@@ -1180,15 +1182,13 @@ impl Interpreter<'_, '_, '_> {
                     expression.span,
                 ));
             }
-            ExprKind::IdentityQualified { callable, .. } => {
-                let name = self.callable_name(*callable)?;
-                let Some((id, _)) = self.program.transforms.find(&name) else {
-                    return Err(Diagnostic::error(
-                        "identity-qualified callable values currently require a user transform",
-                        expression.span,
-                    ));
-                };
-                OuterValue::plain(ValueData::Transform(id))
+            ExprKind::IdentityAsserted {
+                value,
+                prefix,
+                prefix_span,
+            } => {
+                let value = self.expression(*value)?;
+                self.assert_value_identity(value, prefix, *prefix_span)?
             }
             ExprKind::Pipeline { input, stage } => {
                 let input = self.expression(*input)?;
@@ -1198,7 +1198,7 @@ impl Interpreter<'_, '_, '_> {
                     }
                     ExprKind::Name(_)
                     | ExprKind::Member { .. }
-                    | ExprKind::IdentityQualified { .. } => {
+                    | ExprKind::IdentityAsserted { .. } => {
                         self.call(*stage, &[], Some(input), expression.span)?
                     }
                     _ => {
@@ -1226,6 +1226,39 @@ impl Interpreter<'_, '_, '_> {
         ))
     }
 
+    fn assert_value_identity(
+        &self,
+        value: OuterValue,
+        prefix: &str,
+        span: Span,
+    ) -> Result<OuterValue, Diagnostic> {
+        let (kind, actual) = match &value.data {
+            ValueData::Transform(id) => {
+                ("Transform ID", self.program.identities.get(*id).to_string())
+            }
+            _ => match semantic_value_identity(&value).map_err(|error| {
+                Diagnostic::error(
+                    format!("value has no assertable semantic identity: {error}"),
+                    span,
+                )
+            })? {
+                SemanticValueIdentity::Content(identity) => ("Content ID", identity.to_string()),
+                SemanticValueIdentity::Source(identity) => ("Source ID", identity.to_string()),
+                SemanticValueIdentity::Recipe(identity) => ("Recipe ID", identity.to_string()),
+            },
+        };
+        if actual.starts_with(prefix) {
+            return Ok(value);
+        }
+        Err(Diagnostic::error(
+            format!(
+                "value has {kind} {actual}, which does not match identity assertion `#{prefix}`"
+            ),
+            span,
+        )
+        .with_note("update or remove the identity assertion to use this value"))
+    }
+
     fn call(
         &mut self,
         callee: ExprId,
@@ -1235,7 +1268,7 @@ impl Interpreter<'_, '_, '_> {
     ) -> Result<OuterValue, Diagnostic> {
         let callee_expression = self.program.syntax.expr(callee);
         let name = self.callable_name(callee)?;
-        let qualified = matches!(callee_expression.kind, ExprKind::IdentityQualified { .. });
+        let asserted = matches!(callee_expression.kind, ExprKind::IdentityAsserted { .. });
         let mut evaluated = Vec::new();
         if let Some(input) = pipeline_input {
             evaluated.push((None, input, callee_expression.span));
@@ -1248,45 +1281,45 @@ impl Interpreter<'_, '_, '_> {
             ));
         }
         if name == "asset" {
-            if qualified {
+            if asserted {
                 return Err(Diagnostic::error(
-                    "outer builtins cannot use semantic identity qualifiers",
+                    "outer builtins cannot use semantic identity assertions",
                     callee_expression.span,
                 ));
             }
             return self.asset(evaluated, span);
         }
         if name == "read" {
-            if qualified {
+            if asserted {
                 return Err(Diagnostic::error(
-                    "outer builtins cannot use semantic identity qualifiers",
+                    "outer builtins cannot use semantic identity assertions",
                     callee_expression.span,
                 ));
             }
             return self.read(evaluated, span);
         }
         if name == "trace" {
-            if qualified {
+            if asserted {
                 return Err(Diagnostic::error(
-                    "outer builtins cannot use semantic identity qualifiers",
+                    "outer builtins cannot use semantic identity assertions",
                     callee_expression.span,
                 ));
             }
             return self.trace(evaluated, span);
         }
         if name == "replay" {
-            if qualified {
+            if asserted {
                 return Err(Diagnostic::error(
-                    "outer builtins cannot use semantic identity qualifiers",
+                    "outer builtins cannot use semantic identity assertions",
                     callee_expression.span,
                 ));
             }
             return self.replay_call(evaluated, span);
         }
         if name == "save" {
-            if qualified {
+            if asserted {
                 return Err(Diagnostic::error(
-                    "outer builtins cannot use semantic identity qualifiers",
+                    "outer builtins cannot use semantic identity assertions",
                     callee_expression.span,
                 ));
             }
@@ -1369,7 +1402,7 @@ impl Interpreter<'_, '_, '_> {
                 };
                 Ok(format!("{namespace}.{name}"))
             }
-            ExprKind::IdentityQualified { callable, .. } => self.callable_name(*callable),
+            ExprKind::IdentityAsserted { value, .. } => self.callable_name(*value),
             _ => Err(Diagnostic::error(
                 "outer calls require a named builtin or transform",
                 expression.span,
@@ -2481,7 +2514,9 @@ mod tests {
     use crate::backend::native::NativeModule;
     use crate::cache::TransformResultCache;
     use crate::capability::RuntimeCapabilities;
-    use crate::identity::{ContentIdentity, byte_content_identity};
+    use crate::identity::{
+        ContentIdentity, byte_content_identity, content_identity, source_identity,
+    };
     use crate::ir::TransformId;
     use crate::lineage::{Lineage, LineageNode, RecordedValue};
     use crate::runtime::{
@@ -2529,6 +2564,13 @@ mod tests {
                 .get(path)
                 .cloned()
                 .ok_or_else(|| format!("file `{path}` is unavailable"))
+        }
+
+        fn read_asset(&self, locator: &str) -> Result<Vec<u8>, String> {
+            self.files
+                .get(locator)
+                .cloned()
+                .ok_or_else(|| format!("asset `{locator}` is unavailable"))
         }
 
         fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
@@ -2653,7 +2695,7 @@ mod tests {
     }
 
     #[test]
-    fn executes_an_identity_qualified_transform_reference() {
+    fn executes_an_identity_asserted_transform_call() {
         let definition = "transform scale(x: f32, factor: f32) -> f32 { return x * factor }\n";
         let base = crate::compile("base.tima", definition).unwrap();
         let identity = base.identities.get(TransformId(0)).to_string();
@@ -2668,6 +2710,103 @@ mod tests {
 
         let execution = execute(&compiled).unwrap();
         assert_eq!(execution.bindings["out"].data, ValueData::Float(2.0));
+    }
+
+    #[test]
+    fn identity_assertions_accept_first_class_transform_values() {
+        let definition = "transform keep(x: i64) -> i64 { return x }\n";
+        let base = crate::compile("base.tima", definition).unwrap();
+        let identity = base.identities.get(TransformId(0)).to_string();
+        let compiled = crate::compile(
+            "transform-value-identity.tima",
+            format!("{definition}pinned = keep#{}\n", &identity[..14]),
+        )
+        .unwrap();
+
+        let execution = execute(&compiled).unwrap();
+        assert_eq!(
+            execution.bindings["pinned"].data,
+            ValueData::Transform(TransformId(0))
+        );
+    }
+
+    #[test]
+    fn identity_assertions_accept_plain_outer_values_by_content_id() {
+        let input = OuterValue::plain(ValueData::List(Arc::from([
+            OuterValue::plain(ValueData::Integer(1)),
+            OuterValue::plain(ValueData::Integer(2)),
+        ])));
+        let identity = content_identity(&input).unwrap().to_string();
+        let compiled = crate::compile(
+            "value-identity.tima",
+            format!("out = input#{}\n", &identity[..16]),
+        )
+        .unwrap();
+
+        let execution = execute_with(
+            &compiled,
+            &IrInterpreter {
+                module: &compiled.transforms,
+                capabilities: None,
+            },
+            BTreeMap::from([("input".to_owned(), input.clone())]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(execution.bindings["out"], input);
+    }
+
+    #[test]
+    fn identity_assertions_use_recipe_id_for_derived_values() {
+        let definition = "transform keep(x: i64) -> i64 { return x }\n";
+        let base = crate::compile("base.tima", format!("{definition}out = keep(42)\n")).unwrap();
+        let base_execution = execute(&base).unwrap();
+        let recipe = base_execution.bindings["out"]
+            .lineage
+            .as_ref()
+            .and_then(Lineage::recipe_id)
+            .unwrap()
+            .to_string();
+        let compiled = crate::compile(
+            "recipe-identity.tima",
+            format!("{definition}out = keep(42)#{}\n", &recipe[..20]),
+        )
+        .unwrap();
+
+        let execution = execute(&compiled).unwrap();
+        assert_eq!(execution.bindings["out"].data, ValueData::Integer(42));
+    }
+
+    #[test]
+    fn identity_assertions_use_source_id_for_observed_assets() {
+        let bytes = b"source bytes";
+        let identity = source_identity("cat.bin", byte_content_identity(bytes)).to_string();
+        let compiled = crate::compile(
+            "source-identity.tima",
+            format!("out = read(asset(\"cat.bin\"))#{}\n", &identity[..18]),
+        )
+        .unwrap();
+        let world = FixedWorld {
+            environment: BTreeMap::new(),
+            files: BTreeMap::from([("cat.bin".to_owned(), bytes.to_vec())]),
+            urls: BTreeMap::new(),
+        };
+
+        let execution = execute_with_capabilities(&compiled, &world).unwrap();
+        assert_eq!(
+            execution.bindings["out"].data,
+            ValueData::Bytes(Arc::new(bytes.to_vec()))
+        );
+    }
+
+    #[test]
+    fn identity_assertion_mismatches_report_the_identity_domain() {
+        let compiled = crate::compile("mismatch.tima", "out = 42#00000000\n").unwrap();
+        let diagnostics = execute(&compiled).unwrap_err();
+
+        assert!(diagnostics[0].message.contains("Content ID"));
+        assert!(diagnostics[0].message.contains("does not match"));
     }
 
     #[test]

@@ -939,7 +939,7 @@ impl<'a> Lowerer<'a> {
                 ))
             }
             ExprKind::Call { callee, arguments } => {
-                let Some((name, qualified)) = inner_callable_name(self.program, *callee) else {
+                let Some((name, asserted)) = inner_callable_name(self.program, *callee) else {
                     self.diagnostics.push(Diagnostic::error(
                         "inner calls require a directly named transform",
                         self.program.expr(*callee).span,
@@ -947,9 +947,9 @@ impl<'a> Lowerer<'a> {
                     return None;
                 };
                 if name == "environment_i64" {
-                    if qualified {
+                    if asserted {
                         self.diagnostics.push(Diagnostic::error(
-                            "inner runtime operations cannot use semantic identity qualifiers",
+                            "inner runtime operations cannot use semantic identity assertions",
                             self.program.expr(*callee).span,
                         ));
                         return None;
@@ -957,9 +957,9 @@ impl<'a> Lowerer<'a> {
                     return self.environment_i64(arguments, expression.span);
                 }
                 if matches!(name.as_str(), "env.read" | "file.read" | "http.get") {
-                    if qualified {
+                    if asserted {
                         self.diagnostics.push(Diagnostic::error(
-                            "inner runtime operations cannot use semantic identity qualifiers",
+                            "inner runtime operations cannot use semantic identity assertions",
                             self.program.expr(*callee).span,
                         ));
                         return None;
@@ -967,9 +967,9 @@ impl<'a> Lowerer<'a> {
                     return self.world_read(&name, arguments, expression.span);
                 }
                 if name == "image_zero" {
-                    if qualified {
+                    if asserted {
                         self.diagnostics.push(Diagnostic::error(
-                            "inner runtime operations cannot use semantic identity qualifiers",
+                            "inner runtime operations cannot use semantic identity assertions",
                             self.program.expr(*callee).span,
                         ));
                         return None;
@@ -977,9 +977,9 @@ impl<'a> Lowerer<'a> {
                     return self.image_zero(arguments, expression.span);
                 }
                 if name == "image_fill" {
-                    if qualified {
+                    if asserted {
                         self.diagnostics.push(Diagnostic::error(
-                            "inner runtime operations cannot use semantic identity qualifiers",
+                            "inner runtime operations cannot use semantic identity assertions",
                             self.program.expr(*callee).span,
                         ));
                         return None;
@@ -1045,7 +1045,7 @@ impl<'a> Lowerer<'a> {
             | ExprKind::List(_)
             | ExprKind::Record(_)
             | ExprKind::Member { .. }
-            | ExprKind::IdentityQualified { .. }
+            | ExprKind::IdentityAsserted { .. }
             | ExprKind::Pipeline { .. } => {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -1280,7 +1280,7 @@ fn inner_callable_name(program: &ast::Program, expression: ExprId) -> Option<(St
             };
             Some((format!("{namespace}.{name}"), false))
         }
-        ExprKind::IdentityQualified { callable, .. } => match &program.expr(*callable).kind {
+        ExprKind::IdentityAsserted { value, .. } => match &program.expr(*value).kind {
             ExprKind::Name(name) => Some((name.clone(), true)),
             ExprKind::Member { receiver, name, .. } => {
                 let ExprKind::Name(namespace) = &program.expr(*receiver).kind else {
@@ -1307,9 +1307,7 @@ fn expression_mentions_name(program: &ast::Program, expression: ExprId, name: &s
             .iter()
             .any(|argument| expression_mentions_name(program, argument.value, name)),
         ExprKind::Member { receiver, .. } => expression_mentions_name(program, *receiver, name),
-        ExprKind::IdentityQualified { callable, .. } => {
-            expression_mentions_name(program, *callable, name)
-        }
+        ExprKind::IdentityAsserted { value, .. } => expression_mentions_name(program, *value, name),
         ExprKind::Binary { left, right, .. } => {
             expression_mentions_name(program, *left, name)
                 || expression_mentions_name(program, *right, name)

@@ -140,26 +140,44 @@ Newlines are accepted:
 - before and after a pipeline `|`;
 - inside parameter, argument, list, and record delimiters.
 
-### 3.5 Semantic identity qualifiers
+### 3.5 Semantic identity assertions
 
-A callable transform name may be followed by `#` and 1 through 64
-lowercase hexadecimal characters:
+Any expression may be followed by `#` and 1 through 64 lowercase hexadecimal
+characters:
 
 ```tima
 darken#4f26a3(img, 0.8)
 bytes | png.decode#0123456789abcdef
+source = read(asset("cat.png"))#89abcdef
+result = darken(image, 0.8)#fedcba98
 ```
 
-The hexadecimal text is a full Transform ID or a prefix of one. It is checked
-against the named transform during compilation. A mismatch is an error at the
-qualifier, which makes this syntax a reproducibility assertion rather than a
-second name-resolution mechanism. The qualifier does not contribute to typed
-IR or change the Transform ID, Recipe ID, or runtime call semantics.
+The hexadecimal text is a full identity or a prefix. `value#hash` evaluates
+`value`, verifies its selected semantic identity, and returns the same
+immutable value unchanged. A mismatch is an error at the assertion. This is a
+reproducibility assertion, not global lookup by hash, so the expression to the
+left still selects or computes the value and a short prefix need not be
+globally unique.
 
-Qualifiers are supported on user-defined transforms and registered standard
-transforms. They are not supported on ordinary values, outer builtins, or
-reserved inner runtime operations. The name still selects the transform, so a
-short prefix need not be globally unique.
+The selected identity domain is deterministic:
+
+- a transform value or a directly named transform call uses its Transform ID;
+- a value with observed source lineage uses its Source ID;
+- a value with invocation lineage uses its Recipe ID;
+- any other materialized outer value uses its Content ID.
+
+Lineage identity takes precedence over materialized content identity. Thus a
+derived result is asserted by Recipe ID even though its bytes also have a
+Content ID. An unresolved asset locator and a lineage-inspection value do not
+have one assertable semantic identity and produce a runtime error.
+
+Assertions on directly named user-defined and registered transform calls are
+checked during compilation. Other outer value assertions are checked during
+execution. Assertions do not contribute to typed IR and do not change any
+Transform, Recipe, Source, Content, or Artifact ID. Arbitrary value assertions
+are outer-only; inner code may use assertions only to pin directly named Tima
+transform calls. Outer builtins and reserved inner runtime operations do not
+have a Transform ID and cannot be asserted as callables.
 
 ## 4. Program structure
 
@@ -200,14 +218,14 @@ list literal
 record literal
 callee(arguments)
 receiver.member
-transform-name#identity-prefix
+expression#identity-prefix
 left binary-op right
 input | stage
 ```
 
 From highest to lowest precedence:
 
-1. calls, member access, and semantic identity qualification;
+1. calls, member access, and semantic identity assertion;
 2. `*`, `/` (left-associative);
 3. `+`, `-` (left-associative);
 4. one of `==`, `!=`, `<`, `<=`, `>`, `>=`;
@@ -231,10 +249,10 @@ Positional arguments fill the next unfilled parameter. Unknown, duplicate,
 missing, and excess arguments are errors.
 
 An outer callee must be either a direct name or a one-level callable namespace
-such as `webp.encode`, optionally followed by a semantic identity qualifier.
+such as `webp.encode`, optionally followed by a semantic identity assertion.
 Member access is not otherwise executable in outer code.
 
-Inner calls must use a directly named transform, optionally identity-qualified,
+Inner calls must use a directly named transform, optionally identity-asserted,
 and positional arguments only.
 
 ### 5.2 Pipeline expressions
@@ -248,7 +266,7 @@ x | f(a, flag=true) // f(x, a, flag=true)
 ```
 
 A stage must be a transform/builtin name, a one-level namespaced registered
-transform, an identity-qualified transform name, or a call to one of those.
+transform, an identity-asserted transform name, or a call to one of those.
 Pipelines associate left-to-right, so:
 
 ```tima

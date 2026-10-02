@@ -273,7 +273,7 @@ impl Lexer<'_> {
         let value = &self.text[value_start..self.position];
         if value.is_empty() {
             self.diagnostics.push(Diagnostic::error(
-                "semantic identity qualifier requires a hexadecimal hash or prefix",
+                "semantic identity assertion requires a hexadecimal hash or prefix",
                 Span::new(start, self.position),
             ));
         } else if value.len() > 64
@@ -282,7 +282,7 @@ impl Lexer<'_> {
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         {
             self.diagnostics.push(Diagnostic::error(
-                "semantic identity qualifier must be 1 to 64 lowercase hexadecimal characters",
+                "semantic identity assertion must be 1 to 64 lowercase hexadecimal characters",
                 Span::new(start, self.position),
             ));
         } else {
@@ -363,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_semantic_identity_qualifiers() {
+    fn rejects_invalid_semantic_identity_assertions() {
         let inputs = [
             "darken#".to_owned(),
             "darken#ABCD".to_owned(),
