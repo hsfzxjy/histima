@@ -22,13 +22,13 @@ use crate::ir::{
     ValueKind,
 };
 
-pub const CRANELIFT_BACKEND_VERSION: &str = "8";
+pub const CRANELIFT_BACKEND_VERSION: &str = "9";
 pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 
 /// Ahead-of-time native object generation from backend-neutral Tima IR.
 ///
-/// The initial slice accepts scalars and owned/view strings and bytes. Generic
-/// shaped buffers currently remain on the typed-IR interpreter path.
+/// The initial slice accepts scalars, owned/view strings and bytes, and the
+/// ownership-safe in-place subset of generic shaped Buffers.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CraneliftBackend;
 
@@ -366,7 +366,7 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
                 transform.span,
             )
             .with_note(
-                "supported boundary types are bool, u8, i64, f32, String, StringView, Bytes, and BytesView",
+                "supported boundary types are bool, u8, i64, f32, String, StringView, Bytes, BytesView, Buffer, and BufferView",
             ),
         );
         return diagnostics;
@@ -386,19 +386,20 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
                 );
             }
             ValueKind::Binary { .. } => {}
-            ValueKind::U8Scale { .. } => diagnostics.push(Diagnostic::error(
-                "u8.scale is outside the current Cranelift AOT subset",
-                value.span,
-            )),
+            ValueKind::U8Scale { .. } => {}
             ValueKind::Call { .. } => {}
             ValueKind::BufferZero { .. }
             | ValueKind::BufferFill { .. }
             | ValueKind::BufferByteElement
-            | ValueKind::BufferByteIndex
-            | ValueKind::BufferByteMap { .. } => diagnostics.push(Diagnostic::error(
-                "generic Buffer operations are outside the current Cranelift AOT subset",
-                value.span,
-            )),
+            | ValueKind::BufferByteIndex => {}
+            ValueKind::BufferByteMap { index: Some(_), .. } => diagnostics.push(
+                Diagnostic::error(
+                    "indexed Buffer byte maps are outside the current Cranelift AOT subset",
+                    value.span,
+                )
+                .with_note("checked i64 index arithmetic must retain source-spanned failures"),
+            ),
+            ValueKind::BufferByteMap { index: None, .. } => {}
             ValueKind::RuntimeCall(
                 RuntimeCall::EnvironmentRead { .. }
                 | RuntimeCall::FileRead { .. }
@@ -497,9 +498,11 @@ fn lower_transform(
                         required_scalar(&values, *right),
                         transform.value(*left).ty,
                     )),
-                    ValueKind::U8Scale { .. } => {
-                        unreachable!("validation rejects u8.scale")
-                    }
+                    ValueKind::U8Scale { value, factor } => LoweredValue::Scalar(lower_u8_scale(
+                        &mut builder,
+                        required_scalar(&values, *value),
+                        required_scalar(&values, *factor),
+                    )),
                     ValueKind::Call {
                         transform: callee,
                         arguments,
@@ -511,12 +514,43 @@ fn lower_transform(
                         value.ty,
                         &values,
                     ),
-                    ValueKind::BufferZero { .. }
-                    | ValueKind::BufferFill { .. }
-                    | ValueKind::BufferByteElement
+                    ValueKind::BufferZero { buffer } => emit_buffer_fill(
+                        &mut builder,
+                        required_shaped_buffer(&values, *buffer),
+                        None,
+                    ),
+                    ValueKind::BufferFill {
+                        buffer,
+                        value: fill,
+                    } => emit_buffer_fill(
+                        &mut builder,
+                        required_shaped_buffer(&values, *buffer),
+                        Some(required_scalar(&values, *fill)),
+                    ),
+                    ValueKind::BufferByteMap {
+                        buffer,
+                        element,
+                        index: None,
+                        instructions,
+                        result: mapped,
+                    } => emit_buffer_byte_map(
+                        &mut builder,
+                        transform,
+                        index,
+                        required_shaped_buffer(&values, *buffer),
+                        *element,
+                        instructions,
+                        *mapped,
+                        &mut values,
+                        runtime_context,
+                        &function_refs,
+                        &static_strings,
+                        world_call_signature,
+                    ),
+                    ValueKind::BufferByteElement
                     | ValueKind::BufferByteIndex
-                    | ValueKind::BufferByteMap { .. } => {
-                        unreachable!("validation rejects generic Buffer operations")
+                    | ValueKind::BufferByteMap { index: Some(_), .. } => {
+                        unreachable!("marker values are nested or validation rejects indexed maps")
                     }
                     ValueKind::RuntimeCall(call) => emit_world_call(
                         &mut builder,
@@ -594,6 +628,7 @@ fn world_call_signature(module: &ObjectModule) -> Signature {
 enum LoweredValue {
     Scalar(cranelift_codegen::ir::Value),
     Buffer([cranelift_codegen::ir::Value; 3]),
+    ShapedBuffer([cranelift_codegen::ir::Value; crate::abi::ABI_VALUE_WORDS]),
 }
 
 fn lower_parameter(
@@ -631,12 +666,17 @@ fn load_abi_value(
             })
             .collect::<Vec<_>>()
     };
-    debug_assert!(matches!(
-        ty,
-        Type::String | Type::StringView | Type::Bytes | Type::BytesView
-    ));
-    let words = load_words(builder, 3);
-    LoweredValue::Buffer(words.try_into().unwrap())
+    if matches!(ty, Type::Buffer | Type::BufferView) {
+        let words = load_words(builder, crate::abi::ABI_VALUE_WORDS);
+        LoweredValue::ShapedBuffer(words.try_into().unwrap())
+    } else {
+        debug_assert!(matches!(
+            ty,
+            Type::String | Type::StringView | Type::Bytes | Type::BytesView
+        ));
+        let words = load_words(builder, 3);
+        LoweredValue::Buffer(words.try_into().unwrap())
+    }
 }
 
 fn store_result(
@@ -669,6 +709,16 @@ fn store_abi_value(
                 );
             }
         }
+        LoweredValue::ShapedBuffer(words) => {
+            for (word, value) in words.into_iter().enumerate() {
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    pointer,
+                    base + i32::try_from(word * 8).unwrap(),
+                );
+            }
+        }
     }
 }
 
@@ -686,6 +736,141 @@ fn clear_abi_value(
             base + i32::try_from(word * 8).unwrap(),
         );
     }
+}
+
+fn emit_buffer_fill(
+    builder: &mut FunctionBuilder<'_>,
+    buffer: [cranelift_codegen::ir::Value; crate::abi::ABI_VALUE_WORDS],
+    fill: Option<cranelift_codegen::ir::Value>,
+) -> LoweredValue {
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(header, types::I64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let initial = [zero.into()];
+    builder.ins().jump(header, &initial);
+
+    builder.switch_to_block(header);
+    let index = builder.block_params(header)[0];
+    let more = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, index, buffer[ABI_LENGTH_WORD]);
+    builder.ins().brif(more, body, &[], done, &[]);
+
+    builder.switch_to_block(body);
+    let address = builder.ins().iadd(buffer[ABI_POINTER_WORD], index);
+    let fill = fill.unwrap_or_else(|| builder.ins().iconst(types::I8, 0));
+    builder.ins().store(MemFlagsData::new(), fill, address, 0);
+    let next = builder.ins().iadd_imm_u(index, 1);
+    let next = [next.into()];
+    builder.ins().jump(header, &next);
+
+    builder.switch_to_block(done);
+    LoweredValue::ShapedBuffer(buffer)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_buffer_byte_map(
+    builder: &mut FunctionBuilder<'_>,
+    transform: &Transform,
+    transform_index: u32,
+    buffer: [cranelift_codegen::ir::Value; crate::abi::ABI_VALUE_WORDS],
+    element: ValueId,
+    instructions: &[ValueId],
+    result: ValueId,
+    values: &mut [Option<LoweredValue>],
+    runtime_context: cranelift_codegen::ir::Value,
+    function_refs: &[cranelift_codegen::ir::FuncRef],
+    static_strings: &[Option<LoweredStaticString>],
+    world_call_signature: cranelift_codegen::ir::SigRef,
+) -> LoweredValue {
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(header, types::I64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let initial = [zero.into()];
+    builder.ins().jump(header, &initial);
+
+    builder.switch_to_block(header);
+    let index = builder.block_params(header)[0];
+    let more = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, index, buffer[ABI_LENGTH_WORD]);
+    builder.ins().brif(more, body, &[], done, &[]);
+
+    builder.switch_to_block(body);
+    let address = builder.ins().iadd(buffer[ABI_POINTER_WORD], index);
+    let byte = builder
+        .ins()
+        .load(types::I8, MemFlagsData::new(), address, 0);
+    values[element.0 as usize] = Some(LoweredValue::Scalar(byte));
+    for id in instructions {
+        let value = transform.value(*id);
+        let lowered = match &value.kind {
+            ValueKind::Constant(Constant::String(_)) => lower_static_string(
+                builder,
+                static_strings[id.0 as usize].expect("string constants have declared object data"),
+            ),
+            ValueKind::Constant(constant) => {
+                LoweredValue::Scalar(lower_constant(builder, constant, value.ty))
+            }
+            ValueKind::Binary { op, left, right } => LoweredValue::Scalar(lower_binary(
+                builder,
+                *op,
+                required_scalar(values, *left),
+                required_scalar(values, *right),
+                transform.value(*left).ty,
+            )),
+            ValueKind::U8Scale { value, factor } => LoweredValue::Scalar(lower_u8_scale(
+                builder,
+                required_scalar(values, *value),
+                required_scalar(values, *factor),
+            )),
+            ValueKind::Call {
+                transform: callee,
+                arguments,
+            } => emit_transform_call(
+                builder,
+                runtime_context,
+                function_refs[callee.0 as usize],
+                arguments,
+                value.ty,
+                values,
+            ),
+            ValueKind::RuntimeCall(call) => emit_world_call(
+                builder,
+                runtime_context,
+                world_call_signature,
+                abi_callsite(transform_index, id.0),
+                call,
+                value.ty,
+                values,
+            ),
+            ValueKind::Parameter { .. }
+            | ValueKind::BufferZero { .. }
+            | ValueKind::BufferFill { .. }
+            | ValueKind::BufferByteElement
+            | ValueKind::BufferByteIndex
+            | ValueKind::BufferByteMap { .. } => {
+                unreachable!("typed byte-map instructions contain scalar expressions")
+            }
+        };
+        values[id.0 as usize] = Some(lowered);
+    }
+    builder.ins().store(
+        MemFlagsData::new(),
+        required_scalar(values, result),
+        address,
+        0,
+    );
+    let next = builder.ins().iadd_imm_u(index, 1);
+    let next = [next.into()];
+    builder.ins().jump(header, &next);
+
+    builder.switch_to_block(done);
+    LoweredValue::ShapedBuffer(buffer)
 }
 
 fn emit_transform_call(
@@ -825,6 +1010,19 @@ fn lower_static_string(
     LoweredValue::Buffer([pointer, length, capacity])
 }
 
+fn lower_u8_scale(
+    builder: &mut FunctionBuilder<'_>,
+    value: cranelift_codegen::ir::Value,
+    factor: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let value = builder.ins().fcvt_from_uint(types::F32, value);
+    let scaled = builder.ins().fmul(value, factor);
+    let converted = builder.ins().fcvt_to_uint_sat(types::I32, scaled);
+    let maximum = builder.ins().iconst(types::I32, 255);
+    let clamped = builder.ins().umin(converted, maximum);
+    builder.ins().ireduce(types::I8, clamped)
+}
+
 fn lower_binary(
     builder: &mut FunctionBuilder<'_>,
     op: BinaryOp,
@@ -880,7 +1078,12 @@ fn native_boundary_type(ty: Type) -> bool {
     scalar_type(ty)
         || matches!(
             ty,
-            Type::String | Type::StringView | Type::Bytes | Type::BytesView
+            Type::String
+                | Type::StringView
+                | Type::Bytes
+                | Type::BytesView
+                | Type::Buffer
+                | Type::BufferView
         )
 }
 
@@ -914,6 +1117,16 @@ fn required_buffer(
 ) -> [cranelift_codegen::ir::Value; 3] {
     let LoweredValue::Buffer(value) = required_value(values, id) else {
         unreachable!("typed buffer operation has a buffer operand")
+    };
+    value
+}
+
+fn required_shaped_buffer(
+    values: &[Option<LoweredValue>],
+    id: ValueId,
+) -> [cranelift_codegen::ir::Value; crate::abi::ABI_VALUE_WORDS] {
+    let LoweredValue::ShapedBuffer(value) = required_value(values, id) else {
+        unreachable!("typed shaped Buffer operation has a Buffer operand")
     };
     value
 }
@@ -1047,6 +1260,32 @@ mod tests {
             plan.iter()
                 .map(|transform| transform.native_compatible)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn admits_unindexed_buffer_maps_and_reports_indexed_maps() {
+        let compiled = crate::compile(
+            "buffers.tima",
+            "transform scale(buffer: Buffer, factor: f32) -> Buffer {\n\
+                 for byte in buffer.bytes { byte = u8.scale(byte, factor) }\n\
+                 return buffer\n\
+             }\n\
+             transform keep(value: u8, offset: i64) -> u8 { return value }\n\
+             transform indexed(buffer: Buffer) -> Buffer {\n\
+                 for byte, offset in buffer.bytes { byte = keep(byte, offset) }\n\
+                 return buffer\n\
+             }\n",
+        )
+        .unwrap();
+        let plan = CraneliftBackend::transform_plan(&compiled.transforms);
+
+        assert!(plan[0].native_compatible);
+        assert!(plan[1].native_compatible);
+        assert!(!plan[2].native_compatible);
+        assert_eq!(
+            plan[2].fallback_reasons,
+            ["indexed Buffer byte maps are outside the current Cranelift AOT subset"]
         );
     }
 

@@ -47,11 +47,11 @@ cargo run --manifest-path ../../Cargo.toml -p histima -- materialize ../../build
   `--stock-intermediates` policy now stocks recordable invocation results
   reachable from successful program outputs without retaining failed or
   discarded work.
-- **Performance problem (made inspectable):** the indexed Buffer transform
-  intentionally falls back to the interpreter under `hybrid-aot`. The run
-  result's `aot_plan` now identifies `darken` by Transform ID and reports that
-  its Buffer boundary is outside the current native subset, so backend work can
-  be prioritized from an observed workflow rather than guessed.
+- **Performance problem (narrowed):** owned/view Buffer boundaries, fills,
+  unindexed byte maps, and `u8.scale` now run through Cranelift. This workflow's
+  indexed channel selection still falls back because checked index arithmetic
+  must preserve source-spanned failures. The run result's `aot_plan` identifies
+  that exact remaining blocker by Transform ID.
 - **Missing transform/library problem (addressed narrowly):** the first run
   required a separate thumbnail source. `rgba.resize_nearest` now derives it
   from the hero through a precise rank-3 RGBA8 library contract without adding

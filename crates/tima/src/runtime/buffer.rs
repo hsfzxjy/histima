@@ -79,6 +79,18 @@ impl BufferValue {
         self.storage.with_bytes(operation)
     }
 
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.storage.0.as_slice()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Arc<[usize]>, usize) {
+        let storage = match Arc::try_unwrap(self.storage) {
+            Ok(storage) => storage.into_vec(),
+            Err(shared) => shared.to_vec(),
+        };
+        (storage, self.shape, self.outer_stride)
+    }
+
     pub fn to_vec(&self) -> Vec<u8> {
         self.storage.to_vec()
     }

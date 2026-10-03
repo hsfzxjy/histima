@@ -840,7 +840,7 @@ fn cli_runs_the_repository_site_asset_workflow() {
         darken_plan["fallback_reasons"][0]
             .as_str()
             .unwrap()
-            .contains("boundary of transform `darken`")
+            .contains("indexed Buffer byte maps")
     );
     assert_eq!(json_output(&repeated)["stocked_results"], json!([]));
     assert_eq!(json_output(&repeated)["records"], first["records"]);

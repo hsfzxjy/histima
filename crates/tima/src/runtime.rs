@@ -13,7 +13,7 @@ use crate::backend::cache::CachedArtifact;
 use crate::backend::cranelift::{CraneliftBackend, CraneliftTransformPlan};
 use crate::backend::native::{
     NativeArgument, NativeBuffer, NativeBufferView, NativeModule, NativeResult,
-    NativeScalar as AbiScalar,
+    NativeScalar as AbiScalar, NativeShapedBuffer, NativeShapedBufferView,
 };
 use crate::cache::{ResultCache, TransformResultCache};
 use crate::capability::{ASSET_CAPABILITY, CapabilitySession, World, observe_dependency};
@@ -1981,6 +1981,8 @@ enum PreparedNativeArgument {
     StringView(Arc<String>),
     Bytes(NativeBuffer),
     BytesView(Arc<Vec<u8>>),
+    Buffer(NativeShapedBuffer),
+    BufferView(Arc<BufferValue>),
 }
 
 impl TransformEngine for HybridAotEngine<'_> {
@@ -2015,6 +2017,14 @@ impl TransformEngine for HybridAotEngine<'_> {
                 PreparedNativeArgument::BytesView(value) => {
                     NativeArgument::BytesView(NativeBufferView {
                         bytes: value.as_slice(),
+                    })
+                }
+                PreparedNativeArgument::Buffer(buffer) => NativeArgument::Buffer(buffer),
+                PreparedNativeArgument::BufferView(value) => {
+                    NativeArgument::BufferView(NativeShapedBufferView {
+                        bytes: value.as_bytes(),
+                        shape: value.shape(),
+                        outer_stride: value.outer_stride(),
                     })
                 }
             })
@@ -2069,6 +2079,21 @@ impl TransformEngine for HybridAotEngine<'_> {
                 };
                 OuterValue::plain(ValueData::Bytes(value.clone()))
             }
+            NativeResult::OwnedBufferArgument(index) => {
+                let PreparedNativeArgument::Buffer(buffer) = std::mem::replace(
+                    &mut prepared[index],
+                    PreparedNativeArgument::Scalar(AbiScalar::Bool(false)),
+                ) else {
+                    unreachable!("native owned Buffer result identifies an owned Buffer argument")
+                };
+                freeze_native_buffer(buffer, transform.span)?
+            }
+            NativeResult::BufferViewArgument(index) => {
+                let PreparedNativeArgument::BufferView(value) = &prepared[index] else {
+                    unreachable!("native BufferView result identifies a BufferView argument")
+                };
+                OuterValue::plain(ValueData::Buffer(value.clone()))
+            }
         };
         Ok(TransformOutcome {
             value,
@@ -2114,6 +2139,18 @@ fn prepare_native_argument(
             Ok(PreparedNativeArgument::Bytes(NativeBuffer { bytes }))
         }
         (Type::BytesView, ValueData::Bytes(value)) => Ok(PreparedNativeArgument::BytesView(value)),
+        (Type::Buffer, ValueData::Buffer(value)) => {
+            let value = Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone());
+            let (bytes, shape, outer_stride) = value.into_parts();
+            Ok(PreparedNativeArgument::Buffer(NativeShapedBuffer {
+                bytes,
+                shape,
+                outer_stride,
+            }))
+        }
+        (Type::BufferView, ValueData::Buffer(value)) => {
+            Ok(PreparedNativeArgument::BufferView(value))
+        }
         (expected, _) => Err(Diagnostic::error(
             format!(
                 "outer value cannot cross into native parameter type {}",
@@ -2129,6 +2166,17 @@ fn freeze_native_string(buffer: NativeBuffer, span: Span) -> Result<OuterValue, 
         Diagnostic::error("native transform returned invalid UTF-8 for String", span)
     })?;
     Ok(OuterValue::plain(ValueData::String(Arc::new(value))))
+}
+
+fn freeze_native_buffer(buffer: NativeShapedBuffer, span: Span) -> Result<OuterValue, Diagnostic> {
+    BufferValue::new(buffer.shape, buffer.outer_stride, buffer.bytes)
+        .map(OuterValue::buffer)
+        .map_err(|error| {
+            Diagnostic::error(
+                format!("native transform returned an invalid Buffer: {error}"),
+                span,
+            )
+        })
 }
 
 impl IrInterpreter<'_> {
@@ -2422,15 +2470,7 @@ fn lower_interpreted_value(
         (Type::BytesView, ValueData::Bytes(value)) => Ok(InterpretedValue::BytesView(value)),
         (Type::Buffer, ValueData::Buffer(buffer)) => {
             let buffer = Arc::try_unwrap(buffer).unwrap_or_else(|shared| (*shared).clone());
-            let BufferValue {
-                storage,
-                shape,
-                outer_stride,
-            } = buffer;
-            let storage = match Arc::try_unwrap(storage) {
-                Ok(storage) => storage.into_vec(),
-                Err(shared) => shared.to_vec(),
-            };
+            let (storage, shape, outer_stride) = buffer.into_parts();
             Ok(InterpretedValue::Buffer(InterpretedBuffer {
                 storage,
                 shape,
@@ -4085,6 +4125,53 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_and_aot_share_buffer_fill_and_view_ownership() {
+        let world = FixedWorld::empty();
+        let executions = assert_successful_engine_conformance(
+            "buffer-boundary",
+            "transform clear(buffer: Buffer) -> Buffer { return buffer_zero(buffer) }\n\
+             transform fill(buffer: Buffer, value: u8) -> Buffer { return buffer_fill(buffer, value) }\n\
+             transform view(buffer: BufferView) -> BufferView { return buffer }\n\
+             cleared = clear(input)\n\
+             filled = fill(input, 7)\n\
+             viewed = view(input)\n",
+            BTreeMap::from([(
+                "input".to_owned(),
+                OuterValue::buffer(
+                    BufferValue::new(vec![2, 3], 4, vec![1, 2, 3, 99, 4, 5, 6, 100]).unwrap(),
+                ),
+            )]),
+            &world,
+            &["clear", "fill", "view"],
+            &[],
+        );
+
+        for execution in [&executions.interpreted, &executions.hybrid] {
+            let ValueData::Buffer(original) = &execution.bindings["input"].data else {
+                panic!("expected original Buffer")
+            };
+            let ValueData::Buffer(cleared) = &execution.bindings["cleared"].data else {
+                panic!("expected cleared Buffer")
+            };
+            let ValueData::Buffer(filled) = &execution.bindings["filled"].data else {
+                panic!("expected filled Buffer")
+            };
+            let ValueData::Buffer(viewed) = &execution.bindings["viewed"].data else {
+                panic!("expected viewed Buffer")
+            };
+            assert_eq!(cleared.shape(), &[2, 3]);
+            assert_eq!(cleared.outer_stride(), 4);
+            assert_eq!(cleared.bytes(), &[0; 8]);
+            assert_eq!(filled.shape(), &[2, 3]);
+            assert_eq!(filled.outer_stride(), 4);
+            assert_eq!(filled.bytes(), &[7; 8]);
+            assert!(!original.shares_storage_with(cleared));
+            assert!(!original.shares_storage_with(filled));
+            assert!(original.shares_storage_with(viewed));
+        }
+    }
+
+    #[test]
     fn unique_owned_string_and_byte_allocations_cross_the_interpreter_without_copying() {
         let text = String::from("allocation stays put");
         let text_pointer = text.as_ptr();
@@ -4116,7 +4203,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_aot_falls_back_for_buffer_maps() {
+    fn interpreter_and_aot_share_unindexed_buffer_map_semantics() {
         let world = FixedWorld::empty();
         let executions = assert_successful_engine_conformance(
             "buffer-map-fallback",
@@ -4145,8 +4232,8 @@ mod tests {
                 ),
             ]),
             &world,
-            &["choose"],
-            &["replace"],
+            &["choose", "replace"],
+            &[],
         );
 
         for execution in [&executions.interpreted, &executions.hybrid] {
@@ -4163,6 +4250,69 @@ mod tests {
             assert_eq!(result.outer_stride(), 4);
             assert_eq!(result.bytes(), &[9, 2, 9, 8, 3, 9, 4, 9]);
             assert!(!original.shares_storage_with(result));
+        }
+    }
+
+    #[test]
+    fn interpreter_and_aot_share_u8_scale_saturation_inside_buffer_maps() {
+        let world = FixedWorld::empty();
+        let executions = assert_successful_engine_conformance(
+            "buffer-scale",
+            "transform scale_byte(value: u8, factor: f32) -> u8 {\n\
+                 return u8.scale(value, factor)\n\
+             }\n\
+             transform scale(buffer: Buffer, factor: f32) -> Buffer {\n\
+                 for byte in buffer.bytes { byte = scale_byte(byte, factor) }\n\
+                 return buffer\n\
+             }\n\
+             half = scale(input, 0.5)\n\
+             not_a_number = scale(input, nan_factor)\n\
+             positive_infinity = scale(input, positive_factor)\n\
+             negative_infinity = scale(input, negative_factor)\n",
+            BTreeMap::from([
+                (
+                    "input".to_owned(),
+                    OuterValue::buffer(BufferValue::new(vec![4], 4, vec![0, 1, 200, 255]).unwrap()),
+                ),
+                (
+                    "nan_factor".to_owned(),
+                    OuterValue::plain(ValueData::Float(f32::NAN)),
+                ),
+                (
+                    "positive_factor".to_owned(),
+                    OuterValue::plain(ValueData::Float(f32::INFINITY)),
+                ),
+                (
+                    "negative_factor".to_owned(),
+                    OuterValue::plain(ValueData::Float(f32::NEG_INFINITY)),
+                ),
+            ]),
+            &world,
+            &["scale_byte", "scale"],
+            &[],
+        );
+
+        for execution in [&executions.interpreted, &executions.hybrid] {
+            let ValueData::Buffer(half) = &execution.bindings["half"].data else {
+                panic!("expected scaled Buffer")
+            };
+            let ValueData::Buffer(not_a_number) = &execution.bindings["not_a_number"].data else {
+                panic!("expected scaled Buffer")
+            };
+            let ValueData::Buffer(positive_infinity) =
+                &execution.bindings["positive_infinity"].data
+            else {
+                panic!("expected scaled Buffer")
+            };
+            let ValueData::Buffer(negative_infinity) =
+                &execution.bindings["negative_infinity"].data
+            else {
+                panic!("expected scaled Buffer")
+            };
+            assert_eq!(half.bytes(), &[0, 0, 100, 127]);
+            assert_eq!(not_a_number.bytes(), &[0, 0, 0, 0]);
+            assert_eq!(positive_infinity.bytes(), &[0, 255, 255, 255]);
+            assert_eq!(negative_infinity.bytes(), &[0, 0, 0, 0]);
         }
     }
 

@@ -3,15 +3,17 @@ use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use libloading::Library;
 
 use crate::abi::{
-    ABI_ALLOCATION_BUFFER, ABI_ALLOCATION_BYTES, ABI_ALLOCATION_STRING, ABI_BUFFER_RANK_WORD,
-    ABI_CAPACITY_WORD, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_OK, ABI_STATUS_RUNTIME,
-    ABI_WORLD_ENVIRONMENT_READ, ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET, AbiRuntimeContext,
-    AbiValue, abi_callsite,
+    ABI_ALLOCATION_BUFFER, ABI_ALLOCATION_BYTES, ABI_ALLOCATION_STRING,
+    ABI_BUFFER_DIMENSION_0_WORD, ABI_BUFFER_DIMENSION_1_WORD, ABI_BUFFER_DIMENSION_2_WORD,
+    ABI_BUFFER_OUTER_STRIDE_WORD, ABI_BUFFER_RANK_WORD, ABI_CAPACITY_WORD, ABI_LENGTH_WORD,
+    ABI_POINTER_WORD, ABI_STATUS_OK, ABI_STATUS_RUNTIME, ABI_WORLD_ENVIRONMENT_READ,
+    ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET, AbiRuntimeContext, AbiValue, abi_callsite,
 };
 use crate::backend::ArtifactBackend;
 use crate::backend::cache::{CachedArtifact, NativeArtifactCache};
@@ -77,12 +79,28 @@ pub(crate) struct NativeBufferView<'a> {
     pub bytes: &'a [u8],
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) struct NativeShapedBuffer {
+    pub bytes: Vec<u8>,
+    pub shape: Arc<[usize]>,
+    pub outer_stride: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeShapedBufferView<'a> {
+    pub bytes: &'a [u8],
+    pub shape: &'a [usize],
+    pub outer_stride: usize,
+}
+
 pub(crate) enum NativeArgument<'a> {
     Scalar(NativeScalar),
     String(&'a mut NativeBuffer),
     StringView(NativeBufferView<'a>),
     Bytes(&'a mut NativeBuffer),
     BytesView(NativeBufferView<'a>),
+    Buffer(&'a mut NativeShapedBuffer),
+    BufferView(NativeShapedBufferView<'a>),
 }
 
 impl NativeArgument<'_> {
@@ -93,6 +111,8 @@ impl NativeArgument<'_> {
             Self::StringView(_) => Type::StringView,
             Self::Bytes(_) => Type::Bytes,
             Self::BytesView(_) => Type::BytesView,
+            Self::Buffer(_) => Type::Buffer,
+            Self::BufferView(_) => Type::BufferView,
         }
     }
 
@@ -107,6 +127,20 @@ impl NativeArgument<'_> {
             Self::StringView(buffer) | Self::BytesView(buffer) => {
                 buffer_value(buffer.bytes.as_ptr(), buffer.bytes.len(), 0)
             }
+            Self::Buffer(buffer) => shaped_buffer_value(
+                buffer.bytes.as_ptr(),
+                buffer.bytes.len(),
+                buffer.bytes.capacity(),
+                &buffer.shape,
+                buffer.outer_stride,
+            ),
+            Self::BufferView(buffer) => shaped_buffer_value(
+                buffer.bytes.as_ptr(),
+                buffer.bytes.len(),
+                0,
+                buffer.shape,
+                buffer.outer_stride,
+            ),
         }
     }
 }
@@ -121,6 +155,8 @@ pub(crate) enum NativeResult {
     OwnedBytesArgument(usize),
     OwnedBytesAllocation(NativeBuffer),
     BytesViewArgument(usize),
+    OwnedBufferArgument(usize),
+    BufferViewArgument(usize),
 }
 
 fn buffer_value(pointer: *const u8, length: usize, capacity: usize) -> AbiValue {
@@ -128,6 +164,23 @@ fn buffer_value(pointer: *const u8, length: usize, capacity: usize) -> AbiValue 
     value.words[ABI_POINTER_WORD] = pointer as usize as u64;
     value.words[ABI_LENGTH_WORD] = length as u64;
     value.words[ABI_CAPACITY_WORD] = capacity as u64;
+    value
+}
+
+fn shaped_buffer_value(
+    pointer: *const u8,
+    length: usize,
+    capacity: usize,
+    shape: &[usize],
+    outer_stride: usize,
+) -> AbiValue {
+    debug_assert!((1..=3).contains(&shape.len()));
+    let mut value = buffer_value(pointer, length, capacity);
+    value.words[ABI_BUFFER_RANK_WORD] = shape.len() as u64;
+    value.words[ABI_BUFFER_DIMENSION_0_WORD] = shape.first().copied().unwrap_or(0) as u64;
+    value.words[ABI_BUFFER_DIMENSION_1_WORD] = shape.get(1).copied().unwrap_or(0) as u64;
+    value.words[ABI_BUFFER_DIMENSION_2_WORD] = shape.get(2).copied().unwrap_or(0) as u64;
+    value.words[ABI_BUFFER_OUTER_STRIDE_WORD] = outer_stride as u64;
     value
 }
 
@@ -557,6 +610,12 @@ impl NativeModule {
                 (Type::BytesView, NativeArgument::BytesView(_)) => {
                     Ok(NativeResult::BytesViewArgument(index))
                 }
+                (Type::Buffer, NativeArgument::Buffer(_)) => {
+                    Ok(NativeResult::OwnedBufferArgument(index))
+                }
+                (Type::BufferView, NativeArgument::BufferView(_)) => {
+                    Ok(NativeResult::BufferViewArgument(index))
+                }
                 _ => continue,
             };
         }
@@ -739,7 +798,7 @@ mod tests {
 
     use super::{
         NativeArgument, NativeBuffer, NativeBufferView, NativeCallState, NativeModule,
-        NativeResult, NativeScalar, abi_allocate,
+        NativeResult, NativeScalar, NativeShapedBuffer, NativeShapedBufferView, abi_allocate,
     };
     use crate::abi::{ABI_ALLOCATION_BYTES, ABI_POINTER_WORD, ABI_STATUS_OK, AbiValue};
     use crate::backend::cache::ArtifactCacheStatus;
@@ -884,6 +943,47 @@ mod tests {
         assert_eq!(
             native.invoke(TransformId(5), &mut arguments).unwrap(),
             NativeResult::BytesViewArgument(0)
+        );
+    }
+
+    #[test]
+    fn mutates_and_returns_shaped_buffers_without_descriptor_copies() {
+        let compiled = crate::compile(
+            "buffers.tima",
+            "transform clear(buffer: Buffer) -> Buffer { return buffer_zero(buffer) }\n\
+             transform view(buffer: BufferView) -> BufferView { return buffer }\n",
+        )
+        .unwrap();
+        let native = NativeModule::build(&compiled.transforms, &compiled.identities, cache_root())
+            .unwrap()
+            .unwrap();
+
+        let mut buffer = NativeShapedBuffer {
+            bytes: vec![1, 2, 3, 99, 4, 5, 6, 100],
+            shape: [2, 3].into(),
+            outer_stride: 4,
+        };
+        let pointer = buffer.bytes.as_ptr();
+        let mut arguments = [NativeArgument::Buffer(&mut buffer)];
+        assert_eq!(
+            native.invoke(TransformId(0), &mut arguments).unwrap(),
+            NativeResult::OwnedBufferArgument(0)
+        );
+        assert_eq!(buffer.bytes.as_ptr(), pointer);
+        assert_eq!(buffer.bytes, [0; 8]);
+        assert_eq!(&*buffer.shape, &[2, 3]);
+        assert_eq!(buffer.outer_stride, 4);
+
+        let bytes = [1, 2, 3, 4];
+        let shape = [1, 1, 4];
+        let mut arguments = [NativeArgument::BufferView(NativeShapedBufferView {
+            bytes: &bytes,
+            shape: &shape,
+            outer_stride: 4,
+        })];
+        assert_eq!(
+            native.invoke(TransformId(1), &mut arguments).unwrap(),
+            NativeResult::BufferViewArgument(0)
         );
     }
 

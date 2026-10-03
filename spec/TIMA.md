@@ -651,7 +651,12 @@ placing diagnostic objects in the ABI. Other nonzero statuses are reserved.
 `String`, `StringView`, `Bytes`, and `BytesView` use words 0 through 2 for data
 pointer, byte length, and capacity. Views have zero capacity. String bytes are
 UTF-8; the host validates an owned String again when it freezes a native
-result. Remaining words are reserved and zero in the current ABI.
+result. Remaining words are zero for these types.
+
+`Buffer` and `BufferView` use words 0 through 2 for the same storage fields,
+word 3 for rank, words 4 through 6 for up to three dimensions, and word 7 for
+outer stride. Unused dimension words are zero. A view has zero capacity. The
+host validates layout before entry and again when freezing an owned result.
 
 Inner string literals are emitted as immutable local object data and lowered to
 zero-capacity `StringView` descriptors. Passing a literal to native code does
@@ -659,7 +664,7 @@ not allocate at runtime. If a literal-derived view is returned to the outer
 layer, the host copies it into immutable outer storage before the native module
 can be unloaded; artifact memory never becomes outer value storage.
 
-Before a native call, an owned String or Bytes value is uniquely
+Before a native call, an owned String, Bytes, or Buffer value is uniquely
 detached from immutable outer storage. Native code may mutate owned allocations
 in place subject to the statically known value type. A returned owned
 descriptor must identify exactly one compatible owned argument of the same
@@ -676,10 +681,13 @@ descriptor exactly identifies a registered allocation of the expected static
 type. World calls may directly register an already-owned host buffer, avoiding
 a copy solely for ABI transfer.
 
-`Buffer` and `BufferView` do not cross this AOT ABI in v0. A transform whose
-transitive call graph accepts, returns, or operates on Buffer values remains on
-the typed-IR interpreter. This backend limitation does not change Buffer
-language semantics or identity.
+Native Buffer code may preserve a Buffer descriptor while zeroing, filling, or
+running an unindexed byte map over its complete storage, including outer-row
+padding. `u8.scale` has the same binary32 multiply, truncate, and saturation
+semantics as the interpreter. No current operation allocates a new native
+Buffer or changes its layout. Indexed byte maps remain interpreted until their
+checked `i64` index computations and failures can be reproduced exactly. These
+backend limits do not change Buffer language semantics or identity.
 
 Generated code receives only the callback table, function pointers, and opaque
 user data. No Rust layout, dynamic outer tag, lineage, or cache metadata is
@@ -1337,24 +1345,27 @@ load image with Clang, and executes supported transforms through the native ABI.
 standard LLVM installation on Windows or `clang` from `PATH`.
 
 The implemented subset admits scalar parameters and results of `bool`, `u8`,
-`i64`, or `f32`, plus owned and view `String` and `Bytes` boundaries;
-scalar constants, comparisons, control flow, and `f32` arithmetic; and direct
-calls whose complete callee closure is native-compatible. Calls marshal the
-same fixed descriptors through native stack storage, forward the runtime
-context, and propagate failure status to the outermost invocation. String and
-byte descriptors currently support identity returns and passthrough call
-chains; they have no native mutation operations yet.
+`i64`, or `f32`, plus owned and view `String`, `Bytes`, and `Buffer` boundaries;
+scalar constants, comparisons, control flow, `f32` arithmetic, `u8.scale`,
+Buffer zero/fill and unindexed byte maps; and direct calls whose complete
+callee closure is native-compatible. Calls marshal the same fixed descriptors
+through native stack storage, forward the runtime context, and propagate
+failure status to the outermost invocation. String and byte descriptors
+currently support identity returns and passthrough call chains; they have no
+native mutation operations yet. Buffer mutation preserves the input allocation
+and layout, including padding, and the host adopts it without a copy on return.
 
-Checked `i64` arithmetic, `u8.scale`, general string operations, newly
-allocated native Buffers, and `environment_i64` are not compiled. String literals are emitted as
-read-only object data. `env.read`, `file.read`, and `http.get` are therefore
-compiled for both literal keys and keys supplied by native-compatible
-`StringView` values. They call the host through the runtime context, retain
-precise observations, propagate source-spanned errors, and return registered
-host allocations for zero-copy freeze. A transform remains interpreted when
-any transitive callee uses unsupported behavior. The hybrid engine makes that
-decision per outer invocation without changing Transform, Recipe, or Content
-identity, lineage, replay semantics, or registered standard/Wasm dispatch.
+Checked `i64` arithmetic, indexed Buffer maps, general string operations,
+newly allocated native Buffers, and `environment_i64` are not compiled. String
+literals are emitted as read-only object data. `env.read`, `file.read`, and
+`http.get` are therefore compiled for both literal keys and keys supplied by
+native-compatible `StringView` values. They call the host through the runtime
+context, retain precise observations, propagate source-spanned errors, and
+return registered host allocations for zero-copy freeze. A transform remains
+interpreted when any transitive callee uses unsupported behavior. The hybrid
+engine makes that decision per outer invocation without changing Transform,
+Recipe, or Content identity, lineage, replay semantics, or registered
+standard/Wasm dispatch.
 Backend and artifact-cache details are execution metadata only. The standalone
 `tima run-native` command and Histima's explicit `hybrid-aot` choice exercise
 the same boundary; neither makes AOT the mandatory default.

@@ -29,9 +29,10 @@ inner-language transforms.
 
 The AOT Cranelift slice can emit a host relocatable object with `cargo run -p
 tima -- emit-object program.tima`, or link and execute supported scalar,
-String, and Bytes transforms with `cargo run -p tima -- run-native
-program.tima`. The latter is a hybrid path: Buffer operations and other
-unsupported transforms remain interpreted. Supported inner transform calls
+String, Bytes, and ownership-safe Buffer transforms with `cargo run -p tima --
+run-native program.tima`. The latter is a hybrid path: indexed Buffer maps,
+checked integer arithmetic, and other unsupported operations remain
+interpreted. Supported inner transform calls
 are linked in the same artifact; a caller falls back to the interpreter when
 any transitive callee is unsupported. Normal Histima execution defaults to the
 reference interpreter and accepts `run ... --engine hybrid-aot` as an explicit
