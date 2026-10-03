@@ -961,19 +961,19 @@ mod tests {
 
         assert_eq!(
             leaf.to_string(),
-            "37e94b33d07f169a97f6c3c1f23d3cf87aaf5ee7763c435a03c37735966e7ef4"
+            "ee7691ec5931fd0275c2bab44a630077922ccbc60215caf1d75f8f07a6475c35"
         );
         assert_eq!(
             caller.to_string(),
-            "0254f51ba1a9d63cb061bd340fff76d37795e63a9b3cfc033f228586989aa4a6"
+            "2aed765597ed27f4890088f3467637376071c78815a017efdb4b6419636c2551"
         );
         assert_eq!(
             standard.to_string(),
-            "b5f2bcf1f240773d2827e46938b5c921eac4932c80de5913c2bdd5a971894c45"
+            "05b5808b2657b94dce94a07cc7f476f4cc91934da878f3371365968f926154c1"
         );
         assert_eq!(
             registered_wasm.to_string(),
-            "775718252dfde609e71caa09550e261f8acd22125280febbe71b704da24452eb"
+            "f365c363fa4e2ea1902a839ada1679deae2bc9a9a0148c2fd1b275a9c8279404"
         );
     }
 

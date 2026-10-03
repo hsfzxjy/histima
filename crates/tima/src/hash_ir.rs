@@ -1,9 +1,18 @@
-//! Canonical semantic IR used only to derive Transform IDs.
+//! Canonical semantic graph used only to derive Transform IDs.
 //!
-//! Version 1 is frozen. Its node tags and canonical byte encoding are part of
-//! Tima's Transform-ID compatibility contract. Incompatible semantic changes
-//! require a new format version; artifact/backend details and source-facing
-//! names or spans do not belong here.
+//! Hash IR v1 deliberately fixes a small, language-neutral graph grammar
+//! instead of fixing Tima's current type and operation enums. Semantic nodes
+//! carry schema-qualified names and independent schema versions. Future Tima
+//! constructs, or another language entirely, can therefore add schemas without
+//! changing the Hash IR wire format or reassigning an encoding tag.
+//!
+//! Backend details, artifacts, source locations, and source-facing names do
+//! not belong in this graph. A lowering is responsible for choosing schemas
+//! and fields that capture exactly its source language's semantic distinctions.
+
+use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt;
 
 use crate::ast::BinaryOp as AstBinaryOp;
 use crate::identity::TransformIdentity;
@@ -14,437 +23,386 @@ use crate::ir::{
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Index into a definition's node arena. Arena order is not semantic: the
+/// encoder renumbers reachable nodes by deterministic traversal from `root`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId(pub u32);
+
+/// One finite, rooted semantic graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Definition {
-    Tima(TimaTransform),
-    External(ExternalTransform),
+pub struct Definition {
+    pub root: NodeId,
+    pub nodes: Vec<Node>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TimaTransform {
-    pub capabilities: Vec<Capability>,
-    pub parameters: Vec<Type>,
-    pub result: Type,
-    pub values: Vec<Value>,
-    pub blocks: Vec<Block>,
-    pub entry: u32,
-}
-
-/// A non-Tima semantic operation. `scheme` identifies how its version and
-/// opaque contract bytes are interpreted; it is not an execution backend.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExternalTransform {
-    pub scheme: String,
+/// A node's schema gives its fields meaning. Schema evolution is independent
+/// from the Hash IR wire format: incompatible schema semantics use a new
+/// schema version, not a new Hash IR version.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Schema {
+    pub namespace: String,
     pub name: String,
-    pub semantic_version: u32,
-    pub interface_version: Option<u32>,
-    pub parameters: Vec<ExternalParameter>,
-    pub result_type: Option<u8>,
+    pub version: u32,
 }
 
-/// A scheme-defined external parameter. The type code is interpreted by the
-/// named scheme; this keeps external ABI epochs out of the Tima type enum.
+impl Schema {
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>, version: u32) -> Self {
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+            version,
+        }
+    }
+}
+
+/// A schema-qualified record. Field order in memory is deliberately ignored;
+/// canonical encoding sorts fields by their UTF-8 names. Field names must be
+/// unique within a node.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExternalParameter {
+pub struct Node {
+    pub schema: Schema,
+    pub fields: Vec<Field>,
+}
+
+impl Node {
+    pub fn new(schema: Schema, fields: Vec<Field>) -> Self {
+        Self { schema, fields }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field {
     pub name: String,
-    pub type_code: u8,
+    pub value: Data,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Capability {
-    EnvironmentRead,
-    FileRead,
-    HttpGet,
+impl Field {
+    pub fn new(name: impl Into<String>, value: Data) -> Self {
+        Self {
+            name: name.into(),
+            value,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Type {
-    Bool,
-    U8,
-    I64,
-    F32,
-    String,
-    StringView,
-    Bytes,
-    BytesView,
-    Buffer,
-    BufferView,
-}
-
+/// Closed set of structural atoms used to describe open-ended semantic
+/// schemas. Records are nodes; maps are sequences of entry nodes. Larger or
+/// unusual numeric forms can use canonical bytes interpreted by their schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Value {
-    pub ty: Type,
-    pub kind: ValueKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ValueKind {
-    Parameter(u32),
-    Constant(Constant),
-    Binary {
-        op: BinaryOp,
-        left: u32,
-        right: u32,
-    },
-    Call {
-        transform: TransformIdentity,
-        arguments: Vec<u32>,
-    },
-    RuntimeCall(RuntimeCall),
-    BufferZero(u32),
-    BufferFill {
-        buffer: u32,
-        value: u32,
-    },
-    BufferByteElement,
-    BufferByteMap {
-        buffer: u32,
-        element: u32,
-        instructions: Vec<u32>,
-        result: u32,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Constant {
+pub enum Data {
+    Unit,
     Bool(bool),
-    I64(i64),
+    UInt(u64),
+    SInt(i64),
     F32Bits(u32),
-    String(String),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BinaryOp {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Equal,
-    NotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
+    F64Bits(u64),
+    Bytes(Vec<u8>),
+    Text(String),
+    Node(NodeId),
+    Digest([u8; 32]),
+    Sequence(Vec<Data>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RuntimeCall {
-    EnvironmentI64(String),
-    EnvironmentRead(u32),
-    FileRead(u32),
-    HttpGet(u32),
+pub struct ValidationError {
+    message: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Block {
-    pub instructions: Vec<u32>,
-    pub terminator: Terminator,
+impl ValidationError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Terminator {
-    Return(u32),
-    Branch {
-        condition: u32,
-        then_block: u32,
-        else_block: u32,
-    },
-    Jump(u32),
+impl fmt::Display for ValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
+
+impl Error for ValidationError {}
 
 impl Definition {
-    /// Returns the canonical Hash IR v1 encoding.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
+    /// Validates and encodes Hash IR v1. Unreachable arena nodes are ignored;
+    /// they cannot affect a rooted semantic definition.
+    pub fn try_canonical_bytes(&self) -> Result<Vec<u8>, ValidationError> {
+        let (order, canonical_ids) = self.canonical_order()?;
         let mut encoder = Encoder::default();
         encoder.raw(b"TIMA-HASH-IR\0");
         encoder.u32(FORMAT_VERSION);
-        match self {
-            Self::Tima(transform) => {
-                encoder.u8(0);
-                transform.encode(&mut encoder);
-            }
-            Self::External(transform) => {
-                encoder.u8(1);
-                transform.encode(&mut encoder);
-            }
+        encoder.sequence(&order, |encoder, id| {
+            self.encode_node(*id, &canonical_ids, encoder)
+        });
+        encoder.u32(0); // deterministic traversal always assigns the root ID zero
+        Ok(encoder.bytes)
+    }
+
+    /// Returns the canonical bytes for a trusted compiler-produced graph.
+    /// Use `try_canonical_bytes` when accepting graphs from another producer.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.try_canonical_bytes()
+            .expect("compiler-produced Hash IR is valid")
+    }
+
+    fn canonical_order(&self) -> Result<(Vec<NodeId>, Vec<Option<u32>>), ValidationError> {
+        if self.root.0 as usize >= self.nodes.len() {
+            return Err(ValidationError::new(format!(
+                "Hash IR root node {} is outside the {}-node arena",
+                self.root.0,
+                self.nodes.len()
+            )));
         }
-        encoder.bytes
+
+        let mut order = Vec::new();
+        let mut canonical_ids = vec![None; self.nodes.len()];
+        self.discover(self.root, &mut order, &mut canonical_ids)?;
+        Ok((order, canonical_ids))
+    }
+
+    fn discover(
+        &self,
+        id: NodeId,
+        order: &mut Vec<NodeId>,
+        canonical_ids: &mut [Option<u32>],
+    ) -> Result<(), ValidationError> {
+        let index = id.0 as usize;
+        let Some(node) = self.nodes.get(index) else {
+            return Err(ValidationError::new(format!(
+                "Hash IR references node {} outside the {}-node arena",
+                id.0,
+                self.nodes.len()
+            )));
+        };
+        if canonical_ids[index].is_some() {
+            return Ok(());
+        }
+
+        canonical_ids[index] = Some(length(order.len()));
+        order.push(id);
+        validate_schema(&node.schema, id)?;
+        let fields = sorted_fields(node, id)?;
+        for field in fields {
+            self.discover_data(&field.value, order, canonical_ids)?;
+        }
+        Ok(())
+    }
+
+    fn discover_data(
+        &self,
+        data: &Data,
+        order: &mut Vec<NodeId>,
+        canonical_ids: &mut [Option<u32>],
+    ) -> Result<(), ValidationError> {
+        match data {
+            Data::Node(id) => self.discover(*id, order, canonical_ids),
+            Data::Sequence(values) => {
+                for value in values {
+                    self.discover_data(value, order, canonical_ids)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn encode_node(&self, id: NodeId, canonical_ids: &[Option<u32>], encoder: &mut Encoder) {
+        let node = &self.nodes[id.0 as usize];
+        encoder.text(&node.schema.namespace);
+        encoder.text(&node.schema.name);
+        encoder.u32(node.schema.version);
+        let fields = sorted_fields(node, id).expect("graph was validated during discovery");
+        encoder.sequence(&fields, |encoder, field| {
+            encoder.text(&field.name);
+            encode_data(&field.value, canonical_ids, encoder);
+        });
     }
 }
 
-impl TimaTransform {
-    fn encode(&self, encoder: &mut Encoder) {
-        let mut capabilities = self.capabilities.clone();
-        capabilities.sort_unstable();
-        capabilities.dedup();
-        encoder.sequence(&capabilities, |encoder, capability| {
-            encoder.u8(match capability {
-                Capability::EnvironmentRead => 0,
-                Capability::FileRead => 1,
-                Capability::HttpGet => 2,
+fn validate_schema(schema: &Schema, id: NodeId) -> Result<(), ValidationError> {
+    if schema.namespace.is_empty() || schema.name.is_empty() {
+        return Err(ValidationError::new(format!(
+            "Hash IR node {} has an empty schema namespace or name",
+            id.0
+        )));
+    }
+    Ok(())
+}
+
+fn sorted_fields(node: &Node, id: NodeId) -> Result<Vec<&Field>, ValidationError> {
+    let mut names = BTreeSet::new();
+    for field in &node.fields {
+        if field.name.is_empty() {
+            return Err(ValidationError::new(format!(
+                "Hash IR node {} has an empty field name",
+                id.0
+            )));
+        }
+        if !names.insert(field.name.as_str()) {
+            return Err(ValidationError::new(format!(
+                "Hash IR node {} repeats field `{}`",
+                id.0, field.name
+            )));
+        }
+    }
+    let mut fields: Vec<_> = node.fields.iter().collect();
+    fields.sort_unstable_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+    Ok(fields)
+}
+
+fn encode_data(data: &Data, canonical_ids: &[Option<u32>], encoder: &mut Encoder) {
+    match data {
+        Data::Unit => encoder.u8(0),
+        Data::Bool(value) => {
+            encoder.u8(1);
+            encoder.u8(u8::from(*value));
+        }
+        Data::UInt(value) => {
+            encoder.u8(2);
+            encoder.u64(*value);
+        }
+        Data::SInt(value) => {
+            encoder.u8(3);
+            encoder.i64(*value);
+        }
+        Data::F32Bits(value) => {
+            encoder.u8(4);
+            encoder.u32(*value);
+        }
+        Data::F64Bits(value) => {
+            encoder.u8(5);
+            encoder.u64(*value);
+        }
+        Data::Bytes(value) => {
+            encoder.u8(6);
+            encoder.data(value);
+        }
+        Data::Text(value) => {
+            encoder.u8(7);
+            encoder.text(value);
+        }
+        Data::Node(id) => {
+            encoder.u8(8);
+            encoder.u32(
+                canonical_ids[id.0 as usize]
+                    .expect("all referenced nodes were discovered before encoding"),
+            );
+        }
+        Data::Digest(value) => {
+            encoder.u8(9);
+            encoder.raw(value);
+        }
+        Data::Sequence(values) => {
+            encoder.u8(10);
+            encoder.sequence(values, |encoder, value| {
+                encode_data(value, canonical_ids, encoder)
             });
-        });
-        encoder.sequence(&self.parameters, |encoder, ty| ty.encode(encoder));
-        self.result.encode(encoder);
-        encoder.sequence(&self.values, |encoder, value| value.encode(encoder));
-        encoder.sequence(&self.blocks, |encoder, block| block.encode(encoder));
-        encoder.u32(self.entry);
-    }
-}
-
-impl ExternalTransform {
-    fn encode(&self, encoder: &mut Encoder) {
-        encoder.text(&self.scheme);
-        encoder.text(&self.name);
-        encoder.u32(self.semantic_version);
-        match self.interface_version {
-            Some(version) => {
-                encoder.u8(1);
-                encoder.u32(version);
-            }
-            None => encoder.u8(0),
-        }
-        encoder.sequence(&self.parameters, |encoder, parameter| {
-            encoder.text(&parameter.name);
-            encoder.u8(parameter.type_code);
-        });
-        match self.result_type {
-            Some(result) => {
-                encoder.u8(1);
-                encoder.u8(result);
-            }
-            None => encoder.u8(0),
         }
     }
 }
 
-impl Type {
-    fn encode(self, encoder: &mut Encoder) {
-        encoder.u8(match self {
-            Self::Bool => 0,
-            Self::U8 => 1,
-            Self::I64 => 2,
-            Self::F32 => 3,
-            Self::String => 4,
-            Self::StringView => 5,
-            Self::Bytes => 6,
-            Self::BytesView => 7,
-            Self::Buffer => 8,
-            Self::BufferView => 9,
-        });
-    }
-}
-
-impl Value {
-    fn encode(&self, encoder: &mut Encoder) {
-        self.ty.encode(encoder);
-        match &self.kind {
-            ValueKind::Parameter(index) => {
-                encoder.u8(0);
-                encoder.u32(*index);
-            }
-            ValueKind::Constant(constant) => {
-                encoder.u8(1);
-                constant.encode(encoder);
-            }
-            ValueKind::Binary { op, left, right } => {
-                encoder.u8(2);
-                op.encode(encoder);
-                encoder.u32(*left);
-                encoder.u32(*right);
-            }
-            ValueKind::Call {
-                transform,
-                arguments,
-            } => {
-                encoder.u8(3);
-                encoder.raw(transform.as_bytes());
-                encoder.sequence(arguments, |encoder, value| encoder.u32(*value));
-            }
-            ValueKind::RuntimeCall(call) => {
-                encoder.u8(4);
-                call.encode(encoder);
-            }
-            ValueKind::BufferZero(buffer) => {
-                encoder.u8(5);
-                encoder.u32(*buffer);
-            }
-            ValueKind::BufferFill { buffer, value } => {
-                encoder.u8(6);
-                encoder.u32(*buffer);
-                encoder.u32(*value);
-            }
-            ValueKind::BufferByteElement => encoder.u8(7),
-            ValueKind::BufferByteMap {
-                buffer,
-                element,
-                instructions,
-                result,
-            } => {
-                encoder.u8(8);
-                encoder.u32(*buffer);
-                encoder.u32(*element);
-                encoder.sequence(instructions, |encoder, value| encoder.u32(*value));
-                encoder.u32(*result);
-            }
-        }
-    }
-}
-
-impl Constant {
-    fn encode(&self, encoder: &mut Encoder) {
-        match self {
-            Self::Bool(value) => {
-                encoder.u8(0);
-                encoder.u8(u8::from(*value));
-            }
-            Self::I64(value) => {
-                encoder.u8(1);
-                encoder.i64(*value);
-            }
-            Self::F32Bits(value) => {
-                encoder.u8(2);
-                encoder.u32(*value);
-            }
-            Self::String(value) => {
-                encoder.u8(3);
-                encoder.text(value);
-            }
-        }
-    }
-}
-
-impl BinaryOp {
-    fn encode(self, encoder: &mut Encoder) {
-        encoder.u8(match self {
-            Self::Add => 0,
-            Self::Subtract => 1,
-            Self::Multiply => 2,
-            Self::Divide => 3,
-            Self::Equal => 4,
-            Self::NotEqual => 5,
-            Self::Less => 6,
-            Self::LessEqual => 7,
-            Self::Greater => 8,
-            Self::GreaterEqual => 9,
-        });
-    }
-}
-
-impl RuntimeCall {
-    fn encode(&self, encoder: &mut Encoder) {
-        match self {
-            Self::EnvironmentI64(name) => {
-                encoder.u8(0);
-                encoder.text(name);
-            }
-            Self::EnvironmentRead(name) => {
-                encoder.u8(1);
-                encoder.u32(*name);
-            }
-            Self::FileRead(path) => {
-                encoder.u8(2);
-                encoder.u32(*path);
-            }
-            Self::HttpGet(url) => {
-                encoder.u8(3);
-                encoder.u32(*url);
-            }
-        }
-    }
-}
-
-impl Block {
-    fn encode(&self, encoder: &mut Encoder) {
-        encoder.sequence(&self.instructions, |encoder, value| encoder.u32(*value));
-        match self.terminator {
-            Terminator::Return(value) => {
-                encoder.u8(0);
-                encoder.u32(value);
-            }
-            Terminator::Branch {
-                condition,
-                then_block,
-                else_block,
-            } => {
-                encoder.u8(1);
-                encoder.u32(condition);
-                encoder.u32(then_block);
-                encoder.u32(else_block);
-            }
-            Terminator::Jump(target) => {
-                encoder.u8(2);
-                encoder.u32(target);
-            }
-        }
-    }
-}
-
-/// Lowers typed Tima IR into the hash-only representation. `references` is
-/// parallel to the typed value arena and contains resolved IDs for call nodes.
+/// Lowers typed Tima IR into the open Hash IR graph. `references` is parallel
+/// to the typed value arena and contains resolved IDs for call nodes.
 pub(crate) fn lower_tima(
     transform: &IrTransform,
     references: &[Option<TransformIdentity>],
 ) -> Definition {
     assert_eq!(transform.values.len(), references.len());
-    Definition::Tima(TimaTransform {
-        capabilities: transform
-            .capabilities
-            .iter()
-            .map(|capability| match capability {
-                IrCapability::EnvironmentRead => Capability::EnvironmentRead,
-                IrCapability::FileRead => Capability::FileRead,
-                IrCapability::HttpGet => Capability::HttpGet,
-            })
-            .collect(),
-        parameters: transform
-            .parameters
-            .iter()
-            .map(|parameter| Type::from(parameter.ty))
-            .collect(),
-        result: Type::from(transform.return_type),
-        values: transform
-            .values
-            .iter()
-            .zip(references)
-            .map(|(value, reference)| Value {
-                ty: Type::from(value.ty),
-                kind: lower_value(&value.kind, *reference),
-            })
-            .collect(),
-        blocks: transform
-            .blocks
-            .iter()
-            .map(|block| Block {
-                instructions: block.instructions.iter().map(|value| value.0).collect(),
-                terminator: match block.terminator {
-                    IrTerminator::Return(value) => Terminator::Return(value.0),
-                    IrTerminator::Branch {
-                        condition,
-                        then_block,
-                        else_block,
-                    } => Terminator::Branch {
-                        condition: condition.0,
-                        then_block: then_block.0,
-                        else_block: else_block.0,
-                    },
-                    IrTerminator::Jump(target) => Terminator::Jump(target.0),
-                },
-            })
-            .collect(),
-        entry: transform.entry.0,
-    })
+    let mut builder = Builder::default();
+    let types = TypeNodes::new(&mut builder);
+
+    let value_nodes: Vec<_> = transform.values.iter().map(|_| builder.reserve()).collect();
+    let block_nodes: Vec<_> = transform.blocks.iter().map(|_| builder.reserve()).collect();
+
+    for (index, (value, reference)) in transform.values.iter().zip(references).enumerate() {
+        let type_node = types.get(value.ty);
+        let node = lower_value(&value.kind, type_node, *reference, &value_nodes);
+        builder.replace(value_nodes[index], node);
+    }
+
+    for (index, block) in transform.blocks.iter().enumerate() {
+        let terminator = match block.terminator {
+            IrTerminator::Return(value) => builder.node(
+                tima("terminator.return"),
+                vec![field("value", node_data(value_nodes[value.0 as usize]))],
+            ),
+            IrTerminator::Branch {
+                condition,
+                then_block,
+                else_block,
+            } => builder.node(
+                tima("terminator.branch"),
+                vec![
+                    field("condition", node_data(value_nodes[condition.0 as usize])),
+                    field("then", node_data(block_nodes[then_block.0 as usize])),
+                    field("else", node_data(block_nodes[else_block.0 as usize])),
+                ],
+            ),
+            IrTerminator::Jump(target) => builder.node(
+                tima("terminator.jump"),
+                vec![field("target", node_data(block_nodes[target.0 as usize]))],
+            ),
+        };
+        builder.replace(
+            block_nodes[index],
+            Node::new(
+                tima("cfg.block"),
+                vec![
+                    field("arguments", Data::Sequence(Vec::new())),
+                    field(
+                        "instructions",
+                        nodes_data(
+                            block
+                                .instructions
+                                .iter()
+                                .map(|value| value_nodes[value.0 as usize]),
+                        ),
+                    ),
+                    field("terminator", node_data(terminator)),
+                ],
+            ),
+        );
+    }
+
+    let mut capabilities: Vec<_> = transform.capabilities.clone();
+    capabilities.sort_unstable();
+    capabilities.dedup();
+    let capabilities: Vec<_> = capabilities
+        .into_iter()
+        .map(|capability| {
+            let name = match capability {
+                IrCapability::EnvironmentRead => "capability.env.read",
+                IrCapability::FileRead => "capability.file.read",
+                IrCapability::HttpGet => "capability.http.get",
+            };
+            let id = builder.node(tima(name), Vec::new());
+            Data::Node(id)
+        })
+        .collect();
+
+    let root = builder.node(
+        tima("definition.transform"),
+        vec![
+            field("capabilities", Data::Sequence(capabilities)),
+            field("entry", node_data(block_nodes[transform.entry.0 as usize])),
+            field(
+                "parameters",
+                nodes_data(
+                    transform
+                        .parameters
+                        .iter()
+                        .map(|parameter| types.get(parameter.ty)),
+                ),
+            ),
+            field("result", node_data(types.get(transform.return_type))),
+        ],
+    );
+    builder.finish(root)
 }
 
 pub(crate) fn external(scheme: &str, name: &str, semantic_version: u32) -> Definition {
-    Definition::External(ExternalTransform {
-        scheme: scheme.to_owned(),
-        name: name.to_owned(),
-        semantic_version,
-        interface_version: None,
-        parameters: Vec::new(),
-        result_type: None,
-    })
+    external_definition(scheme, name, semantic_version, None, &[], None)
 }
 
 pub(crate) fn registered_wasm_external(
@@ -454,98 +412,271 @@ pub(crate) fn registered_wasm_external(
     parameters: &[(&str, u8)],
     result: u8,
 ) -> Definition {
-    Definition::External(ExternalTransform {
-        scheme: "tima.registered-wasm-contract".to_owned(),
-        name: name.to_owned(),
+    external_definition(
+        "tima.registered-wasm-contract",
+        name,
         semantic_version,
-        interface_version: Some(abi_version),
-        parameters: parameters
-            .iter()
-            .map(|(name, type_code)| ExternalParameter {
-                name: (*name).to_owned(),
-                type_code: *type_code,
-            })
-            .collect(),
-        result_type: Some(result),
-    })
+        Some(abi_version),
+        parameters,
+        Some(result),
+    )
 }
 
-fn lower_value(kind: &IrValueKind, reference: Option<TransformIdentity>) -> ValueKind {
+fn external_definition(
+    scheme: &str,
+    name: &str,
+    semantic_version: u32,
+    interface_version: Option<u32>,
+    parameters: &[(&str, u8)],
+    result: Option<u8>,
+) -> Definition {
+    let mut builder = Builder::default();
+    let parameters: Vec<_> = parameters
+        .iter()
+        .map(|(name, type_code)| {
+            let parameter = builder.node(
+                histima("external.parameter"),
+                vec![
+                    field("name", Data::Text((*name).to_owned())),
+                    field("type_code", Data::UInt(u64::from(*type_code))),
+                ],
+            );
+            Data::Node(parameter)
+        })
+        .collect();
+    let root = builder.node(
+        histima("definition.external-transform"),
+        vec![
+            field(
+                "interface_version",
+                interface_version.map_or(Data::Unit, |value| Data::UInt(u64::from(value))),
+            ),
+            field("name", Data::Text(name.to_owned())),
+            field("parameters", Data::Sequence(parameters)),
+            field(
+                "result_type",
+                result.map_or(Data::Unit, |value| Data::UInt(u64::from(value))),
+            ),
+            field("scheme", Data::Text(scheme.to_owned())),
+            field("semantic_version", Data::UInt(u64::from(semantic_version))),
+        ],
+    );
+    builder.finish(root)
+}
+
+fn lower_value(
+    kind: &IrValueKind,
+    ty: NodeId,
+    reference: Option<TransformIdentity>,
+    values: &[NodeId],
+) -> Node {
+    let typed = |mut fields: Vec<Field>| {
+        fields.push(field("type", node_data(ty)));
+        fields
+    };
     match kind {
-        IrValueKind::Parameter { index } => ValueKind::Parameter(*index),
-        IrValueKind::Constant(constant) => ValueKind::Constant(match constant {
-            IrConstant::Bool(value) => Constant::Bool(*value),
-            IrConstant::I64(value) => Constant::I64(*value),
-            IrConstant::F32(value) => Constant::F32Bits(value.to_bits()),
-            IrConstant::String(value) => Constant::String(value.clone()),
-        }),
-        IrValueKind::Binary { op, left, right } => ValueKind::Binary {
-            op: BinaryOp::from(*op),
-            left: left.0,
-            right: right.0,
+        IrValueKind::Parameter { index } => Node::new(
+            tima("value.parameter"),
+            typed(vec![field("index", Data::UInt(u64::from(*index)))]),
+        ),
+        IrValueKind::Constant(constant) => match constant {
+            IrConstant::Bool(value) => Node::new(
+                tima("constant.bool"),
+                typed(vec![field("value", Data::Bool(*value))]),
+            ),
+            IrConstant::I64(value) => Node::new(
+                tima("constant.i64"),
+                typed(vec![field("value", Data::SInt(*value))]),
+            ),
+            IrConstant::F32(value) => Node::new(
+                tima("constant.f32"),
+                typed(vec![field("bits", Data::F32Bits(value.to_bits()))]),
+            ),
+            IrConstant::String(value) => Node::new(
+                tima("constant.string"),
+                typed(vec![field("value", Data::Text(value.clone()))]),
+            ),
         },
-        IrValueKind::Call { arguments, .. } => ValueKind::Call {
-            transform: reference.expect("call values have a resolved Transform ID"),
-            arguments: arguments.iter().map(|value| value.0).collect(),
+        IrValueKind::Binary { op, left, right } => Node::new(
+            tima(binary_schema(*op)),
+            typed(vec![
+                field("left", node_data(values[left.0 as usize])),
+                field("right", node_data(values[right.0 as usize])),
+            ]),
+        ),
+        IrValueKind::Call { arguments, .. } => Node::new(
+            tima("operation.call"),
+            typed(vec![
+                field(
+                    "arguments",
+                    nodes_data(arguments.iter().map(|value| values[value.0 as usize])),
+                ),
+                field(
+                    "transform",
+                    Data::Digest(
+                        *reference
+                            .expect("call values have a resolved Transform ID")
+                            .as_bytes(),
+                    ),
+                ),
+            ]),
+        ),
+        IrValueKind::RuntimeCall(call) => match call {
+            IrRuntimeCall::EnvironmentI64 { name } => Node::new(
+                tima("world.environment-i64"),
+                typed(vec![field("name", Data::Text(name.clone()))]),
+            ),
+            IrRuntimeCall::EnvironmentRead { name } => Node::new(
+                tima("world.environment-read"),
+                typed(vec![field("name", node_data(values[name.0 as usize]))]),
+            ),
+            IrRuntimeCall::FileRead { path } => Node::new(
+                tima("world.file-read"),
+                typed(vec![field("path", node_data(values[path.0 as usize]))]),
+            ),
+            IrRuntimeCall::HttpGet { url } => Node::new(
+                tima("world.http-get"),
+                typed(vec![field("url", node_data(values[url.0 as usize]))]),
+            ),
         },
-        IrValueKind::RuntimeCall(call) => ValueKind::RuntimeCall(match call {
-            IrRuntimeCall::EnvironmentI64 { name } => RuntimeCall::EnvironmentI64(name.clone()),
-            IrRuntimeCall::EnvironmentRead { name } => RuntimeCall::EnvironmentRead(name.0),
-            IrRuntimeCall::FileRead { path } => RuntimeCall::FileRead(path.0),
-            IrRuntimeCall::HttpGet { url } => RuntimeCall::HttpGet(url.0),
-        }),
-        IrValueKind::BufferZero { buffer } => ValueKind::BufferZero(buffer.0),
-        IrValueKind::BufferFill { buffer, value } => ValueKind::BufferFill {
-            buffer: buffer.0,
-            value: value.0,
-        },
-        IrValueKind::BufferByteElement => ValueKind::BufferByteElement,
+        IrValueKind::BufferZero { buffer } => Node::new(
+            tima("buffer.zero"),
+            typed(vec![field("buffer", node_data(values[buffer.0 as usize]))]),
+        ),
+        IrValueKind::BufferFill { buffer, value } => Node::new(
+            tima("buffer.fill"),
+            typed(vec![
+                field("buffer", node_data(values[buffer.0 as usize])),
+                field("value", node_data(values[value.0 as usize])),
+            ]),
+        ),
+        IrValueKind::BufferByteElement => Node::new(tima("buffer.byte-element"), typed(Vec::new())),
         IrValueKind::BufferByteMap {
             buffer,
             element,
             instructions,
             result,
-        } => ValueKind::BufferByteMap {
-            buffer: buffer.0,
-            element: element.0,
-            instructions: instructions.iter().map(|value| value.0).collect(),
-            result: result.0,
-        },
+        } => Node::new(
+            tima("buffer.byte-map"),
+            typed(vec![
+                field("buffer", node_data(values[buffer.0 as usize])),
+                field("element", node_data(values[element.0 as usize])),
+                field(
+                    "instructions",
+                    nodes_data(instructions.iter().map(|value| values[value.0 as usize])),
+                ),
+                field("result", node_data(values[result.0 as usize])),
+            ]),
+        ),
     }
 }
 
-impl From<IrType> for Type {
-    fn from(value: IrType) -> Self {
-        match value {
-            IrType::Bool => Self::Bool,
-            IrType::U8 => Self::U8,
-            IrType::I64 => Self::I64,
-            IrType::F32 => Self::F32,
-            IrType::String => Self::String,
-            IrType::StringView => Self::StringView,
-            IrType::Bytes => Self::Bytes,
-            IrType::BytesView => Self::BytesView,
-            IrType::Buffer => Self::Buffer,
-            IrType::BufferView => Self::BufferView,
+fn binary_schema(op: AstBinaryOp) -> &'static str {
+    match op {
+        AstBinaryOp::Add => "binary.add",
+        AstBinaryOp::Subtract => "binary.subtract",
+        AstBinaryOp::Multiply => "binary.multiply",
+        AstBinaryOp::Divide => "binary.divide",
+        AstBinaryOp::Equal => "binary.equal",
+        AstBinaryOp::NotEqual => "binary.not-equal",
+        AstBinaryOp::Less => "binary.less",
+        AstBinaryOp::LessEqual => "binary.less-equal",
+        AstBinaryOp::Greater => "binary.greater",
+        AstBinaryOp::GreaterEqual => "binary.greater-equal",
+    }
+}
+
+struct TypeNodes {
+    bool_: NodeId,
+    u8_: NodeId,
+    i64_: NodeId,
+    f32_: NodeId,
+    string: NodeId,
+    string_view: NodeId,
+    bytes: NodeId,
+    bytes_view: NodeId,
+    buffer: NodeId,
+    buffer_view: NodeId,
+}
+
+impl TypeNodes {
+    fn new(builder: &mut Builder) -> Self {
+        Self {
+            bool_: builder.node(tima("type.bool"), Vec::new()),
+            u8_: builder.node(tima("type.u8"), Vec::new()),
+            i64_: builder.node(tima("type.i64"), Vec::new()),
+            f32_: builder.node(tima("type.f32"), Vec::new()),
+            string: builder.node(tima("type.string"), Vec::new()),
+            string_view: builder.node(tima("type.string-view"), Vec::new()),
+            bytes: builder.node(tima("type.bytes"), Vec::new()),
+            bytes_view: builder.node(tima("type.bytes-view"), Vec::new()),
+            buffer: builder.node(tima("type.buffer"), Vec::new()),
+            buffer_view: builder.node(tima("type.buffer-view"), Vec::new()),
+        }
+    }
+
+    fn get(&self, ty: IrType) -> NodeId {
+        match ty {
+            IrType::Bool => self.bool_,
+            IrType::U8 => self.u8_,
+            IrType::I64 => self.i64_,
+            IrType::F32 => self.f32_,
+            IrType::String => self.string,
+            IrType::StringView => self.string_view,
+            IrType::Bytes => self.bytes,
+            IrType::BytesView => self.bytes_view,
+            IrType::Buffer => self.buffer,
+            IrType::BufferView => self.buffer_view,
         }
     }
 }
 
-impl From<AstBinaryOp> for BinaryOp {
-    fn from(value: AstBinaryOp) -> Self {
-        match value {
-            AstBinaryOp::Add => Self::Add,
-            AstBinaryOp::Subtract => Self::Subtract,
-            AstBinaryOp::Multiply => Self::Multiply,
-            AstBinaryOp::Divide => Self::Divide,
-            AstBinaryOp::Equal => Self::Equal,
-            AstBinaryOp::NotEqual => Self::NotEqual,
-            AstBinaryOp::Less => Self::Less,
-            AstBinaryOp::LessEqual => Self::LessEqual,
-            AstBinaryOp::Greater => Self::Greater,
-            AstBinaryOp::GreaterEqual => Self::GreaterEqual,
+#[derive(Default)]
+struct Builder {
+    nodes: Vec<Node>,
+}
+
+impl Builder {
+    fn reserve(&mut self) -> NodeId {
+        self.node(Schema::new("tima.internal", "reserved", 0), Vec::new())
+    }
+
+    fn replace(&mut self, id: NodeId, node: Node) {
+        self.nodes[id.0 as usize] = node;
+    }
+
+    fn node(&mut self, schema: Schema, fields: Vec<Field>) -> NodeId {
+        let id = NodeId(length(self.nodes.len()));
+        self.nodes.push(Node::new(schema, fields));
+        id
+    }
+
+    fn finish(self, root: NodeId) -> Definition {
+        Definition {
+            root,
+            nodes: self.nodes,
         }
     }
+}
+
+fn tima(name: &str) -> Schema {
+    Schema::new("tima", name, 1)
+}
+
+fn histima(name: &str) -> Schema {
+    Schema::new("histima", name, 1)
+}
+
+fn field(name: &str, value: Data) -> Field {
+    Field::new(name, value)
+}
+
+fn node_data(id: NodeId) -> Data {
+    Data::Node(id)
+}
+
+fn nodes_data(values: impl IntoIterator<Item = NodeId>) -> Data {
+    Data::Sequence(values.into_iter().map(Data::Node).collect())
 }
 
 #[derive(Default)]
@@ -582,6 +713,10 @@ impl Encoder {
         self.raw(&value.to_le_bytes());
     }
 
+    fn u64(&mut self, value: u64) {
+        self.raw(&value.to_le_bytes());
+    }
+
     fn i64(&mut self, value: i64) {
         self.raw(&value.to_le_bytes());
     }
@@ -596,19 +731,139 @@ mod tests {
     use super::*;
 
     #[test]
-    fn v1_encoding_is_self_identifying_and_length_delimited() {
-        let first = external("a", "bc", 1);
-        let second = external("ab", "c", 1);
+    fn canonical_graph_ignores_arena_and_field_order() {
+        let first = Definition {
+            root: NodeId(0),
+            nodes: vec![
+                Node::new(
+                    Schema::new("example", "pair", 1),
+                    vec![
+                        Field::new("right", Data::Node(NodeId(2))),
+                        Field::new("left", Data::Node(NodeId(1))),
+                    ],
+                ),
+                Node::new(
+                    Schema::new("example", "integer", 1),
+                    vec![Field::new("value", Data::SInt(1))],
+                ),
+                Node::new(
+                    Schema::new("example", "integer", 1),
+                    vec![Field::new("value", Data::SInt(2))],
+                ),
+            ],
+        };
+        let second = Definition {
+            root: NodeId(2),
+            nodes: vec![
+                Node::new(
+                    Schema::new("example", "integer", 1),
+                    vec![Field::new("value", Data::SInt(2))],
+                ),
+                Node::new(
+                    Schema::new("example", "integer", 1),
+                    vec![Field::new("value", Data::SInt(1))],
+                ),
+                Node::new(
+                    Schema::new("example", "pair", 1),
+                    vec![
+                        Field::new("left", Data::Node(NodeId(1))),
+                        Field::new("right", Data::Node(NodeId(0))),
+                    ],
+                ),
+            ],
+        };
+
+        assert_eq!(first.canonical_bytes(), second.canonical_bytes());
+    }
+
+    #[test]
+    fn graph_supports_cycles_and_ignores_unreachable_nodes() {
+        let base = Definition {
+            root: NodeId(0),
+            nodes: vec![Node::new(
+                Schema::new("example", "loop", 1),
+                vec![Field::new("next", Data::Node(NodeId(0)))],
+            )],
+        };
+        let with_unreachable = Definition {
+            root: NodeId(1),
+            nodes: vec![
+                Node::new(Schema::new("ignored", "node", 99), Vec::new()),
+                Node::new(
+                    Schema::new("example", "loop", 1),
+                    vec![Field::new("next", Data::Node(NodeId(1)))],
+                ),
+            ],
+        };
+
+        assert_eq!(base.canonical_bytes(), with_unreachable.canonical_bytes());
+    }
+
+    #[test]
+    fn schemas_are_open_without_new_wire_tags() {
+        let first = Definition {
+            root: NodeId(0),
+            nodes: vec![Node::new(
+                Schema::new("future.language", "operation.quantum-fold", 7),
+                vec![Field::new(
+                    "payload",
+                    Data::Sequence(vec![Data::UInt(3), Data::Bytes(vec![1, 2, 3])]),
+                )],
+            )],
+        };
+        let second = Definition {
+            root: NodeId(0),
+            nodes: vec![Node::new(
+                Schema::new("future.language", "operation.quantum-fold", 8),
+                vec![Field::new(
+                    "payload",
+                    Data::Sequence(vec![Data::UInt(3), Data::Bytes(vec![1, 2, 3])]),
+                )],
+            )],
+        };
 
         assert_ne!(first.canonical_bytes(), second.canonical_bytes());
         assert!(first.canonical_bytes().starts_with(b"TIMA-HASH-IR\0"));
+    }
+
+    #[test]
+    fn v1_encoding_vector_is_stable() {
+        let definition = Definition {
+            root: NodeId(0),
+            nodes: vec![Node::new(Schema::new("a", "bc", 1), Vec::new())],
+        };
+
         assert_eq!(
-            first
+            definition
                 .canonical_bytes()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
-            "54494d412d484153482d4952000100000001010000006102000000626301000000000000000000"
+            "54494d412d484153482d49520001000000010000000100000061020000006263010000000000000000000000"
         );
+    }
+
+    #[test]
+    fn malformed_graph_is_rejected() {
+        let duplicate = Definition {
+            root: NodeId(0),
+            nodes: vec![Node::new(
+                Schema::new("example", "bad", 1),
+                vec![
+                    Field::new("same", Data::Unit),
+                    Field::new("same", Data::Bool(true)),
+                ],
+            )],
+        };
+        let dangling = Definition {
+            root: NodeId(0),
+            nodes: vec![Node::new(
+                Schema::new("example", "bad", 1),
+                vec![Field::new("missing", Data::Node(NodeId(1)))],
+            )],
+        };
+
+        assert!(duplicate.try_canonical_bytes().is_err());
+        assert!(dangling.try_canonical_bytes().is_err());
     }
 }

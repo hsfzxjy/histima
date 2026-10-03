@@ -898,80 +898,118 @@ not interchangeable: distinct recipes may produce identical content.
 
 #### Hash IR v1
 
-Hash IR v1 is frozen. Transform identity does not serialize compiler typed-IR
-structs directly. Typed Tima transforms lower to a hash-only representation
-containing ordered boundary types, a canonical capability set, typed semantic
-values, referenced Transform IDs, control-flow blocks, and the entry block.
-Source spans, source-facing transform/local/parameter names, backend choices,
-and artifact configuration are absent. An incompatible semantic encoding must
-introduce a new Hash IR version; v1 tags must not be repurposed.
+Hash IR v1 is a frozen, language-neutral semantic graph grammar. Transform
+identity does not serialize compiler typed-IR structs or assign wire tags to
+Tima's current types and operations. Instead, every semantic construct is a
+schema-qualified node with named fields. A schema has a UTF-8 namespace, UTF-8
+name, and independent `u32` semantic version. New Tima constructs and other
+finite language IRs add schemas or schema versions without changing Hash IR
+v1's wire grammar.
 
-Non-Tima transforms use an external semantic-operation node containing a
-scheme, semantic operation name and version, and optionally an interface
-version plus ordered named parameter/result type codes. Type codes inside an
-external contract are interpreted by its scheme. Exact Wasm module bytes and
-Artifact IDs remain outside Hash IR.
+Tima reserves the `tima` schema namespace and Histima reserves `histima`.
+Other producers must use a stable namespace they control. Changing a schema's
+meaning requires a new schema version. Unknown schemas can still be validated,
+canonically encoded, and hashed; interpreting or executing them requires an
+implementation of that schema.
+
+A definition is one finite rooted directed graph. Graphs may share nodes and
+contain cycles, which admits ordinary expression graphs, SSA/CFG forms with
+block arguments, nested-region encodings, recursive type descriptions, and
+future language-specific semantic nodes. Source spans, source-facing names,
+backend choices, artifact configuration, and other non-semantic data remain
+excluded.
 
 The canonical byte primitives are:
 
-- `u8`, `u32`, and `i64` are fixed-width little-endian integers;
-- `data` is `u32 byte_length` followed by those bytes;
-- `text` is `data` whose bytes are UTF-8;
+- `u8`, `u32`, `u64`, and `i64` are fixed-width little-endian integers;
+- `bytes` is `u32 byte_length` followed by those bytes;
+- `text` is `bytes` whose payload is UTF-8;
 - `sequence<T>` is `u32 element_count` followed by each encoded element;
-- `option<T>` is tag `0` for absent or tag `1` followed by `T`;
-- a referenced Transform ID is its raw 32 digest bytes.
+- a digest is exactly 32 uninterpreted bytes whose meaning comes from its
+  containing schema field.
 
-Every definition begins with the 13 bytes `TIMA-HASH-IR\0`, `u32(1)`, then a
-definition tag:
+Every definition encodes as the 13 bytes `TIMA-HASH-IR\0`, `u32(1)`,
+`sequence<node>`, and a `u32` canonical root ID. The root ID is always zero.
+A node encodes as `text namespace`, `text schema_name`, `u32 schema_version`,
+and `sequence<field>`. A field encodes as `text field_name` followed by its
+data value. Schema namespace, schema name, and field names must be non-empty;
+field names must be unique within one node.
 
-| Tag | Definition payload |
-| --- | --- |
-| `0` | Tima: `sequence<capability>`, `sequence<parameter type>`, result type, `sequence<value>`, `sequence<block>`, `u32 entry_block` |
-| `1` | External: `text scheme`, `text name`, `u32 semantic_version`, `option<u32> interface_version`, `sequence<external parameter>`, `option<u8> result_type` |
+Fields are encoded in ascending bytewise UTF-8 name order. Canonical node IDs
+are independent of producer arena allocation: assign the root ID zero, then
+traverse fields in canonical order and sequence elements in semantic order,
+assigning each newly encountered node the next ID before traversing that node.
+Encode nodes in that discovery order and replace node references with their
+canonical IDs. Repeated references and cycles reuse the first assigned ID.
+Unreachable arena nodes are not part of the definition and are omitted.
 
-An external parameter is `text name` followed by its scheme-defined `u8` type
-code. Tima type and capability tags are:
+The fixed structural data tags are:
 
-| Type | Tag | Capability | Tag |
-| --- | ---: | --- | ---: |
-| `bool` | 0 | `env.read` | 0 |
-| `u8` | 1 | `file.read` | 1 |
-| `i64` | 2 | `http.get` | 2 |
-| `f32` | 3 |  |  |
-| `String` | 4 |  |  |
-| `StringView` | 5 |  |  |
-| `Bytes` | 6 |  |  |
-| `BytesView` | 7 |  |  |
-| `Buffer` | 8 |  |  |
-| `BufferView` | 9 |  |  |
-
-The capability sequence is a set encoding: entries are unique and sorted by
-ascending tag. Other sequences retain their stated semantic order.
-
-A value is its type tag, value-kind tag, then the listed payload:
-
-| Tag | Value kind and payload |
+| Tag | Data payload |
 | ---: | --- |
-| 0 | parameter: `u32 parameter_index` |
-| 1 | constant |
-| 2 | binary: binary-op tag, `u32 left`, `u32 right` |
-| 3 | call: referenced Transform ID, `sequence<u32> arguments` |
-| 4 | runtime call |
-| 5 | buffer zero: `u32 buffer` |
-| 6 | buffer fill: `u32 buffer`, `u32 value` |
-| 7 | buffer-byte element: no payload |
-| 8 | buffer-byte map: `u32 buffer`, `u32 element`, `sequence<u32> instructions`, `u32 result` |
+| 0 | unit: no payload |
+| 1 | boolean: canonical `u8` 0 or 1 |
+| 2 | unsigned integer: `u64` |
+| 3 | signed integer: `i64` |
+| 4 | raw IEEE-754 binary32 bits: `u32` |
+| 5 | raw IEEE-754 binary64 bits: `u64` |
+| 6 | bytes |
+| 7 | text |
+| 8 | node reference: `u32` canonical node ID |
+| 9 | digest: 32 bytes |
+| 10 | sequence: `sequence<data>` |
 
-Constant tags are bool `0` (`u8` 0 or 1), i64 `1`, raw IEEE-754 f32 bits `2`
-(`u32`), and String `3` (`text`). Binary tags in order from 0 through 9 are
-add, subtract, multiply, divide, equal, not-equal, less, less-equal, greater,
-and greater-equal. Runtime-call tags are legacy environment-i64 `0` (`text`
-key), environment-read `1` (`u32` key value), file-read `2` (`u32` path
-value), and HTTP-get `3` (`u32` URL value).
+These atoms are structural rather than a closed language type system. Records
+are nodes; maps are sequences of entry nodes whose schema defines ordering;
+optional fields use unit or schema-defined omission; arbitrary-width numbers
+and other future literals use canonical bytes interpreted by their schema.
+Consequently new language types, operations, control-flow forms, ownership
+rules, and effect descriptions do not consume new Hash IR wire tags.
 
-A block is `sequence<u32> instructions` followed by a terminator: return tag
-`0` plus `u32 value`; branch tag `1` plus `u32 condition`, `u32 then_block`,
-and `u32 else_block`; or jump tag `2` plus `u32 target`.
+Current typed Tima transforms use root schema
+`tima:definition.transform@1` with fields `capabilities` (canonical sorted
+sequence), `parameters` (ordered sequence of type nodes), `result` (type node),
+and `entry` (CFG block node). Current leaf type schemas are `type.bool`,
+`type.u8`, `type.i64`, `type.f32`, `type.string`, `type.string-view`,
+`type.bytes`, `type.bytes-view`, `type.buffer`, and `type.buffer-view`, all in
+namespace `tima` at schema version 1 with no fields. Capability schemas are
+`capability.env.read`, `capability.file.read`, and `capability.http.get` under
+the same namespace and version.
+
+Current Tima value and operation schemas are:
+
+| `tima` schema at version 1 | Fields |
+| --- | --- |
+| `value.parameter` | `index` unsigned, `type` node |
+| `constant.bool` | `value` boolean, `type` node |
+| `constant.i64` | `value` signed, `type` node |
+| `constant.f32` | `bits` binary32 bits, `type` node |
+| `constant.string` | `value` text, `type` node |
+| `binary.add`, `binary.subtract`, `binary.multiply`, `binary.divide`, `binary.equal`, `binary.not-equal`, `binary.less`, `binary.less-equal`, `binary.greater`, `binary.greater-equal` | `left` node, `right` node, `type` node |
+| `operation.call` | `arguments` ordered node sequence, `transform` digest, `type` node |
+| `world.environment-i64` | `name` text, `type` node |
+| `world.environment-read` | `name` node, `type` node |
+| `world.file-read` | `path` node, `type` node |
+| `world.http-get` | `url` node, `type` node |
+| `buffer.zero` | `buffer` node, `type` node |
+| `buffer.fill` | `buffer` node, `value` node, `type` node |
+| `buffer.byte-element` | `type` node |
+| `buffer.byte-map` | `buffer` node, `element` node, `instructions` ordered node sequence, `result` node, `type` node |
+
+`tima:cfg.block@1` has `arguments` (an ordered node sequence, empty for the
+current typed IR), `instructions` (evaluation-order node sequence), and
+`terminator` (node). Terminator schemas are `terminator.return` with `value`,
+`terminator.branch` with `condition`, `then`, and `else`, and
+`terminator.jump` with `target`.
+
+Non-Tima transforms currently use root schema
+`histima:definition.external-transform@1` with text `scheme` and `name`,
+unsigned `semantic_version`, unit-or-unsigned `interface_version`, ordered
+`parameters`, and unit-or-unsigned `result_type`. Each parameter uses
+`histima:external.parameter@1` with text `name` and unsigned `type_code`.
+Type codes are interpreted by the external scheme. Exact Wasm module bytes and
+Artifact IDs remain outside Hash IR. A richer external contract may define a
+new schema without changing the v1 graph grammar.
 
 Transform ID is:
 
@@ -983,16 +1021,16 @@ The following golden vectors are normative:
 
 | Definition | Transform ID |
 | --- | --- |
-| `transform keep(value: i64) -> i64 { return value }` | `37e94b33d07f169a97f6c3c1f23d3cf87aaf5ee7763c435a03c37735966e7ef4` |
-| the preceding `keep` called by `transform apply(value: i64) -> i64 { return keep(value) }` | `0254f51ba1a9d63cb061bd340fff76d37795e63a9b3cfc033f228586989aa4a6` |
-| standard operation `ppm.decode`, semantic version 3 | `b5f2bcf1f240773d2827e46938b5c921eac4932c80de5913c2bdd5a971894c45` |
-| registered-Wasm `fixture.encode`, semantic version 1, ABI 4, parameters `buffer:2, quality:3`, result 1 | `775718252dfde609e71caa09550e261f8acd22125280febbe71b704da24452eb` |
+| `transform keep(value: i64) -> i64 { return value }` | `ee7691ec5931fd0275c2bab44a630077922ccbc60215caf1d75f8f07a6475c35` |
+| the preceding `keep` called by `transform apply(value: i64) -> i64 { return keep(value) }` | `2aed765597ed27f4890088f3467637376071c78815a017efdb4b6419636c2551` |
+| standard operation `ppm.decode`, semantic version 3 | `05b5808b2657b94dce94a07cc7f476f4cc91934da878f3371365968f926154c1` |
+| registered-Wasm `fixture.encode`, semantic version 1, ABI 4, parameters `buffer:2, quality:3`, result 1 | `f365c363fa4e2ea1902a839ada1679deae2bc9a9a0148c2fd1b275a9c8279404` |
 
-For an encoding-level vector, external scheme `a`, name `bc`, semantic version
-1, with no interface, parameters, or result, encodes as hexadecimal:
+For an encoding-level vector, a one-node graph whose root schema is namespace
+`a`, name `bc`, schema version 1, with no fields, encodes as hexadecimal:
 
 ```text
-54494d412d484153482d4952000100000001010000006102000000626301000000000000000000
+54494d412d484153482d49520001000000010000000100000061020000006263010000000000000000000000
 ```
 
 ### 12.3 Result and artifact caches
