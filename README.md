@@ -35,7 +35,9 @@ unsupported transforms remain interpreted. Supported inner transform calls
 are linked in the same artifact; a caller falls back to the interpreter when
 any transitive callee is unsupported. Normal Histima execution defaults to the
 reference interpreter and accepts `run ... --engine hybrid-aot` as an explicit
-product-level choice.
+product-level choice. Hybrid run output includes an `aot_plan` for every source
+transform, reporting its semantic Transform ID, native or interpreter-fallback
+dispatch, and backend reasons for each fallback.
 
 ## Build and try it
 

@@ -1351,6 +1351,15 @@ Backend and artifact-cache details are execution metadata only. The standalone
 `tima run-native` command and Histima's explicit `hybrid-aot` choice exercise
 the same boundary; neither makes AOT the mandatory default.
 
+A Histima hybrid run reports an execution-only `aot_plan` for every
+source-defined transform in definition order. Each entry contains its semantic
+Transform ID, the dispatch mode that would be used when called (`native` or
+`interpreter-fallback`), and backend reasons for fallback. Transitive callers
+report an unsupported callee when their own operations are otherwise
+compatible. This plan is diagnostic execution metadata: whether it is emitted,
+and the exact wording of its reasons, do not participate in Hash IR, Transform
+ID, Recipe ID, Content ID, lineage, replay, or cache keys.
+
 Native artifacts are cached independently using Artifact IDs derived from the
 Transform ID plus the Cranelift/compiler version, target, inferred CPU feature
 configuration, optimization setting, and ABI version. A compilation-unit

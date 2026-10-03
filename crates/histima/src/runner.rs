@@ -9,7 +9,7 @@ use tima::ast::Item;
 use tima::backend::cache::{ArtifactCacheStatus, CachedArtifact};
 use tima::cache::{CacheError, CacheStats, ResultCache, TransformResultCache};
 use tima::capability::World;
-use tima::identity::{ContentIdentity, RecipeIdentity, byte_content_identity};
+use tima::identity::{ContentIdentity, RecipeIdentity, TransformIdentity, byte_content_identity};
 use tima::lineage::{Lineage, LineageNode};
 use tima::runtime::{Execution, OuterValue, ValueData};
 
@@ -23,11 +23,35 @@ use crate::{ArtifactInfo, RecordedResult, Workspace};
 pub struct ProgramExecution {
     pub execution: Execution,
     pub engine: ExecutionEngine,
+    pub aot_plan: Option<Vec<AotTransformPlan>>,
     pub stock_policy: ResultStockPolicy,
     pub stocked_results: Vec<StockedResult>,
     pub artifact: Option<ArtifactInfo>,
     pub artifact_cache: Option<ArtifactCacheStatus>,
     pub result_cache: CacheStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AotTransformExecution {
+    Native,
+    InterpreterFallback,
+}
+
+impl AotTransformExecution {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::InterpreterFallback => "interpreter-fallback",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AotTransformPlan {
+    pub name: String,
+    pub transform_id: TransformIdentity,
+    pub execution: AotTransformExecution,
+    pub fallback_reasons: Vec<String>,
 }
 
 /// Host storage policy applied only after a complete successful execution.
@@ -209,7 +233,7 @@ impl Workspace {
         engine: ExecutionEngine,
     ) -> Result<(ProgramExecution, Vec<StockCandidate>), RunError> {
         let mut result_cache = WorkspaceResultCache::new(self);
-        let (execution, cached_artifact) = match engine {
+        let (execution, cached_artifact, aot_plan) = match engine {
             ExecutionEngine::Interpreter => (
                 tima::runtime::execute_cached_with_capabilities_and_identity_prefixes(
                     program,
@@ -218,6 +242,7 @@ impl Workspace {
                     self,
                 )
                 .map_err(RunError::Runtime)?,
+                None,
                 None,
             ),
             ExecutionEngine::HybridAot => {
@@ -230,7 +255,21 @@ impl Workspace {
                         self,
                     )
                     .map_err(RunError::Runtime)?;
-                (execution.execution, execution.artifact)
+                let aot_plan = execution
+                    .transform_plan
+                    .into_iter()
+                    .map(|transform| AotTransformPlan {
+                        name: transform.name,
+                        transform_id: program.identities.get(transform.transform),
+                        execution: if transform.native_compatible {
+                            AotTransformExecution::Native
+                        } else {
+                            AotTransformExecution::InterpreterFallback
+                        },
+                        fallback_reasons: transform.fallback_reasons,
+                    })
+                    .collect();
+                (execution.execution, execution.artifact, Some(aot_plan))
             }
         };
         let artifact_cache = cached_artifact.as_ref().map(|artifact| artifact.status);
@@ -245,6 +284,7 @@ impl Workspace {
             ProgramExecution {
                 execution,
                 engine,
+                aot_plan,
                 stock_policy: ResultStockPolicy::None,
                 stocked_results: vec![],
                 artifact,

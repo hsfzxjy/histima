@@ -18,7 +18,8 @@ use crate::ast::BinaryOp;
 use crate::backend::{ArtifactBackend, BackendArtifact};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    Constant, RuntimeCall, Terminator, Transform, Type, TypedModule, ValueId, ValueKind,
+    Constant, RuntimeCall, Terminator, Transform, TransformId, Type, TypedModule, ValueId,
+    ValueKind,
 };
 
 pub const CRANELIFT_BACKEND_VERSION: &str = "8";
@@ -31,9 +32,23 @@ pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CraneliftBackend;
 
+/// Backend-only dispatch metadata for one source transform. This report is not
+/// part of Tima semantics, Hash IR, or Transform identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CraneliftTransformPlan {
+    pub transform: TransformId,
+    pub name: String,
+    pub native_compatible: bool,
+    pub fallback_reasons: Vec<String>,
+}
+
 impl CraneliftBackend {
     pub fn supported_transforms(module: &TypedModule) -> Vec<bool> {
         supported_transforms(module)
+    }
+
+    pub fn transform_plan(module: &TypedModule) -> Vec<CraneliftTransformPlan> {
+        transform_plan(module)
     }
 }
 
@@ -278,6 +293,60 @@ fn supported_transforms(module: &TypedModule) -> Vec<bool> {
         visit(module, index, &mut states, &mut supported);
     }
     supported
+}
+
+fn transform_plan(module: &TypedModule) -> Vec<CraneliftTransformPlan> {
+    let supported = supported_transforms(module);
+    module
+        .transforms
+        .iter()
+        .enumerate()
+        .map(|(index, transform)| {
+            let mut fallback_reasons = Vec::new();
+            if !supported[index] {
+                for diagnostic in validate_transform(transform) {
+                    push_unique(&mut fallback_reasons, diagnostic.message);
+                }
+                if fallback_reasons.is_empty() {
+                    for value in &transform.values {
+                        let ValueKind::Call {
+                            transform: callee, ..
+                        } = value.kind
+                        else {
+                            continue;
+                        };
+                        if !supported[callee.0 as usize] {
+                            push_unique(
+                                &mut fallback_reasons,
+                                format!(
+                                    "calls `{}` which is not native-compatible",
+                                    module.get(callee).name
+                                ),
+                            );
+                        }
+                    }
+                }
+                if fallback_reasons.is_empty() {
+                    fallback_reasons.push(
+                        "recursive source-transform calls are outside the current Cranelift AOT subset"
+                            .to_owned(),
+                    );
+                }
+            }
+            CraneliftTransformPlan {
+                transform: TransformId(index as u32),
+                name: transform.name.clone(),
+                native_compatible: supported[index],
+                fallback_reasons,
+            }
+        })
+        .collect()
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
 }
 
 fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
@@ -941,6 +1010,43 @@ mod tests {
             diagnostics[0]
                 .message
                 .contains("outside the initial Cranelift AOT subset")
+        );
+    }
+
+    #[test]
+    fn reports_native_admission_and_transitive_fallback_reasons() {
+        let compiled = crate::compile(
+            "plan.tima",
+            "transform scale(value: f32, factor: f32) -> f32 { return value * factor }\n\
+             transform checked(left: i64, right: i64) -> i64 { return left + right }\n\
+             transform wrapper(left: i64, right: i64) -> i64 {\n\
+                 return checked(left, right)\n\
+             }\n",
+        )
+        .unwrap();
+        let plan = CraneliftBackend::transform_plan(&compiled.transforms);
+
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].name, "scale");
+        assert!(plan[0].native_compatible);
+        assert!(plan[0].fallback_reasons.is_empty());
+        assert_eq!(plan[1].name, "checked");
+        assert!(!plan[1].native_compatible);
+        assert_eq!(
+            plan[1].fallback_reasons,
+            ["Cranelift AOT does not yet lower checked i64 arithmetic"]
+        );
+        assert_eq!(plan[2].name, "wrapper");
+        assert!(!plan[2].native_compatible);
+        assert_eq!(
+            plan[2].fallback_reasons,
+            ["calls `checked` which is not native-compatible"]
+        );
+        assert_eq!(
+            CraneliftBackend::supported_transforms(&compiled.transforms),
+            plan.iter()
+                .map(|transform| transform.native_compatible)
+                .collect::<Vec<_>>()
         );
     }
 

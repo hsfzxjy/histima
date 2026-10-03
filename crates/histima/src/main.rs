@@ -685,6 +685,19 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let json = cli_json::run(&result, &recorded);
             output.emit(json, || {
                 println!("execution_engine = {}", result.engine.name());
+                if let Some(plan) = &result.aot_plan {
+                    println!("aot_backend = cranelift");
+                    println!("aot_source_transform_count = {}", plan.len());
+                    for (index, transform) in plan.iter().enumerate() {
+                        println!("aot[{index}].name = {}", transform.name);
+                        println!("aot[{index}].transform_id = {}", transform.transform_id);
+                        println!("aot[{index}].execution = {}", transform.execution.name());
+                        for (reason_index, reason) in transform.fallback_reasons.iter().enumerate()
+                        {
+                            println!("aot[{index}].reason[{reason_index}] = {reason}");
+                        }
+                    }
+                }
                 println!("result_stock_policy = {}", result.stock_policy.name());
                 println!(
                     "artifact_cache = {}",

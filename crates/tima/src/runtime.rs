@@ -10,6 +10,7 @@ pub use buffer::{BufferLayoutError, BufferValue};
 
 use crate::ast::{Argument, BinaryOp, ExprId, ExprKind, Item};
 use crate::backend::cache::CachedArtifact;
+use crate::backend::cranelift::{CraneliftBackend, CraneliftTransformPlan};
 use crate::backend::native::{
     NativeArgument, NativeBuffer, NativeBufferView, NativeModule, NativeResult,
     NativeScalar as AbiScalar,
@@ -97,6 +98,7 @@ pub struct Execution {
 pub struct AotExecution {
     pub execution: Execution,
     pub artifact: Option<CachedArtifact>,
+    pub transform_plan: Vec<CraneliftTransformPlan>,
 }
 
 pub fn execute(program: &CompiledProgram) -> Result<Execution, Vec<Diagnostic>> {
@@ -258,6 +260,7 @@ fn execute_aot_with(
     artifact_cache_root: &Path,
     identity_prefixes: Option<&dyn IdentityPrefixResolver>,
 ) -> Result<AotExecution, Vec<Diagnostic>> {
+    let transform_plan = CraneliftBackend::transform_plan(&program.transforms);
     let native = NativeModule::build(
         &program.transforms,
         &program.identities,
@@ -282,6 +285,7 @@ fn execute_aot_with(
     Ok(AotExecution {
         execution,
         artifact,
+        transform_plan,
     })
 }
 

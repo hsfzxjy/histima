@@ -46,9 +46,11 @@ cargo run --manifest-path ../../Cargo.toml -p histima -- materialize ../../build
   `--stock-intermediates` policy now stocks recordable invocation results
   reachable from successful program outputs without retaining failed or
   discarded work.
-- **Performance problem:** the indexed Buffer transform intentionally falls
-  back to the interpreter under `hybrid-aot`; the current CLI reports the
-  engine but does not explain the per-transform fallback decision.
+- **Performance problem (made inspectable):** the indexed Buffer transform
+  intentionally falls back to the interpreter under `hybrid-aot`. The run
+  result's `aot_plan` now identifies `darken` by Transform ID and reports that
+  its Buffer boundary is outside the current native subset, so backend work can
+  be prioritized from an observed workflow rather than guessed.
 - **Missing transform/library problem:** there is no general resize transform,
   so this workload uses separate hero and thumbnail sources rather than
   deriving multiple sizes from one Buffer.

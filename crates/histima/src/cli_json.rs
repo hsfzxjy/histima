@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use histima::{
-    ArtifactInfo, ArtifactInspection, AssetSummary, CatalogInfo, CatalogPage, CatalogSearch,
-    CatalogStats, ContentInspection, DurableTrace, ImportedAsset, PipelineExecution,
+    AotTransformPlan, ArtifactInfo, ArtifactInspection, AssetSummary, CatalogInfo, CatalogPage,
+    CatalogSearch, CatalogStats, ContentInspection, DurableTrace, ImportedAsset, PipelineExecution,
     ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult, StockedResult,
     WorkspaceSummary, WorkspaceVerification,
 };
@@ -333,6 +333,10 @@ pub fn run(result: &ProgramExecution, recorded: &[(String, RecordedResult)]) -> 
     let single_record = (records.len() == 1).then(|| records[0].clone());
     json!({
         "execution_engine": result.engine.name(),
+        "aot_plan": result.aot_plan.as_ref().map(|transforms| json!({
+            "backend": "cranelift",
+            "source_transforms": transforms.iter().map(aot_transform_plan).collect::<Vec<_>>(),
+        })),
         "result_stock_policy": result.stock_policy.name(),
         "stocked_results": result.stocked_results.iter().map(stocked_result).collect::<Vec<_>>(),
         "artifact_cache": result.artifact_cache.map(|status| match status {
@@ -345,6 +349,15 @@ pub fn run(result: &ProgramExecution, recorded: &[(String, RecordedResult)]) -> 
         "trace": trace,
         "recorded": single_record,
         "records": records,
+    })
+}
+
+fn aot_transform_plan(transform: &AotTransformPlan) -> Value {
+    json!({
+        "name": transform.name,
+        "transform_id": transform.transform_id.to_string(),
+        "execution": transform.execution.name(),
+        "fallback_reasons": transform.fallback_reasons,
     })
 }
 

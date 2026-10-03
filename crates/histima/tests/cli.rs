@@ -569,6 +569,9 @@ fn cli_hybrid_aot_matches_interpreter_semantics_and_reuses_artifacts() {
              transform keep(data: Bytes) -> Bytes {{\n\
                  return data\n\
              }}\n\
+             transform checked(left: i64, right: i64) -> i64 {{\n\
+                 return left + right\n\
+             }}\n\
              out = source | read | keep\n\
              trace(out)\n"
         ),
@@ -593,6 +596,27 @@ fn cli_hybrid_aot_matches_interpreter_semantics_and_reuses_artifacts() {
     assert_eq!(first_native["execution_engine"], "hybrid-aot");
     assert_eq!(first_native["artifact_cache"], "miss");
     assert!(first_native["artifact"].is_object());
+    assert_eq!(first_native["aot_plan"]["backend"], "cranelift");
+    let source_transforms = first_native["aot_plan"]["source_transforms"]
+        .as_array()
+        .unwrap();
+    assert_eq!(source_transforms.len(), 2);
+    let keep_plan = source_transforms
+        .iter()
+        .find(|transform| transform["name"] == "keep")
+        .unwrap();
+    assert_eq!(keep_plan["execution"], "native");
+    assert_eq!(keep_plan["fallback_reasons"], json!([]));
+    assert_eq!(keep_plan["transform_id"].as_str().unwrap().len(), 64);
+    let checked_plan = source_transforms
+        .iter()
+        .find(|transform| transform["name"] == "checked")
+        .unwrap();
+    assert_eq!(checked_plan["execution"], "interpreter-fallback");
+    assert_eq!(
+        checked_plan["fallback_reasons"],
+        json!(["Cranelift AOT does not yet lower checked i64 arithmetic"])
+    );
     assert_eq!(first_native["bindings"]["out"]["type"], "bytes");
     assert_eq!(
         first_native["bindings"]["out"]["byte_length"],
@@ -619,6 +643,7 @@ fn cli_hybrid_aot_matches_interpreter_semantics_and_reuses_artifacts() {
     let second_native = json_output(&second_native);
     assert_eq!(second_native["artifact_cache"], "hit");
     assert_eq!(second_native["artifact"], first_native["artifact"]);
+    assert_eq!(second_native["aot_plan"], first_native["aot_plan"]);
 
     let interpreted = histima([
         "run",
@@ -635,6 +660,7 @@ fn cli_hybrid_aot_matches_interpreter_semantics_and_reuses_artifacts() {
     assert_eq!(interpreted["execution_engine"], "interpreter");
     assert_eq!(interpreted["artifact_cache"], Value::Null);
     assert_eq!(interpreted["artifact"], Value::Null);
+    assert_eq!(interpreted["aot_plan"], Value::Null);
     assert_eq!(interpreted["bindings"], first_native["bindings"]);
     assert_eq!(interpreted["trace"], first_native["trace"]);
     assert_eq!(interpreted["recorded"], first_native["recorded"]);
@@ -689,6 +715,8 @@ fn cli_runs_the_repository_site_asset_workflow() {
             "run",
             text(&workspace),
             "pipeline.tima",
+            "--engine",
+            "hybrid-aot",
             "--stock-intermediates",
             "--record",
             "hero_buffer",
@@ -757,6 +785,8 @@ fn cli_runs_the_repository_site_asset_workflow() {
             "run",
             text(&workspace),
             "pipeline.tima",
+            "--engine",
+            "hybrid-aot",
             "--stock-intermediates",
             "--record",
             "hero_buffer",
@@ -777,6 +807,22 @@ fn cli_runs_the_repository_site_asset_workflow() {
             .as_u64()
             .unwrap()
             >= 8
+    );
+    let repeated_json = json_output(&repeated);
+    assert_eq!(repeated_json["execution_engine"], "hybrid-aot");
+    assert_eq!(repeated_json["artifact"], Value::Null);
+    let darken_plan = repeated_json["aot_plan"]["source_transforms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|transform| transform["name"] == "darken")
+        .unwrap();
+    assert_eq!(darken_plan["execution"], "interpreter-fallback");
+    assert!(
+        darken_plan["fallback_reasons"][0]
+            .as_str()
+            .unwrap()
+            .contains("boundary of transform `darken`")
     );
     assert_eq!(json_output(&repeated)["stocked_results"], json!([]));
     assert_eq!(json_output(&repeated)["records"], first["records"]);
