@@ -10,9 +10,10 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::abi::{
-    ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_RUNTIME_USER_DATA_OFFSET, ABI_RUNTIME_WORLD_CALL_OFFSET,
-    ABI_VALUE_BYTES, ABI_WORLD_ENVIRONMENT_READ, ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET,
-    TIMA_ABI_VERSION, abi_callsite,
+    ABI_FAILURE_CHECKED_INTEGER, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_RUNTIME_FAILURE_OFFSET,
+    ABI_RUNTIME_USER_DATA_OFFSET, ABI_RUNTIME_WORLD_CALL_OFFSET, ABI_VALUE_BYTES,
+    ABI_WORLD_ENVIRONMENT_READ, ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET, TIMA_ABI_VERSION,
+    abi_callsite,
 };
 use crate::ast::BinaryOp;
 use crate::backend::{ArtifactBackend, BackendArtifact};
@@ -22,7 +23,7 @@ use crate::ir::{
     ValueKind,
 };
 
-pub const CRANELIFT_BACKEND_VERSION: &str = "9";
+pub const CRANELIFT_BACKEND_VERSION: &str = "10";
 pub const CRANELIFT_OPTIMIZATION: &str = "speed";
 
 /// Ahead-of-time native object generation from backend-neutral Tima IR.
@@ -374,17 +375,6 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
     for value in &transform.values {
         match &value.kind {
             ValueKind::Parameter { .. } | ValueKind::Constant(_) => {}
-            ValueKind::Binary { op, left, .. }
-                if value_type(transform, *left) == Type::I64 && op.is_arithmetic() =>
-            {
-                diagnostics.push(
-                    Diagnostic::error(
-                        "Cranelift AOT does not yet lower checked i64 arithmetic",
-                        value.span,
-                    )
-                    .with_note("the backend must preserve Tima overflow and division diagnostics"),
-                );
-            }
             ValueKind::Binary { .. } => {}
             ValueKind::U8Scale { .. } => {}
             ValueKind::Call { .. } => {}
@@ -392,14 +382,7 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
             | ValueKind::BufferFill { .. }
             | ValueKind::BufferByteElement
             | ValueKind::BufferByteIndex => {}
-            ValueKind::BufferByteMap { index: Some(_), .. } => diagnostics.push(
-                Diagnostic::error(
-                    "indexed Buffer byte maps are outside the current Cranelift AOT subset",
-                    value.span,
-                )
-                .with_note("checked i64 index arithmetic must retain source-spanned failures"),
-            ),
-            ValueKind::BufferByteMap { index: None, .. } => {}
+            ValueKind::BufferByteMap { .. } => {}
             ValueKind::RuntimeCall(
                 RuntimeCall::EnvironmentRead { .. }
                 | RuntimeCall::FileRead { .. }
@@ -425,9 +408,11 @@ fn lower_transform(
 ) -> Result<Function, Vec<Diagnostic>> {
     let signature = native_signature(module);
     let world_call_signature = world_call_signature(module);
+    let failure_signature = failure_signature(module);
     let frontend_config = module.target_config();
     let mut function = Function::with_name_signature(UserFuncName::user(0, index), signature);
     let world_call_signature = function.import_signature(world_call_signature);
+    let failure_signature = function.import_signature(failure_signature);
     let function_refs = function_ids
         .iter()
         .map(|callee| module.declare_func_in_func(*callee, &mut function))
@@ -491,6 +476,19 @@ fn lower_transform(
                     ValueKind::Constant(constant) => {
                         LoweredValue::Scalar(lower_constant(&mut builder, constant, value.ty))
                     }
+                    ValueKind::Binary { op, left, right }
+                        if transform.value(*left).ty == Type::I64 && op.is_arithmetic() =>
+                    {
+                        LoweredValue::Scalar(emit_checked_i64_binary(
+                            &mut builder,
+                            runtime_context,
+                            failure_signature,
+                            abi_callsite(index, id.0),
+                            *op,
+                            required_scalar(&values, *left),
+                            required_scalar(&values, *right),
+                        ))
+                    }
                     ValueKind::Binary { op, left, right } => LoweredValue::Scalar(lower_binary(
                         &mut builder,
                         *op,
@@ -530,7 +528,7 @@ fn lower_transform(
                     ValueKind::BufferByteMap {
                         buffer,
                         element,
-                        index: None,
+                        index: byte_index,
                         instructions,
                         result: mapped,
                     } => emit_buffer_byte_map(
@@ -539,6 +537,7 @@ fn lower_transform(
                         index,
                         required_shaped_buffer(&values, *buffer),
                         *element,
+                        *byte_index,
                         instructions,
                         *mapped,
                         &mut values,
@@ -546,11 +545,10 @@ fn lower_transform(
                         &function_refs,
                         &static_strings,
                         world_call_signature,
+                        failure_signature,
                     ),
-                    ValueKind::BufferByteElement
-                    | ValueKind::BufferByteIndex
-                    | ValueKind::BufferByteMap { index: Some(_), .. } => {
-                        unreachable!("marker values are nested or validation rejects indexed maps")
+                    ValueKind::BufferByteElement | ValueKind::BufferByteIndex => {
+                        unreachable!("marker values are nested")
                     }
                     ValueKind::RuntimeCall(call) => emit_world_call(
                         &mut builder,
@@ -619,6 +617,18 @@ fn world_call_signature(module: &ObjectModule) -> Signature {
         AbiParam::new(pointer_type),
         AbiParam::new(types::I64),
         AbiParam::new(pointer_type),
+    ]);
+    signature.returns.push(AbiParam::new(types::I32));
+    signature
+}
+
+fn failure_signature(module: &ObjectModule) -> Signature {
+    let mut signature = module.make_signature();
+    let pointer_type = module.target_config().pointer_type();
+    signature.params.extend([
+        AbiParam::new(pointer_type),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I32),
     ]);
     signature.returns.push(AbiParam::new(types::I32));
     signature
@@ -777,6 +787,7 @@ fn emit_buffer_byte_map(
     transform_index: u32,
     buffer: [cranelift_codegen::ir::Value; crate::abi::ABI_VALUE_WORDS],
     element: ValueId,
+    byte_index: Option<ValueId>,
     instructions: &[ValueId],
     result: ValueId,
     values: &mut [Option<LoweredValue>],
@@ -784,6 +795,7 @@ fn emit_buffer_byte_map(
     function_refs: &[cranelift_codegen::ir::FuncRef],
     static_strings: &[Option<LoweredStaticString>],
     world_call_signature: cranelift_codegen::ir::SigRef,
+    failure_signature: cranelift_codegen::ir::SigRef,
 ) -> LoweredValue {
     let header = builder.create_block();
     let body = builder.create_block();
@@ -806,6 +818,9 @@ fn emit_buffer_byte_map(
         .ins()
         .load(types::I8, MemFlagsData::new(), address, 0);
     values[element.0 as usize] = Some(LoweredValue::Scalar(byte));
+    if let Some(byte_index) = byte_index {
+        values[byte_index.0 as usize] = Some(LoweredValue::Scalar(index));
+    }
     for id in instructions {
         let value = transform.value(*id);
         let lowered = match &value.kind {
@@ -815,6 +830,19 @@ fn emit_buffer_byte_map(
             ),
             ValueKind::Constant(constant) => {
                 LoweredValue::Scalar(lower_constant(builder, constant, value.ty))
+            }
+            ValueKind::Binary { op, left, right }
+                if transform.value(*left).ty == Type::I64 && op.is_arithmetic() =>
+            {
+                LoweredValue::Scalar(emit_checked_i64_binary(
+                    builder,
+                    runtime_context,
+                    failure_signature,
+                    abi_callsite(transform_index, id.0),
+                    *op,
+                    required_scalar(values, *left),
+                    required_scalar(values, *right),
+                ))
             }
             ValueKind::Binary { op, left, right } => LoweredValue::Scalar(lower_binary(
                 builder,
@@ -1023,6 +1051,107 @@ fn lower_u8_scale(
     builder.ins().ireduce(types::I8, clamped)
 }
 
+fn emit_checked_i64_binary(
+    builder: &mut FunctionBuilder<'_>,
+    runtime_context: cranelift_codegen::ir::Value,
+    failure_signature: cranelift_codegen::ir::SigRef,
+    callsite: u64,
+    op: BinaryOp,
+    left: cranelift_codegen::ir::Value,
+    right: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    match op {
+        BinaryOp::Add => {
+            let (result, overflow) = builder.ins().sadd_overflow(left, right);
+            emit_failure_if(
+                builder,
+                runtime_context,
+                failure_signature,
+                callsite,
+                overflow,
+            );
+            result
+        }
+        BinaryOp::Subtract => {
+            let (result, overflow) = builder.ins().ssub_overflow(left, right);
+            emit_failure_if(
+                builder,
+                runtime_context,
+                failure_signature,
+                callsite,
+                overflow,
+            );
+            result
+        }
+        BinaryOp::Multiply => {
+            let (result, overflow) = builder.ins().smul_overflow(left, right);
+            emit_failure_if(
+                builder,
+                runtime_context,
+                failure_signature,
+                callsite,
+                overflow,
+            );
+            result
+        }
+        BinaryOp::Divide => {
+            let zero = builder.ins().icmp_imm_s(IntCC::Equal, right, 0);
+            let minimum = builder.ins().icmp_imm_s(IntCC::Equal, left, i64::MIN);
+            let negative_one = builder.ins().icmp_imm_s(IntCC::Equal, right, -1);
+            let overflow = builder.ins().band(minimum, negative_one);
+            let invalid = builder.ins().bor(zero, overflow);
+            emit_failure_if(
+                builder,
+                runtime_context,
+                failure_signature,
+                callsite,
+                invalid,
+            );
+            builder.ins().sdiv(left, right)
+        }
+        _ => unreachable!("checked i64 lowering is used only for arithmetic"),
+    }
+}
+
+fn emit_failure_if(
+    builder: &mut FunctionBuilder<'_>,
+    runtime_context: cranelift_codegen::ir::Value,
+    signature: cranelift_codegen::ir::SigRef,
+    callsite: u64,
+    failed: cranelift_codegen::ir::Value,
+) {
+    let failure = builder.create_block();
+    let success = builder.create_block();
+    builder.ins().brif(failed, failure, &[], success, &[]);
+
+    builder.switch_to_block(failure);
+    let pointer_type = builder.func.dfg.value_type(runtime_context);
+    let user_data = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        runtime_context,
+        ABI_RUNTIME_USER_DATA_OFFSET,
+    );
+    let callback = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        runtime_context,
+        ABI_RUNTIME_FAILURE_OFFSET,
+    );
+    let callsite = builder.ins().iconst(types::I64, callsite as i64);
+    let failure_kind = builder
+        .ins()
+        .iconst(types::I32, i64::from(ABI_FAILURE_CHECKED_INTEGER));
+    let call =
+        builder
+            .ins()
+            .call_indirect(signature, callback, &[user_data, callsite, failure_kind]);
+    let status = builder.inst_results(call)[0];
+    builder.ins().return_(&[status]);
+
+    builder.switch_to_block(success);
+}
+
 fn lower_binary(
     builder: &mut FunctionBuilder<'_>,
     op: BinaryOp,
@@ -1066,7 +1195,7 @@ fn integer_condition(op: BinaryOp, ty: Type) -> IntCC {
         BinaryOp::LessEqual => IntCC::SignedLessThanOrEqual,
         BinaryOp::Greater => IntCC::SignedGreaterThan,
         BinaryOp::GreaterEqual => IntCC::SignedGreaterThanOrEqual,
-        _ => unreachable!("checked integer arithmetic is rejected by validation"),
+        _ => unreachable!("integer arithmetic is lowered separately"),
     }
 }
 
@@ -1094,10 +1223,6 @@ fn clif_type(ty: Type) -> cranelift_codegen::ir::Type {
         Type::F32 => types::F32,
         _ => unreachable!("validation rejects non-scalar boundary types"),
     }
-}
-
-fn value_type(transform: &Transform, id: ValueId) -> Type {
-    transform.values[id.0 as usize].ty
 }
 
 fn required_value(values: &[Option<LoweredValue>], id: ValueId) -> LoweredValue {
@@ -1201,16 +1326,6 @@ mod tests {
 
     #[test]
     fn rejects_semantics_not_yet_preserved_by_the_native_backend() {
-        let checked_integer = crate::compile(
-            "integer.tima",
-            "transform add(left: i64, right: i64) -> i64 { return left + right }\n",
-        )
-        .unwrap();
-        let diagnostics = CraneliftBackend
-            .emit(&checked_integer.transforms)
-            .unwrap_err();
-        assert!(diagnostics[0].message.contains("checked i64 arithmetic"));
-
         let unsupported_world_call = crate::compile(
             "world.tima",
             "transform read() -> i64 uses env.read { return environment_i64(\"MODE\") }\n",
@@ -1227,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_native_admission_and_transitive_fallback_reasons() {
+    fn admits_checked_integer_calls_transitively() {
         let compiled = crate::compile(
             "plan.tima",
             "transform scale(value: f32, factor: f32) -> f32 { return value * factor }\n\
@@ -1244,17 +1359,11 @@ mod tests {
         assert!(plan[0].native_compatible);
         assert!(plan[0].fallback_reasons.is_empty());
         assert_eq!(plan[1].name, "checked");
-        assert!(!plan[1].native_compatible);
-        assert_eq!(
-            plan[1].fallback_reasons,
-            ["Cranelift AOT does not yet lower checked i64 arithmetic"]
-        );
+        assert!(plan[1].native_compatible);
+        assert!(plan[1].fallback_reasons.is_empty());
         assert_eq!(plan[2].name, "wrapper");
-        assert!(!plan[2].native_compatible);
-        assert_eq!(
-            plan[2].fallback_reasons,
-            ["calls `checked` which is not native-compatible"]
-        );
+        assert!(plan[2].native_compatible);
+        assert!(plan[2].fallback_reasons.is_empty());
         assert_eq!(
             CraneliftBackend::supported_transforms(&compiled.transforms),
             plan.iter()
@@ -1264,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn admits_unindexed_buffer_maps_and_reports_indexed_maps() {
+    fn admits_indexed_and_unindexed_buffer_maps() {
         let compiled = crate::compile(
             "buffers.tima",
             "transform scale(buffer: Buffer, factor: f32) -> Buffer {\n\
@@ -1282,11 +1391,8 @@ mod tests {
 
         assert!(plan[0].native_compatible);
         assert!(plan[1].native_compatible);
-        assert!(!plan[2].native_compatible);
-        assert_eq!(
-            plan[2].fallback_reasons,
-            ["indexed Buffer byte maps are outside the current Cranelift AOT subset"]
-        );
+        assert!(plan[2].native_compatible);
+        assert!(plan[2].fallback_reasons.is_empty());
     }
 
     #[test]

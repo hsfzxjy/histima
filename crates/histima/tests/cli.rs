@@ -612,11 +612,8 @@ fn cli_hybrid_aot_matches_interpreter_semantics_and_reuses_artifacts() {
         .iter()
         .find(|transform| transform["name"] == "checked")
         .unwrap();
-    assert_eq!(checked_plan["execution"], "interpreter-fallback");
-    assert_eq!(
-        checked_plan["fallback_reasons"],
-        json!(["Cranelift AOT does not yet lower checked i64 arithmetic"])
-    );
+    assert_eq!(checked_plan["execution"], "native");
+    assert_eq!(checked_plan["fallback_reasons"], json!([]));
     assert_eq!(first_native["bindings"]["out"]["type"], "bytes");
     assert_eq!(
         first_native["bindings"]["out"]["byte_length"],
@@ -739,6 +736,8 @@ fn cli_runs_the_repository_site_asset_workflow() {
     assert_eq!(first["records"].as_array().unwrap().len(), 5);
     assert_eq!(first["result_stock_policy"], "reachable-invocations");
     assert_eq!(first["stocked_results"].as_array().unwrap().len(), 8);
+    assert_eq!(first["artifact_cache"], "miss");
+    assert!(first["artifact"].is_object());
     let stocked_transforms = first["stocked_results"]
         .as_array()
         .unwrap()
@@ -828,20 +827,16 @@ fn cli_runs_the_repository_site_asset_workflow() {
     );
     let repeated_json = json_output(&repeated);
     assert_eq!(repeated_json["execution_engine"], "hybrid-aot");
-    assert_eq!(repeated_json["artifact"], Value::Null);
+    assert_eq!(repeated_json["artifact_cache"], "hit");
+    assert_eq!(repeated_json["artifact"], first["artifact"]);
     let darken_plan = repeated_json["aot_plan"]["source_transforms"]
         .as_array()
         .unwrap()
         .iter()
         .find(|transform| transform["name"] == "darken")
         .unwrap();
-    assert_eq!(darken_plan["execution"], "interpreter-fallback");
-    assert!(
-        darken_plan["fallback_reasons"][0]
-            .as_str()
-            .unwrap()
-            .contains("indexed Buffer byte maps")
-    );
+    assert_eq!(darken_plan["execution"], "native");
+    assert_eq!(darken_plan["fallback_reasons"], json!([]));
     assert_eq!(json_output(&repeated)["stocked_results"], json!([]));
     assert_eq!(json_output(&repeated)["records"], first["records"]);
 

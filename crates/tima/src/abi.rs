@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use crate::ir::Type;
 
 /// ABI epoch for ahead-of-time native artifacts.
-pub const TIMA_ABI_VERSION: u32 = 2;
+pub const TIMA_ABI_VERSION: u32 = 3;
 
 pub const ABI_VALUE_WORDS: usize = 8;
 pub const ABI_VALUE_BYTES: usize = ABI_VALUE_WORDS * size_of::<u64>();
@@ -37,6 +37,8 @@ pub const ABI_WORLD_ENVIRONMENT_READ: u32 = 1;
 pub const ABI_WORLD_FILE_READ: u32 = 2;
 pub const ABI_WORLD_HTTP_GET: u32 = 3;
 
+pub const ABI_FAILURE_CHECKED_INTEGER: u32 = 1;
+
 pub type AbiAllocateFn = unsafe extern "C" fn(
     user_data: *mut c_void,
     kind: u32,
@@ -53,6 +55,9 @@ pub type AbiWorldCallFn = unsafe extern "C" fn(
     result: *mut AbiValue,
 ) -> i32;
 
+pub type AbiFailureFn =
+    unsafe extern "C" fn(user_data: *mut c_void, callsite: u64, failure: u32) -> i32;
+
 /// Host callbacks available to generated native transforms. Native code sees
 /// only this C-compatible table and opaque user data, never Rust runtime
 /// objects or outer values.
@@ -61,6 +66,7 @@ pub struct AbiRuntimeContext {
     pub user_data: *mut c_void,
     pub allocate: AbiAllocateFn,
     pub world_call: AbiWorldCallFn,
+    pub failure: AbiFailureFn,
 }
 
 pub const ABI_RUNTIME_USER_DATA_OFFSET: i32 =
@@ -69,6 +75,7 @@ pub const ABI_RUNTIME_ALLOCATE_OFFSET: i32 =
     std::mem::offset_of!(AbiRuntimeContext, allocate) as i32;
 pub const ABI_RUNTIME_WORLD_CALL_OFFSET: i32 =
     std::mem::offset_of!(AbiRuntimeContext, world_call) as i32;
+pub const ABI_RUNTIME_FAILURE_OFFSET: i32 = std::mem::offset_of!(AbiRuntimeContext, failure) as i32;
 
 pub const fn abi_callsite(transform: u32, value: u32) -> u64 {
     ((transform as u64) << 32) | value as u64

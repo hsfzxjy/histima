@@ -11,9 +11,10 @@ use libloading::Library;
 use crate::abi::{
     ABI_ALLOCATION_BUFFER, ABI_ALLOCATION_BYTES, ABI_ALLOCATION_STRING,
     ABI_BUFFER_DIMENSION_0_WORD, ABI_BUFFER_DIMENSION_1_WORD, ABI_BUFFER_DIMENSION_2_WORD,
-    ABI_BUFFER_OUTER_STRIDE_WORD, ABI_BUFFER_RANK_WORD, ABI_CAPACITY_WORD, ABI_LENGTH_WORD,
-    ABI_POINTER_WORD, ABI_STATUS_OK, ABI_STATUS_RUNTIME, ABI_WORLD_ENVIRONMENT_READ,
-    ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET, AbiRuntimeContext, AbiValue, abi_callsite,
+    ABI_BUFFER_OUTER_STRIDE_WORD, ABI_BUFFER_RANK_WORD, ABI_CAPACITY_WORD,
+    ABI_FAILURE_CHECKED_INTEGER, ABI_LENGTH_WORD, ABI_POINTER_WORD, ABI_STATUS_OK,
+    ABI_STATUS_RUNTIME, ABI_WORLD_ENVIRONMENT_READ, ABI_WORLD_FILE_READ, ABI_WORLD_HTTP_GET,
+    AbiRuntimeContext, AbiValue, abi_callsite,
 };
 use crate::backend::ArtifactBackend;
 use crate::backend::cache::{CachedArtifact, NativeArtifactCache};
@@ -340,6 +341,23 @@ unsafe extern "C" fn abi_world_call(
     ABI_STATUS_OK
 }
 
+unsafe extern "C" fn abi_failure(user_data: *mut c_void, callsite: u64, failure: u32) -> i32 {
+    // SAFETY: `NativeModule::invoke_with_capabilities` installs this exact
+    // state for the duration of the native call.
+    let state = unsafe { &mut *user_data.cast::<NativeCallState<'_, '_>>() };
+    let span = state.span(callsite);
+    match failure {
+        ABI_FAILURE_CHECKED_INTEGER => state.fail(Diagnostic::error(
+            "integer arithmetic overflow or division by zero",
+            span,
+        )),
+        _ => state.fail(Diagnostic::error(
+            format!("native transform reported unknown failure kind {failure}"),
+            span,
+        )),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct NativeSignature {
     parameters: Vec<Type>,
@@ -456,7 +474,13 @@ impl NativeModule {
                 span: transform.span,
             });
             for (value_index, value) in transform.values.iter().enumerate() {
-                if matches!(&value.kind, ValueKind::RuntimeCall(_)) {
+                if matches!(&value.kind, ValueKind::RuntimeCall(_))
+                    || matches!(
+                        &value.kind,
+                        ValueKind::Binary { op, left, .. }
+                            if op.is_arithmetic() && transform.value(*left).ty == Type::I64
+                    )
+                {
                     call_spans.insert(
                         abi_callsite(native_index as u32, value_index as u32),
                         value.span,
@@ -563,6 +587,7 @@ impl NativeModule {
             user_data: std::ptr::from_mut(&mut state).cast(),
             allocate: abi_allocate,
             world_call: abi_world_call,
+            failure: abi_failure,
         };
         // SAFETY: argument/result descriptors match the statically checked
         // signature, borrowed buffers and the runtime callback table outlive
@@ -1153,15 +1178,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(native.contains(TransformId(0)));
-        assert!(!native.contains(TransformId(1)));
-        assert!(!native.contains(TransformId(2)));
+        assert!(native.contains(TransformId(1)));
+        assert!(native.contains(TransformId(2)));
     }
 
     #[test]
     fn modules_without_supported_transforms_need_no_load_library() {
         let compiled = crate::compile(
             "interpreted.tima",
-            "transform checked(left: i64, right: i64) -> i64 { return left + right }\n",
+            "transform legacy() -> i64 uses env.read { return environment_i64(\"MODE\") }\n",
         )
         .unwrap();
         assert!(

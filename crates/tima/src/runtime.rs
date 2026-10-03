@@ -3298,6 +3298,7 @@ mod tests {
             &[
                 "bool_identity",
                 "int_identity",
+                "int_add",
                 "float_identity",
                 "float_math",
                 "float_less",
@@ -3309,7 +3310,7 @@ mod tests {
                 "own_bytes",
                 "view_bytes",
             ],
-            &["int_add"],
+            &[],
         );
 
         for execution in [&executions.interpreted, &executions.hybrid] {
@@ -3424,18 +3425,33 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_fallback_preserves_checked_integer_failures() {
+    fn interpreter_and_aot_report_the_same_checked_integer_failures() {
         let world = FixedWorld::empty();
-        for (case, expression) in [
-            ("integer-overflow", "value + 1"),
-            ("integer-division-by-zero", "value / 0"),
+        for (case, operation, left, right) in [
+            ("integer-add-overflow", "+", i64::MAX, 1),
+            ("integer-subtract-overflow", "-", i64::MIN, 1),
+            ("integer-multiply-overflow", "*", i64::MAX, 2),
+            ("integer-division-by-zero", "/", i64::MAX, 0),
+            ("integer-division-overflow", "/", i64::MIN, -1),
         ] {
             let source = format!(
-                "transform checked(value: i64) -> i64 {{ return {expression} }}\n\
-                 out = checked(9223372036854775807)\n"
+                "transform checked(left: i64, right: i64) -> i64 {{\n\
+                     return left {operation} right\n\
+                 }}\n\
+                 out = checked(left, right)\n"
             );
+            let bindings = BTreeMap::from([
+                (
+                    "left".to_owned(),
+                    OuterValue::plain(ValueData::Integer(left)),
+                ),
+                (
+                    "right".to_owned(),
+                    OuterValue::plain(ValueData::Integer(right)),
+                ),
+            ]);
             let (interpreted, hybrid) =
-                execute_engine_pair(case, &source, BTreeMap::new(), &world, &[], &["checked"]);
+                execute_engine_pair(case, &source, bindings, &world, &["checked"], &[]);
             assert_eq!(interpreted.unwrap_err(), hybrid.unwrap_err());
         }
     }
@@ -4341,8 +4357,8 @@ mod tests {
                 ),
             )]),
             &world,
-            &[],
             &["darken_byte", "darken"],
+            &[],
         );
 
         for execution in [&executions.interpreted, &executions.hybrid] {
