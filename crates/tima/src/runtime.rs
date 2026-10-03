@@ -2652,11 +2652,14 @@ fn checked_u8(value: i64, span: Span) -> Result<u8, Diagnostic> {
 mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::backend::native::NativeModule;
     use crate::cache::TransformResultCache;
-    use crate::capability::RuntimeCapabilities;
+    use crate::capability::{RuntimeCapabilities, World};
+    use crate::diagnostic::Diagnostic;
     use crate::fraction::Fraction;
     use crate::identity::{
         ContentIdentity, IdentityDomain, IdentityPrefixResolver, byte_content_identity,
@@ -2667,9 +2670,9 @@ mod tests {
     use crate::plugin::{PluginDefinition, PluginParameter, PluginRegistry, PluginValueType};
     use crate::runtime::{
         BufferValue, HybridAotEngine, IrInterpreter, OuterValue, ReplayDependencyResolver,
-        TransformEngine, ValueData, execute, execute_aot_cached_with_capabilities, execute_cached,
-        execute_cached_with_capabilities, execute_cached_with_capabilities_and_identity_prefixes,
-        execute_with, execute_with_capabilities, freeze_interpreted_value, invoke_transform,
+        TransformEngine, ValueData, execute, execute_cached, execute_cached_with_capabilities,
+        execute_cached_with_capabilities_and_identity_prefixes, execute_with,
+        execute_with_capabilities, freeze_interpreted_value, invoke_transform,
         lower_interpreted_value, replay, replay_with_capabilities, replay_with_dependencies,
     };
     use crate::source::Span;
@@ -2695,6 +2698,16 @@ mod tests {
         environment: BTreeMap<String, Vec<u8>>,
         files: BTreeMap<String, Vec<u8>>,
         urls: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl FixedWorld {
+        fn empty() -> Self {
+            Self {
+                environment: BTreeMap::new(),
+                files: BTreeMap::new(),
+                urls: BTreeMap::new(),
+            }
+        }
     }
 
     impl RuntimeCapabilities for FixedWorld {
@@ -2724,6 +2737,316 @@ mod tests {
                 .get(url)
                 .cloned()
                 .ok_or_else(|| format!("HTTP URL `{url}` is unavailable"))
+        }
+    }
+
+    struct EngineExecutions {
+        interpreted: super::Execution,
+        hybrid: super::Execution,
+    }
+
+    static CONFORMANCE_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn conformance_artifact_root(case: &str) -> PathBuf {
+        let sequence = CONFORMANCE_ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("build")
+            .join(format!(
+                "engine-conformance-{case}-{}-{sequence}",
+                std::process::id()
+            ))
+    }
+
+    /// Runs the typed-IR interpreter as the reference semantics and the hybrid
+    /// engine over the same compiled program, inputs, and World. The support
+    /// assertions keep native coverage distinct from intentional fallback.
+    fn execute_engine_pair(
+        case: &str,
+        source: &str,
+        bindings: BTreeMap<String, OuterValue>,
+        world: &dyn World,
+        native_transforms: &[&str],
+        interpreted_transforms: &[&str],
+    ) -> (
+        Result<super::Execution, Vec<Diagnostic>>,
+        Result<super::Execution, Vec<Diagnostic>>,
+    ) {
+        let compiled = crate::compile(format!("{case}.tima"), source).unwrap();
+        let native = NativeModule::build(
+            &compiled.transforms,
+            &compiled.identities,
+            conformance_artifact_root(case),
+        )
+        .unwrap();
+
+        for name in native_transforms {
+            let (id, _) = compiled
+                .transforms
+                .find(name)
+                .unwrap_or_else(|| panic!("missing conformance transform `{name}`"));
+            assert!(
+                native.as_ref().is_some_and(|module| module.contains(id)),
+                "conformance transform `{name}` must execute through Cranelift"
+            );
+        }
+        for name in interpreted_transforms {
+            let (id, _) = compiled
+                .transforms
+                .find(name)
+                .unwrap_or_else(|| panic!("missing conformance transform `{name}`"));
+            assert!(
+                !native.as_ref().is_some_and(|module| module.contains(id)),
+                "conformance transform `{name}` must exercise the documented interpreter fallback"
+            );
+        }
+
+        let interpreted = execute_with(
+            &compiled,
+            &IrInterpreter {
+                module: &compiled.transforms,
+                capabilities: Some(world),
+            },
+            bindings.clone(),
+            None,
+            None,
+        );
+        let hybrid = execute_with(
+            &compiled,
+            &HybridAotEngine {
+                interpreter: IrInterpreter {
+                    module: &compiled.transforms,
+                    capabilities: Some(world),
+                },
+                native: native.as_ref(),
+            },
+            bindings,
+            None,
+            None,
+        );
+        (interpreted, hybrid)
+    }
+
+    fn assert_successful_engine_conformance(
+        case: &str,
+        source: &str,
+        bindings: BTreeMap<String, OuterValue>,
+        world: &dyn World,
+        native_transforms: &[&str],
+        interpreted_transforms: &[&str],
+    ) -> EngineExecutions {
+        let (interpreted, hybrid) = execute_engine_pair(
+            case,
+            source,
+            bindings,
+            world,
+            native_transforms,
+            interpreted_transforms,
+        );
+        let interpreted = interpreted.unwrap_or_else(|diagnostics| {
+            panic!("reference interpreter failed for {case}: {diagnostics:#?}")
+        });
+        let hybrid = hybrid
+            .unwrap_or_else(|diagnostics| panic!("hybrid AOT failed for {case}: {diagnostics:#?}"));
+        assert_execution_semantics(case, &interpreted, &hybrid);
+        EngineExecutions {
+            interpreted,
+            hybrid,
+        }
+    }
+
+    fn assert_execution_semantics(
+        case: &str,
+        interpreted: &super::Execution,
+        hybrid: &super::Execution,
+    ) {
+        assert_eq!(
+            interpreted.bindings.keys().collect::<Vec<_>>(),
+            hybrid.bindings.keys().collect::<Vec<_>>(),
+            "binding sets differ for {case}"
+        );
+        for (name, interpreted) in &interpreted.bindings {
+            assert_outer_value_semantics(
+                &format!("{case} binding `{name}`"),
+                interpreted,
+                &hybrid.bindings[name],
+            );
+        }
+        match (&interpreted.last_value, &hybrid.last_value) {
+            (Some(interpreted), Some(hybrid)) => {
+                assert_outer_value_semantics(&format!("{case} last value"), interpreted, hybrid);
+            }
+            (None, None) => {}
+            _ => panic!("last-value presence differs for {case}"),
+        }
+    }
+
+    fn assert_outer_value_semantics(label: &str, left: &OuterValue, right: &OuterValue) {
+        assert_value_data_semantics(label, &left.data, &right.data);
+        match (&left.lineage, &right.lineage) {
+            (Some(left), Some(right)) => assert_lineage_semantics(label, left, right),
+            (None, None) => {}
+            _ => panic!("lineage presence differs for {label}"),
+        }
+        match (content_identity(left), content_identity(right)) {
+            (Ok(left), Ok(right)) => assert_eq!(left, right, "Content ID differs for {label}"),
+            (Err(left), Err(right)) => assert_eq!(left.to_string(), right.to_string()),
+            _ => panic!("content identity availability differs for {label}"),
+        }
+    }
+
+    fn assert_value_data_semantics(label: &str, left: &ValueData, right: &ValueData) {
+        match (left, right) {
+            (ValueData::Null, ValueData::Null) => {}
+            (ValueData::Bool(left), ValueData::Bool(right)) => assert_eq!(left, right, "{label}"),
+            (ValueData::Integer(left), ValueData::Integer(right)) => {
+                assert_eq!(left, right, "{label}");
+            }
+            (ValueData::Float(left), ValueData::Float(right)) => {
+                assert_eq!(
+                    left.to_bits(),
+                    right.to_bits(),
+                    "f32 bits differ for {label}"
+                );
+            }
+            (ValueData::Fraction(left), ValueData::Fraction(right)) => {
+                assert_eq!(left, right, "{label}");
+            }
+            (ValueData::String(left), ValueData::String(right)) => {
+                assert_eq!(left, right, "{label}");
+            }
+            (ValueData::Bytes(left), ValueData::Bytes(right)) => {
+                assert_eq!(left, right, "{label}");
+            }
+            (ValueData::List(left), ValueData::List(right)) => {
+                assert_eq!(left.len(), right.len(), "list length differs for {label}");
+                for (index, (left, right)) in left.iter().zip(right.iter()).enumerate() {
+                    assert_outer_value_semantics(&format!("{label}[{index}]"), left, right);
+                }
+            }
+            (ValueData::Record(left), ValueData::Record(right)) => {
+                assert_eq!(
+                    left.keys().collect::<Vec<_>>(),
+                    right.keys().collect::<Vec<_>>(),
+                    "record fields differ for {label}"
+                );
+                for (name, left) in left.iter() {
+                    assert_outer_value_semantics(&format!("{label}.{name}"), left, &right[name]);
+                }
+            }
+            (ValueData::Asset(left), ValueData::Asset(right)) => {
+                assert_eq!(left, right, "{label}");
+            }
+            (ValueData::Buffer(left), ValueData::Buffer(right)) => {
+                assert_eq!(
+                    left.shape(),
+                    right.shape(),
+                    "Buffer shape differs for {label}"
+                );
+                assert_eq!(
+                    left.outer_stride(),
+                    right.outer_stride(),
+                    "Buffer stride differs for {label}"
+                );
+                assert_eq!(
+                    left.to_vec(),
+                    right.to_vec(),
+                    "Buffer bytes differ for {label}"
+                );
+            }
+            (ValueData::Transform(left), ValueData::Transform(right)) => {
+                assert_eq!(left, right, "{label}");
+            }
+            (ValueData::Lineage(left), ValueData::Lineage(right)) => {
+                assert_lineage_semantics(label, left, right);
+            }
+            _ => panic!(
+                "result types differ for {label}: {} versus {}",
+                value_kind(left),
+                value_kind(right)
+            ),
+        }
+    }
+
+    fn value_kind(value: &ValueData) -> &'static str {
+        match value {
+            ValueData::Null => "Null",
+            ValueData::Bool(_) => "bool",
+            ValueData::Integer(_) => "i64",
+            ValueData::Float(_) => "f32",
+            ValueData::Fraction(_) => "Fraction",
+            ValueData::String(_) => "String",
+            ValueData::Bytes(_) => "Bytes",
+            ValueData::List(_) => "List",
+            ValueData::Record(_) => "Record",
+            ValueData::Asset(_) => "Asset",
+            ValueData::Buffer(_) => "Buffer",
+            ValueData::Transform(_) => "Transform",
+            ValueData::Lineage(_) => "Lineage",
+        }
+    }
+
+    fn assert_lineage_semantics(label: &str, left: &Lineage, right: &Lineage) {
+        match (left.node(), right.node()) {
+            (LineageNode::Source(left), LineageNode::Source(right)) => {
+                assert_eq!(left, right, "source lineage differs for {label}");
+            }
+            (LineageNode::ExternalObservation(left), LineageNode::ExternalObservation(right)) => {
+                assert_eq!(left, right, "observation lineage differs for {label}");
+            }
+            (LineageNode::Invocation(left), LineageNode::Invocation(right)) => {
+                assert_eq!(left.transform_name, right.transform_name, "{label}");
+                assert_eq!(left.transform_id, right.transform_id, "{label}");
+                assert_eq!(
+                    left.recipe_id, right.recipe_id,
+                    "Recipe ID differs for {label}"
+                );
+                assert_eq!(left.arguments.len(), right.arguments.len(), "{label}");
+                for (index, (left, right)) in left
+                    .arguments
+                    .iter()
+                    .zip(right.arguments.iter())
+                    .enumerate()
+                {
+                    let argument_label = format!("{label} argument {index}");
+                    assert_eq!(left.name, right.name, "{argument_label}");
+                    assert_eq!(
+                        left.semantic_identity, right.semantic_identity,
+                        "{argument_label}"
+                    );
+                    assert_recorded_value_semantics(&argument_label, &left.value, &right.value);
+                    match (&left.lineage, &right.lineage) {
+                        (Some(left), Some(right)) => {
+                            assert_lineage_semantics(&argument_label, left, right);
+                        }
+                        (None, None) => {}
+                        _ => panic!("argument lineage presence differs for {argument_label}"),
+                    }
+                }
+                assert_eq!(left.observations.len(), right.observations.len(), "{label}");
+                for (index, (left, right)) in left
+                    .observations
+                    .iter()
+                    .zip(right.observations.iter())
+                    .enumerate()
+                {
+                    assert_lineage_semantics(&format!("{label} observation {index}"), left, right);
+                }
+            }
+            _ => panic!("lineage node types differ for {label}"),
+        }
+    }
+
+    fn assert_recorded_value_semantics(label: &str, left: &RecordedValue, right: &RecordedValue) {
+        match (left, right) {
+            (RecordedValue::Float(left), RecordedValue::Float(right)) => {
+                assert_eq!(
+                    left.to_bits(),
+                    right.to_bits(),
+                    "f32 bits differ for {label}"
+                );
+            }
+            _ => assert_eq!(left, right, "recorded value differs for {label}"),
         }
     }
 
@@ -2949,73 +3272,151 @@ mod tests {
     }
 
     #[test]
-    fn aot_executes_supported_scalars_and_interprets_the_rest() {
-        let compiled = crate::compile(
-            "hybrid.tima",
-            "transform scale(x: f32, factor: f32) -> f32 { return x * factor }\n\
-             transform checked(left: i64, right: i64) -> i64 { return left + right }\n\
-             native_out = scale(8.0, 0.25)\n\
-             interpreted_out = checked(20, 22)\n",
-        )
-        .unwrap();
-        let world = FixedWorld {
-            environment: BTreeMap::new(),
-            files: BTreeMap::new(),
-            urls: BTreeMap::new(),
-        };
-        let mut cache = TransformResultCache::default();
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build")
-            .join(format!("aot-runtime-{}", std::process::id()));
-        let execution =
-            execute_aot_cached_with_capabilities(&compiled, &mut cache, &world, root).unwrap();
-        assert!(execution.artifact.is_some());
-        assert_eq!(
-            execution.execution.bindings["native_out"].data,
-            ValueData::Float(2.0)
+    fn interpreter_and_aot_share_scalar_call_and_boundary_semantics() {
+        let world = FixedWorld::empty();
+        let executions = assert_successful_engine_conformance(
+            "scalar-boundary",
+            "transform bool_identity(value: bool) -> bool { return value }
+             transform int_identity(value: i64) -> i64 { return value }
+             transform int_add(left: i64, right: i64) -> i64 { return left + right }
+             transform float_identity(value: f32) -> f32 { return value }
+             transform float_math(left: f32, right: f32) -> f32 {
+                 return left * right + right
+             }
+             transform float_less(left: f32, right: f32) -> bool { return left < right }
+             transform choose(flag: bool, left: f32, right: f32) -> f32 {
+                 if flag { return left } else { return right }
+             }
+             transform halve(value: f32) -> f32 { return value * 0.5 }
+             transform through_call(value: f32) -> f32 { return halve(value) }
+             transform own_text(value: String) -> String { return value }
+             transform view_text(value: StringView) -> StringView { return value }
+             transform own_bytes(value: Bytes) -> Bytes { return value }
+             transform view_bytes(value: BytesView) -> BytesView { return value }
+             bool_out = bool_identity(true)
+             integer_out = int_identity(42)
+             integer_sum = int_add(20, 22)
+             float_out = float_math(8.0, 0.25)
+             less_out = float_less(0.25, 0.5)
+             branch_out = choose(false, 1.0, 2.0)
+             call_out = through_call(8.0)
+             negative_zero_out = float_identity(negative_zero)
+             nan_out = float_identity(payload_nan)
+             owned_text = own_text(text)
+             viewed_text = view_text(text)
+             owned_bytes = own_bytes(blob)
+             viewed_bytes = view_bytes(blob)
+            ",
+            BTreeMap::from([
+                (
+                    "negative_zero".to_owned(),
+                    OuterValue::plain(ValueData::Float(f32::from_bits(0x8000_0000))),
+                ),
+                (
+                    "payload_nan".to_owned(),
+                    OuterValue::plain(ValueData::Float(f32::from_bits(0x7fc0_1234))),
+                ),
+                (
+                    "text".to_owned(),
+                    OuterValue::plain(ValueData::String(Arc::new("hello".to_owned()))),
+                ),
+                (
+                    "blob".to_owned(),
+                    OuterValue::plain(ValueData::Bytes(Arc::new(vec![1, 2, 3, 4]))),
+                ),
+            ]),
+            &world,
+            &[
+                "bool_identity",
+                "int_identity",
+                "float_identity",
+                "float_math",
+                "float_less",
+                "choose",
+                "halve",
+                "through_call",
+                "own_text",
+                "view_text",
+                "own_bytes",
+                "view_bytes",
+            ],
+            &["int_add"],
         );
-        assert_eq!(
-            execution.execution.bindings["interpreted_out"].data,
-            ValueData::Integer(42)
-        );
+
+        for execution in [&executions.interpreted, &executions.hybrid] {
+            let ValueData::Float(negative_zero) = execution.bindings["negative_zero_out"].data
+            else {
+                panic!("expected f32 result")
+            };
+            assert_eq!(negative_zero.to_bits(), 0x8000_0000);
+            let ValueData::Float(payload_nan) = execution.bindings["nan_out"].data else {
+                panic!("expected f32 result")
+            };
+            assert_eq!(payload_nan.to_bits(), 0x7fc0_1234);
+
+            let ValueData::String(text) = &execution.bindings["text"].data else {
+                panic!("expected original String")
+            };
+            let ValueData::String(owned_text) = &execution.bindings["owned_text"].data else {
+                panic!("expected owned String result")
+            };
+            let ValueData::String(viewed_text) = &execution.bindings["viewed_text"].data else {
+                panic!("expected StringView result")
+            };
+            assert!(!Arc::ptr_eq(text, owned_text));
+            assert!(Arc::ptr_eq(text, viewed_text));
+
+            let ValueData::Bytes(blob) = &execution.bindings["blob"].data else {
+                panic!("expected original Bytes")
+            };
+            let ValueData::Bytes(owned_bytes) = &execution.bindings["owned_bytes"].data else {
+                panic!("expected owned Bytes result")
+            };
+            let ValueData::Bytes(viewed_bytes) = &execution.bindings["viewed_bytes"].data else {
+                panic!("expected BytesView result")
+            };
+            assert!(!Arc::ptr_eq(blob, owned_bytes));
+            assert!(Arc::ptr_eq(blob, viewed_bytes));
+        }
     }
 
     #[test]
-    fn aot_world_reads_preserve_observations_and_freeze_host_allocations() {
-        let compiled = crate::compile(
-            "native-world.tima",
-            "transform load() -> Bytes uses file.read {
-                 return file.read(\"asset.bin\")
-             }
-             transform label() -> StringView { return \"native\" }
-             out = load()
-             name = label()
-",
-        )
-        .unwrap();
+    fn interpreter_and_aot_share_world_observations_lineage_and_content() {
         let world = FixedWorld {
-            environment: BTreeMap::new(),
+            environment: BTreeMap::from([("MODE".to_owned(), b"release".to_vec())]),
             files: BTreeMap::from([("asset.bin".to_owned(), vec![1, 2, 3, 4])]),
-            urls: BTreeMap::new(),
+            urls: BTreeMap::from([("https://example.test/data".to_owned(), vec![5, 6, 7, 8])]),
         };
-        let mut cache = TransformResultCache::default();
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build")
-            .join(format!("aot-world-runtime-{}", std::process::id()));
-        let execution =
-            execute_aot_cached_with_capabilities(&compiled, &mut cache, &world, root).unwrap();
-        assert!(execution.artifact.is_some());
+        let executions = assert_successful_engine_conformance(
+            "world-operations",
+            "transform environment(key: StringView) -> String uses env.read {
+                 return env.read(key)
+             }
+             transform file(path: StringView) -> Bytes uses file.read {
+                 return file.read(path)
+             }
+             transform http(url: StringView) -> Bytes uses http.get {
+                 return http.get(url)
+             }
+             mode = environment(\"MODE\")
+             local = file(\"asset.bin\")
+             remote = http(\"https://example.test/data\")
+            ",
+            BTreeMap::new(),
+            &world,
+            &["environment", "file", "http"],
+            &[],
+        );
+
         assert_eq!(
-            execution.execution.bindings["out"].data,
+            executions.hybrid.bindings["local"].data,
             ValueData::Bytes(Arc::new(vec![1, 2, 3, 4]))
         );
         assert_eq!(
-            execution.execution.bindings["name"].data,
-            ValueData::String(Arc::new("native".to_owned()))
+            executions.hybrid.bindings["mode"].data,
+            ValueData::String(Arc::new("release".to_owned()))
         );
-        let lineage = execution.execution.bindings["out"]
+        let lineage = executions.hybrid.bindings["local"]
             .lineage
             .as_ref()
             .unwrap();
@@ -3033,6 +3434,41 @@ mod tests {
             observation.observed_content,
             byte_content_identity(&[1, 2, 3, 4])
         );
+    }
+
+    #[test]
+    fn interpreter_and_aot_report_the_same_world_callback_failure() {
+        let world = FixedWorld::empty();
+        let (interpreted, hybrid) = execute_engine_pair(
+            "world-failure",
+            "transform load() -> Bytes uses file.read {
+                 return file.read(\"missing.bin\")
+             }
+             out = load()
+            ",
+            BTreeMap::new(),
+            &world,
+            &["load"],
+            &[],
+        );
+        assert_eq!(interpreted.unwrap_err(), hybrid.unwrap_err());
+    }
+
+    #[test]
+    fn hybrid_fallback_preserves_checked_integer_failures() {
+        let world = FixedWorld::empty();
+        for (case, expression) in [
+            ("integer-overflow", "value + 1"),
+            ("integer-division-by-zero", "value / 0"),
+        ] {
+            let source = format!(
+                "transform checked(value: i64) -> i64 {{ return {expression} }}\n\
+                 out = checked(9223372036854775807)\n"
+            );
+            let (interpreted, hybrid) =
+                execute_engine_pair(case, &source, BTreeMap::new(), &world, &[], &["checked"]);
+            assert_eq!(interpreted.unwrap_err(), hybrid.unwrap_err());
+        }
     }
 
     #[test]
@@ -3720,79 +4156,6 @@ mod tests {
     }
 
     #[test]
-    fn native_owned_strings_and_bytes_detach_while_views_alias() {
-        let compiled = crate::compile(
-            "native-buffers.tima",
-            "transform own_text(value: String) -> String { return value }\n\
-             transform view_text(value: StringView) -> StringView { return value }\n\
-             transform own_bytes(value: Bytes) -> Bytes { return value }\n\
-             transform view_bytes(value: BytesView) -> BytesView { return value }\n\
-             owned_text = own_text(text)\n\
-             viewed_text = view_text(text)\n\
-             owned_bytes = own_bytes(blob)\n\
-             viewed_bytes = view_bytes(blob)\n",
-        )
-        .unwrap();
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build")
-            .join(format!("native-buffer-runtime-{}", std::process::id()));
-        let native = NativeModule::build(&compiled.transforms, &compiled.identities, root)
-            .unwrap()
-            .unwrap();
-        let engine = HybridAotEngine {
-            interpreter: IrInterpreter {
-                module: &compiled.transforms,
-                capabilities: None,
-            },
-            native: Some(&native),
-        };
-        let execution = execute_with(
-            &compiled,
-            &engine,
-            BTreeMap::from([
-                (
-                    "text".to_owned(),
-                    OuterValue::plain(ValueData::String(Arc::new("hello".to_owned()))),
-                ),
-                (
-                    "blob".to_owned(),
-                    OuterValue::plain(ValueData::Bytes(Arc::new(vec![1, 2, 3, 4]))),
-                ),
-            ]),
-            None,
-            None,
-        )
-        .unwrap();
-
-        let ValueData::String(text) = &execution.bindings["text"].data else {
-            panic!("expected original string")
-        };
-        let ValueData::String(owned_text) = &execution.bindings["owned_text"].data else {
-            panic!("expected owned string result")
-        };
-        let ValueData::String(viewed_text) = &execution.bindings["viewed_text"].data else {
-            panic!("expected string view result")
-        };
-        assert_eq!(owned_text.as_str(), "hello");
-        assert!(!Arc::ptr_eq(text, owned_text));
-        assert!(Arc::ptr_eq(text, viewed_text));
-
-        let ValueData::Bytes(blob) = &execution.bindings["blob"].data else {
-            panic!("expected original bytes")
-        };
-        let ValueData::Bytes(owned_bytes) = &execution.bindings["owned_bytes"].data else {
-            panic!("expected owned bytes result")
-        };
-        let ValueData::Bytes(viewed_bytes) = &execution.bindings["viewed_bytes"].data else {
-            panic!("expected bytes view result")
-        };
-        assert_eq!(owned_bytes.as_slice(), &[1, 2, 3, 4]);
-        assert!(!Arc::ptr_eq(blob, owned_bytes));
-        assert!(Arc::ptr_eq(blob, viewed_bytes));
-    }
-
-    #[test]
     fn unique_owned_string_and_byte_allocations_cross_the_interpreter_without_copying() {
         let text = String::from("allocation stays put");
         let text_pointer = text.as_ptr();
@@ -3825,8 +4188,9 @@ mod tests {
 
     #[test]
     fn hybrid_aot_falls_back_for_buffer_maps() {
-        let compiled = crate::compile(
-            "buffer-map-fallback.tima",
+        let world = FixedWorld::empty();
+        let executions = assert_successful_engine_conformance(
+            "buffer-map-fallback",
             "transform choose(current: u8, target: u8, replacement: u8) -> u8 {\n\
                  if current == target { return replacement } else { return current }\n\
              }\n\
@@ -3835,70 +4199,42 @@ mod tests {
                  return img\n\
              }\n\
              out = replace(img, target, replacement)\n",
-        )
-        .unwrap();
-        let bindings = BTreeMap::from([
-            (
-                "img".to_owned(),
-                OuterValue::buffer(
-                    BufferValue::new(vec![2, 3], 4, vec![1, 2, 1, 8, 3, 1, 4, 1]).unwrap(),
+            BTreeMap::from([
+                (
+                    "img".to_owned(),
+                    OuterValue::buffer(
+                        BufferValue::new(vec![2, 3], 4, vec![1, 2, 1, 8, 3, 1, 4, 1]).unwrap(),
+                    ),
                 ),
-            ),
-            (
-                "target".to_owned(),
-                OuterValue::plain(ValueData::Integer(1)),
-            ),
-            (
-                "replacement".to_owned(),
-                OuterValue::plain(ValueData::Integer(9)),
-            ),
-        ]);
-        let interpreted = execute_with(
-            &compiled,
-            &IrInterpreter {
-                module: &compiled.transforms,
-                capabilities: None,
-            },
-            bindings.clone(),
-            None,
-            None,
-        )
-        .unwrap();
+                (
+                    "target".to_owned(),
+                    OuterValue::plain(ValueData::Integer(1)),
+                ),
+                (
+                    "replacement".to_owned(),
+                    OuterValue::plain(ValueData::Integer(9)),
+                ),
+            ]),
+            &world,
+            &["choose"],
+            &["replace"],
+        );
 
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("build")
-            .join(format!(
-                "buffer-map-fallback-runtime-{}",
-                std::process::id()
-            ));
-        let native_module = NativeModule::build(&compiled.transforms, &compiled.identities, root)
-            .unwrap()
-            .unwrap();
-        let native = execute_with(
-            &compiled,
-            &HybridAotEngine {
-                interpreter: IrInterpreter {
-                    module: &compiled.transforms,
-                    capabilities: None,
-                },
-                native: Some(&native_module),
-            },
-            bindings,
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(native.bindings["out"], interpreted.bindings["out"]);
-        let ValueData::Buffer(original) = &native.bindings["img"].data else {
-            panic!("expected original Buffer")
-        };
-        let ValueData::Buffer(result) = &native.bindings["out"].data else {
-            panic!("expected mapped Buffer")
-        };
-        assert_eq!(original.bytes(), &[1, 2, 1, 8, 3, 1, 4, 1]);
-        assert_eq!(result.bytes(), &[9, 2, 9, 8, 3, 9, 4, 9]);
+        for execution in [&executions.interpreted, &executions.hybrid] {
+            let ValueData::Buffer(original) = &execution.bindings["img"].data else {
+                panic!("expected original Buffer")
+            };
+            let ValueData::Buffer(result) = &execution.bindings["out"].data else {
+                panic!("expected mapped Buffer")
+            };
+            assert_eq!(original.shape(), &[2, 3]);
+            assert_eq!(original.outer_stride(), 4);
+            assert_eq!(original.bytes(), &[1, 2, 1, 8, 3, 1, 4, 1]);
+            assert_eq!(result.shape(), &[2, 3]);
+            assert_eq!(result.outer_stride(), 4);
+            assert_eq!(result.bytes(), &[9, 2, 9, 8, 3, 9, 4, 9]);
+            assert!(!original.shares_storage_with(result));
+        }
     }
 
     #[test]
