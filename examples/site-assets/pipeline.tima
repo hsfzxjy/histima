@@ -1,0 +1,28 @@
+transform darken_byte(value: u8, offset: i64, factor: f32) -> u8 {
+    pixel = offset / 4
+    alpha = pixel * 4 + 3
+    if offset == alpha {
+        return value
+    } else {
+        return u8.scale(value, factor)
+    }
+}
+
+transform darken(buffer: Buffer, factor: f32) -> Buffer {
+    for byte, offset in buffer.bytes {
+        byte = darken_byte(byte, offset, factor)
+    }
+    return buffer
+}
+
+hero_source = asset("inputs/hero.ppm")
+hero_buffer = hero_source | read | ppm.decode | darken(0.72)
+hero_png = hero_buffer | png.encode(compression=6)
+hero_webp = hero_buffer | webp.encode(quality=84)
+
+thumbnail_source = asset("inputs/thumbnail.ppm")
+thumbnail_buffer = thumbnail_source | read | ppm.decode | darken(0.82)
+thumbnail_png = thumbnail_buffer | png.encode(compression=6)
+thumbnail_webp = thumbnail_buffer | webp.encode(quality=78)
+
+trace(hero_webp)

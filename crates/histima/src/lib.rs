@@ -713,11 +713,9 @@ impl Workspace {
 
     pub fn import_file(&mut self, path: impl AsRef<Path>) -> Result<ImportedAsset> {
         let path = path.as_ref();
-        let locator = path
-            .to_str()
-            .ok_or_else(|| Error::NonUtf8Locator(path.to_owned()))?;
+        let locator = asset_locator(path)?;
         let bytes = fs::read(path).map_err(|error| Error::io("read source asset", path, error))?;
-        self.import_bytes(locator, &bytes)
+        self.import_bytes(&locator, &bytes)
     }
 
     pub fn read_asset(&self, locator: &str) -> Result<Vec<u8>> {
@@ -1116,6 +1114,17 @@ impl Workspace {
     }
 }
 
+fn asset_locator(path: &Path) -> Result<String> {
+    let locator = path
+        .to_str()
+        .ok_or_else(|| Error::NonUtf8Locator(path.to_owned()))?;
+    Ok(if cfg!(windows) {
+        locator.replace('\\', "/")
+    } else {
+        locator.to_owned()
+    })
+}
+
 fn migrate_legacy_catalog(root: &Path) -> Result<()> {
     let catalog = root.join(CATALOG_FILE_NAME);
     let legacy = root.join(LEGACY_CATALOG_FILE_NAME);
@@ -1221,6 +1230,12 @@ mod tests {
     use tima::identity::byte_content_identity;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn imported_asset_locators_use_portable_path_separators() {
+        let path = PathBuf::from("assets").join("nested").join("source.bin");
+        assert_eq!(asset_locator(&path).unwrap(), "assets/nested/source.bin");
+    }
 
     #[test]
     fn workspace_applies_catalog_migrations_and_connection_policy() {

@@ -11,7 +11,7 @@ The repository currently provides:
 - immutable outer values, calls, pipelines, registered codecs, lineage, replay,
   and Recipe-ID result caching;
 - statically checked transforms lowered to backend-neutral typed Tima IR;
-- a production typed-IR interpreter with owned mutable inner values,
+- a reference/default typed-IR interpreter with owned mutable inner values,
   read-only aliasable views, and freeze-on-return;
 - one call/lineage/replay path for source Tima, standard, and registered-Wasm
   transforms, also exposed to Rust hosts as `runtime::invoke_transform`, plus
@@ -33,8 +33,9 @@ String, and Bytes transforms with `cargo run -p tima -- run-native
 program.tima`. The latter is a hybrid path: Buffer operations and other
 unsupported transforms remain interpreted. Supported inner transform calls
 are linked in the same artifact; a caller falls back to the interpreter when
-any transitive callee is unsupported. Histima still uses the interpreter while
-the remaining Buffer operations and World callbacks are implemented.
+any transitive callee is unsupported. Normal Histima execution defaults to the
+reference interpreter and accepts `run ... --engine hybrid-aot` as an explicit
+product-level choice.
 
 ## Build and try it
 
@@ -49,6 +50,7 @@ cargo run -p histima -- verify build/my-workspace
 cargo run -p histima -- search build/my-workspace png
 cargo run -p histima -- pipeline build/my-workspace 'asset("examples/tiny.ppm") | read | ppm.decode | webp.encode(quality=85)'
 cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --record out
+cargo run -p histima -- run build/my-workspace examples/image_pipeline.tima --engine hybrid-aot --record out
 cargo run -p histima -- trace build/my-workspace <recipe-id>
 cargo run -p histima -- expression build/my-workspace <recipe-id>
 cargo run -p histima -- replay build/my-workspace examples/image_pipeline.tima <recipe-id>
@@ -69,10 +71,16 @@ execution-history recency.
 `histima import [workspace] <source-path>...` imports one or more explicit
 files. Add `--recursive` to traverse directory arguments in deterministic
 lexical order; recursive traversal rejects symbolic links instead of following
-them. A single non-recursive file retains the original output shape, while a
+them. Imported filesystem locators use `/` separators on every platform so the
+same locator can appear in portable Tima source. A single non-recursive file retains the original output shape, while a
 batch reports every imported asset in order. When positional workspace/source
 arguments would be ambiguous, `--workspace <path>` selects the workspace
 explicitly.
+
+The runnable [website asset workflow](examples/site-assets/README.md) imports
+multiple sources, applies a user-defined generic Buffer transform, emits PNG
+and WebP results, and walks through cache reuse, trace, replay, recipe
+expression rendering, and materialization.
 
 Catalog listings use bounded SQLite keyset pagination. `histima assets` and
 `histima recipes` accept `--limit <1-100>` and return `next_cursor` when more

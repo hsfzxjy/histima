@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -70,7 +70,7 @@ fn cli_imports_inspects_and_materializes_across_processes() {
     assert_success(&assets);
     assert!(stdout(&assets).contains("count = 1"));
     assert!(stdout(&assets).contains("truncated = false"));
-    assert_eq!(field(&assets, "asset[0].locator"), text(&source));
+    assert_eq!(field(&assets, "asset[0].locator"), portable(&source));
     assert_eq!(field(&assets, "asset[0].content_id"), content_id);
 
     let inspected = histima(["inspect", "content", text(&workspace), &content_id]);
@@ -150,10 +150,10 @@ fn cli_batch_imports_explicit_files_and_directories_in_stable_order() {
     assert_eq!(
         locators,
         vec![
-            text(&first),
-            text(&directory.join("a.bin")),
-            text(&nested.join("m.bin")),
-            text(&directory.join("z.bin")),
+            portable(&first),
+            portable(&directory.join("a.bin")),
+            portable(&nested.join("m.bin")),
+            portable(&directory.join("z.bin")),
         ]
     );
 
@@ -170,8 +170,8 @@ fn cli_batch_imports_explicit_files_and_directories_in_stable_order() {
     assert_success(&nearest);
     let nearest = json_output(&nearest);
     assert_eq!(nearest["count"], 2);
-    assert_eq!(nearest["assets"][0]["locator"], text(&second));
-    assert_eq!(nearest["assets"][1]["locator"], text(&third));
+    assert_eq!(nearest["assets"][0]["locator"], portable(&second));
+    assert_eq!(nearest["assets"][1]["locator"], portable(&third));
 
     let stats = histima(["stats", text(&workspace), "--json"]);
     assert_success(&stats);
@@ -656,6 +656,111 @@ fn cli_hybrid_aot_matches_interpreter_semantics_and_reuses_artifacts() {
     let invalid = histima(["run", text(&workspace), text(&script), "--engine", "jit"]);
     assert!(!invalid.status.success());
     assert!(stderr(&invalid).contains("expected interpreter or hybrid-aot"));
+}
+
+#[test]
+fn cli_runs_the_repository_site_asset_workflow() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let materialized = test.path().join("hero.webp");
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/site-assets");
+
+    assert_success(&histima_in(&example, ["init", text(&workspace)]));
+    let imported = histima_in(
+        &example,
+        [
+            "import",
+            "--workspace",
+            text(&workspace),
+            "inputs",
+            "--recursive",
+            "--json",
+        ],
+    );
+    assert_success(&imported);
+    let imported = json_output(&imported);
+    assert_eq!(imported["count"], 2);
+    assert_eq!(imported["assets"][0]["locator"], "inputs/hero.ppm");
+    assert_eq!(imported["assets"][1]["locator"], "inputs/thumbnail.ppm");
+
+    let first = histima_in(
+        &example,
+        [
+            "run",
+            text(&workspace),
+            "pipeline.tima",
+            "--record",
+            "hero_webp",
+            "--json",
+        ],
+    );
+    assert_success(&first);
+    let first = json_output(&first);
+    assert_eq!(first["bindings"]["hero_buffer"]["shape"], json!([2, 4, 4]));
+    assert_eq!(
+        first["bindings"]["thumbnail_buffer"]["shape"],
+        json!([2, 2, 4])
+    );
+    let recipe_id = json_string(&first["recorded"], "recipe_id").to_owned();
+    let content_id = json_string(&first["recorded"], "content_id").to_owned();
+    assert!(first["trace"].as_str().unwrap().contains("invoke darken"));
+    assert!(
+        first["trace"]
+            .as_str()
+            .unwrap()
+            .contains("invoke webp.encode")
+    );
+
+    let repeated = histima_in(
+        &example,
+        [
+            "run",
+            text(&workspace),
+            "pipeline.tima",
+            "--record",
+            "hero_webp",
+            "--json",
+        ],
+    );
+    assert_success(&repeated);
+    assert!(
+        json_output(&repeated)["result_cache"]["hits"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    let expression = histima_in(&example, ["expression", text(&workspace), &recipe_id]);
+    assert_success(&expression);
+    assert!(stdout(&expression).contains("darken#"));
+    assert!(stdout(&expression).contains(&recipe_id));
+
+    let replay = histima_in(
+        &example,
+        [
+            "replay",
+            text(&workspace),
+            "pipeline.tima",
+            &recipe_id,
+            "--json",
+        ],
+    );
+    assert_success(&replay);
+    assert_eq!(json_output(&replay)["content_id"], content_id);
+
+    let materialize = histima_in(
+        &example,
+        [
+            "materialize",
+            text(&workspace),
+            &content_id,
+            text(&materialized),
+        ],
+    );
+    assert_success(&materialize);
+    let bytes = fs::read(materialized).unwrap();
+    assert!(bytes.starts_with(b"RIFF"));
+    assert_eq!(&bytes[8..12], b"WEBP");
 }
 
 #[test]

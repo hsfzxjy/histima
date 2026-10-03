@@ -1,9 +1,16 @@
-transform darken(img: Image, factor: f32) -> Image {
-    for p in img.pixels {
-        p.r *= factor
-        p.g *= factor
-        p.b *= factor
+transform darken_byte(value: u8, offset: i64, factor: f32) -> u8 {
+    pixel = offset / 4
+    alpha = pixel * 4 + 3
+    if offset == alpha {
+        return value
+    } else {
+        return u8.scale(value, factor)
     }
+}
 
-    return img
+transform darken(buffer: Buffer, factor: f32) -> Buffer {
+    for byte, offset in buffer.bytes {
+        byte = darken_byte(byte, offset, factor)
+    }
+    return buffer
 }
