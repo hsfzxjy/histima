@@ -55,7 +55,7 @@ fn cli_imports_inspects_and_materializes_across_processes() {
 
     let initialized = histima(["init", text(&workspace)]);
     assert_success(&initialized);
-    assert!(stdout(&initialized).contains("schema_version = 6"));
+    assert!(stdout(&initialized).contains("schema_version = 7"));
 
     let imported = histima(["import", text(&workspace), text(&source)]);
     assert_success(&imported);
@@ -476,7 +476,7 @@ fn cli_summarizes_bounded_actionable_workspace_state() {
     assert_success(&summary);
     let summary = json_output(&summary);
     assert_eq!(summary["workspace"], text(&workspace));
-    assert_eq!(summary["catalog"]["schema_version"], 6);
+    assert_eq!(summary["catalog"]["schema_version"], 7);
     assert_eq!(summary["catalog"]["foreign_keys_enabled"], true);
     assert_eq!(summary["counts"]["source_heads"], 2);
     assert_eq!(summary["counts"]["recipe_results"], 2);
@@ -690,6 +690,8 @@ fn cli_runs_the_repository_site_asset_workflow() {
             text(&workspace),
             "pipeline.tima",
             "--record",
+            "hero_buffer",
+            "--record",
             "hero_png",
             "--record",
             "hero_webp",
@@ -708,7 +710,15 @@ fn cli_runs_the_repository_site_asset_workflow() {
         json!([2, 2, 4])
     );
     assert_eq!(first["recorded"], Value::Null);
-    assert_eq!(first["records"].as_array().unwrap().len(), 4);
+    assert_eq!(first["records"].as_array().unwrap().len(), 5);
+    let hero_buffer = first["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["binding"] == "hero_buffer")
+        .unwrap();
+    let buffer_recipe_id = json_string(hero_buffer, "recipe_id").to_owned();
+    let buffer_content_id = json_string(hero_buffer, "content_id").to_owned();
     let hero_webp = first["records"]
         .as_array()
         .unwrap()
@@ -732,6 +742,8 @@ fn cli_runs_the_repository_site_asset_workflow() {
             text(&workspace),
             "pipeline.tima",
             "--record",
+            "hero_buffer",
+            "--record",
             "hero_png",
             "--record",
             "hero_webp",
@@ -747,7 +759,7 @@ fn cli_runs_the_repository_site_asset_workflow() {
         json_output(&repeated)["result_cache"]["hits"]
             .as_u64()
             .unwrap()
-            >= 4
+            >= 5
     );
     assert_eq!(json_output(&repeated)["records"], first["records"]);
 
@@ -768,6 +780,37 @@ fn cli_runs_the_repository_site_asset_workflow() {
     );
     assert_success(&replay);
     assert_eq!(json_output(&replay)["content_id"], content_id);
+
+    let buffer_replay = histima_in(
+        &example,
+        [
+            "replay",
+            text(&workspace),
+            "pipeline.tima",
+            &buffer_recipe_id,
+            "--json",
+        ],
+    );
+    assert_success(&buffer_replay);
+    let buffer_replay = json_output(&buffer_replay);
+    assert_eq!(buffer_replay["content_id"], buffer_content_id);
+    assert_eq!(buffer_replay["replayed"]["type"], "buffer");
+    assert_eq!(buffer_replay["replayed"]["shape"], json!([2, 4, 4]));
+
+    let buffer_content = histima_in(
+        &example,
+        [
+            "inspect",
+            "content",
+            text(&workspace),
+            &buffer_content_id,
+            "--json",
+        ],
+    );
+    assert_success(&buffer_content);
+    let buffer_content = json_output(&buffer_content);
+    assert_eq!(buffer_content["kind"], "buffer");
+    assert_eq!(buffer_content["valid"], true);
 
     let materialize = histima_in(
         &example,
@@ -1050,7 +1093,7 @@ fn cli_json_covers_the_workspace_lifecycle() {
     let initialized = histima(["--json", "init", text(&workspace)]);
     assert_success(&initialized);
     let initialized = json_output(&initialized);
-    assert_eq!(initialized["schema_version"], 6);
+    assert_eq!(initialized["schema_version"], 7);
     assert_eq!(initialized["journal_mode"], "wal");
 
     let imported = histima(["import", text(&workspace), &source_locator, "--json"]);

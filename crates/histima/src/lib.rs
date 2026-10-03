@@ -27,7 +27,7 @@ use tima::plugin::{PluginDefinition, PluginParameter, PluginRegistry, PluginValu
 use tima::runtime::{OuterValue, ValueData};
 use tima::transform::{TransformInfo, TransformOrigin};
 
-use cas::{ContentKind, ContentStore};
+use cas::{ContentStore, decode_typed_value};
 use catalog::{Catalog, validate_artifact_identities};
 
 const CATALOG_FILE_NAME: &str = ".histima.sql3";
@@ -1002,14 +1002,15 @@ impl Workspace {
         atomic_file::write_new(destination.as_ref(), &bytes)
     }
 
-    /// Persists one invocation-derived immutable byte value and its semantic
-    /// lineage. Other outer value encodings remain intentionally unsupported.
+    /// Persists one invocation-derived immutable Bytes or Buffer value and its
+    /// semantic lineage. Other outer value encodings remain unsupported.
     pub fn record_value(&mut self, value: &OuterValue) -> Result<RecordedResult> {
-        let ValueData::Bytes(bytes) = &value.data else {
+        if !matches!(value.data, ValueData::Bytes(_) | ValueData::Buffer(_)) {
             return Err(Error::ValueNotRecordable(
-                "durable recording currently supports only immutable byte values".to_owned(),
+                "durable recording currently supports only immutable Bytes and Buffer values"
+                    .to_owned(),
             ));
-        };
+        }
         let Some(lineage) = &value.lineage else {
             return Err(Error::ValueNotRecordable(
                 "durable recording requires transform invocation lineage".to_owned(),
@@ -1020,7 +1021,7 @@ impl Workspace {
                 "durable recording requires transform invocation lineage".to_owned(),
             ));
         }
-        let content = self.content.put_bytes_value(bytes)?;
+        let content = self.content.put_typed_value(value)?;
         let trace = self.catalog.record_result(lineage, &content)?;
         Ok(RecordedResult {
             recipe_id: trace.recipe_id,
@@ -1076,9 +1077,6 @@ impl Workspace {
         let Some(object) = self.catalog.content(identity)? else {
             return Ok(None);
         };
-        if object.kind != ContentKind::Bytes {
-            return Ok(None);
-        }
         let bytes =
             self.content
                 .read_recorded(&object.content_id, &object.relative_path, object.kind)?;
@@ -1090,7 +1088,7 @@ impl Workspace {
                 bytes.len()
             )));
         }
-        Ok(Some(OuterValue::plain(ValueData::Bytes(Arc::new(bytes)))))
+        decode_typed_value(object.kind, &bytes)
     }
 
     pub fn catalog_info(&self) -> Result<CatalogInfo> {
@@ -1245,7 +1243,7 @@ mod tests {
         assert_eq!(
             workspace.catalog_info().unwrap(),
             CatalogInfo {
-                schema_version: 6,
+                schema_version: 7,
                 foreign_keys_enabled: true,
                 journal_mode: "wal".to_owned(),
             }

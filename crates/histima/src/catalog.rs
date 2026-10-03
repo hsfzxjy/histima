@@ -16,7 +16,7 @@ use crate::cas::{ContentKind, StoredContent};
 use crate::error::{Error, Result};
 use crate::stored_lineage::StoredRecipe;
 
-const LATEST_SCHEMA_VERSION: i64 = 6;
+const LATEST_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_LIST_LIMIT: usize = 100;
 
 const MIGRATION_1: &str = r#"
@@ -154,6 +154,15 @@ CREATE INDEX world_snapshots_content_idx ON world_snapshots(content_id);
 const MIGRATION_6: &str = r#"
 CREATE INDEX lineage_invocations_transform_name_recipe_idx
     ON lineage_invocations(transform_name, recipe_id);
+"#;
+
+// `contents.kind` was frozen by migration 2 with a `raw|bytes` CHECK. Keep
+// that compatible storage column intact and add new semantic value kinds here.
+const MIGRATION_7: &str = r#"
+CREATE TABLE content_value_kinds (
+    content_id TEXT PRIMARY KEY REFERENCES contents(content_id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL CHECK (kind IN ('buffer'))
+) STRICT;
 "#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,8 +391,11 @@ impl Catalog {
         let identity = identity.to_string();
         self.connection
             .query_row(
-                "SELECT content_id, byte_length, relative_path, kind
-                 FROM contents WHERE content_id = ?1",
+                "SELECT content.content_id, content.byte_length, content.relative_path,
+                        COALESCE(value_kind.kind, content.kind)
+                 FROM contents AS content
+                 LEFT JOIN content_value_kinds AS value_kind USING (content_id)
+                 WHERE content.content_id = ?1",
                 [&identity],
                 |row| {
                     Ok((
@@ -458,8 +470,11 @@ impl Catalog {
 
     pub fn all_contents(&self) -> Result<Vec<CatalogObject>> {
         let mut statement = self.connection.prepare(
-            "SELECT content_id, byte_length, relative_path, kind
-             FROM contents ORDER BY content_id",
+            "SELECT content.content_id, content.byte_length, content.relative_path,
+                    COALESCE(value_kind.kind, content.kind)
+             FROM contents AS content
+             LEFT JOIN content_value_kinds AS value_kind USING (content_id)
+             ORDER BY content.content_id",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -1220,6 +1235,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         (4_i64, "backend-neutral artifact metadata", MIGRATION_4),
         (5_i64, "retained World observations", MIGRATION_5),
         (6_i64, "recipe transform-name query index", MIGRATION_6),
+        (7_i64, "extended content value kinds", MIGRATION_7),
     ] {
         if version <= current {
             continue;
@@ -1239,6 +1255,12 @@ fn insert_content(transaction: &Transaction<'_>, content: &StoredContent) -> Res
     let byte_len = i64::try_from(content.byte_len)
         .map_err(|_| Error::catalog("content byte length does not fit SQLite INTEGER"))?;
     let content_id = content.identity.to_string();
+    // Migration 2 constrained this legacy column to raw/bytes. Buffer files
+    // are byte storage whose semantic kind is carried by `content_value_kinds`.
+    let storage_kind = match content.kind {
+        ContentKind::Buffer => ContentKind::Bytes,
+        kind => kind,
+    };
     transaction.execute(
         "INSERT OR IGNORE INTO contents(content_id, byte_length, relative_path, kind)
          VALUES (?1, ?2, ?3, ?4)",
@@ -1246,11 +1268,22 @@ fn insert_content(transaction: &Transaction<'_>, content: &StoredContent) -> Res
             content_id,
             byte_len,
             content.relative_path,
-            content.kind.as_str()
+            storage_kind.as_str()
         ],
     )?;
+    if content.kind == ContentKind::Buffer {
+        transaction.execute(
+            "INSERT OR IGNORE INTO content_value_kinds(content_id, kind)
+             VALUES (?1, 'buffer')",
+            [&content_id],
+        )?;
+    }
     let recorded = transaction.query_row(
-        "SELECT byte_length, relative_path, kind FROM contents WHERE content_id = ?1",
+        "SELECT content.byte_length, content.relative_path,
+                COALESCE(value_kind.kind, content.kind)
+         FROM contents AS content
+         LEFT JOIN content_value_kinds AS value_kind USING (content_id)
+         WHERE content.content_id = ?1",
         [&content_id],
         |row| {
             Ok((
@@ -1603,7 +1636,7 @@ mod tests {
 
         let catalog = Catalog::open(&database).unwrap();
 
-        assert_eq!(catalog.info().unwrap().schema_version, 6);
+        assert_eq!(catalog.info().unwrap().schema_version, 7);
         assert_eq!(
             catalog
                 .connection
@@ -1611,6 +1644,15 @@ mod tests {
                     .get::<_, String>(0))
                 .unwrap(),
             "raw"
+        );
+        assert_eq!(
+            catalog
+                .connection
+                .query_row("SELECT COUNT(*) FROM content_value_kinds", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
         );
         assert_eq!(
             catalog

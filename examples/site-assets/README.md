@@ -10,11 +10,11 @@ From this directory, create a disposable workspace and run the pipeline:
 ```text
 cargo run --manifest-path ../../Cargo.toml -p histima -- init ../../build/site-assets-work
 cargo run --manifest-path ../../Cargo.toml -p histima -- import --workspace ../../build/site-assets-work inputs --recursive
-cargo run --manifest-path ../../Cargo.toml -p histima -- run ../../build/site-assets-work pipeline.tima --record hero_png --record hero_webp --record thumbnail_png --record thumbnail_webp --json
+cargo run --manifest-path ../../Cargo.toml -p histima -- run ../../build/site-assets-work pipeline.tima --record hero_buffer --record hero_png --record hero_webp --record thumbnail_png --record thumbnail_webp --json
 ```
 
-The last command prints all four recorded Recipe and Content IDs in one
-`records` array. Run it again to
+The last command prints all five recorded Recipe and Content IDs in one
+`records` array, including the immutable intermediate Buffer. Run it again to
 observe result-cache reuse, or select the optional hybrid engine to exercise
 its interpreter fallback for the Buffer transform:
 
@@ -38,10 +38,10 @@ cargo run --manifest-path ../../Cargo.toml -p histima -- materialize ../../build
   stocked only one binding, forcing repeated executions. Repeating
   `--record <binding>` now stocks all selected outputs in one execution and
   reports them through the JSON `records` array.
-- **Runtime problem:** across processes, only explicitly stocked outputs are
-  durable result-cache hits; unrecorded sibling outputs and intermediates are
-  recomputed. Eagerly stocking a successful build graph needs a deliberate
-  storage-policy design.
+- **Runtime problem (partially addressed):** selected immutable Buffers can now
+  be stored, validated, replayed, and reused across processes. Unselected
+  siblings and intermediates are still recomputed; eagerly stocking a complete
+  successful build graph needs a deliberate storage-policy design.
 - **Performance problem:** the indexed Buffer transform intentionally falls
   back to the interpreter under `hybrid-aot`; the current CLI reports the
   engine but does not explain the per-transform fallback decision.

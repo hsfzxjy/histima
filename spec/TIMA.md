@@ -1202,6 +1202,12 @@ for migration/inspection of older workspaces.
 Transform results are cached by Recipe ID and validated against immutable
 content.
 
+Histima's durable result store supports immutable `Bytes` and `Buffer` values.
+A stored Buffer retains its rank, shape, outer stride, and every storage byte,
+including padding; loading reconstructs and validates the Buffer layout before
+cache reuse or replay. Its storage encoding is a host persistence detail and
+does not replace or alter the semantic Buffer Content ID.
+
 A result-cache hit receives the current semantic invocation lineage. The hit
 does not add an execution-history node. Conflicting content for one Recipe ID
 is a reproducibility error.

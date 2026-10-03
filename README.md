@@ -62,7 +62,9 @@ Opening an older workspace migrates `catalog.sqlite3` to that hidden name.
 Add `--json` anywhere for structured output.
 
 `histima run` accepts repeated `--record <binding>` options to stock several
-materialized outputs from one execution. JSON keeps the legacy `recorded`
+materialized `Bytes` or `Buffer` outputs from one execution. Durable Buffer
+storage preserves and validates shape, outer stride, and every storage byte.
+JSON keeps the legacy `recorded`
 object for a single binding and reports every selected result in the `records`
 array; for a multi-record run, `recorded` is null and `records` is authoritative.
 

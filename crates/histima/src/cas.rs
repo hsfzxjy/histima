@@ -11,6 +11,7 @@ use tima::runtime::{OuterValue, ValueData};
 use crate::error::{Error, Result};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const BUFFER_ENCODING_MAGIC: &[u8] = b"HISTIMA-BUFFER\0\x01";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredContent {
@@ -24,6 +25,7 @@ pub(crate) struct StoredContent {
 pub(crate) enum ContentKind {
     Raw,
     Bytes,
+    Buffer,
 }
 
 impl ContentKind {
@@ -31,6 +33,7 @@ impl ContentKind {
         match self {
             Self::Raw => "raw",
             Self::Bytes => "bytes",
+            Self::Buffer => "buffer",
         }
     }
 
@@ -38,6 +41,7 @@ impl ContentKind {
         match value {
             "raw" => Ok(Self::Raw),
             "bytes" => Ok(Self::Bytes),
+            "buffer" => Ok(Self::Buffer),
             _ => Err(Error::catalog(format!("unknown content kind {value:?}"))),
         }
     }
@@ -71,6 +75,23 @@ impl ContentStore {
         let identity = content_identity(&value)
             .map_err(|error| Error::catalog(format!("cannot identify byte value: {error}")))?;
         self.put_known(identity, ContentKind::Bytes, bytes)
+    }
+
+    pub fn put_typed_value(&self, value: &OuterValue) -> Result<StoredContent> {
+        match &value.data {
+            ValueData::Bytes(bytes) => self.put_bytes_value(bytes),
+            ValueData::Buffer(buffer) => {
+                let identity = content_identity(value).map_err(|error| {
+                    Error::catalog(format!("cannot identify Buffer value: {error}"))
+                })?;
+                let encoded = encode_buffer(buffer)?;
+                self.put_known(identity, ContentKind::Buffer, &encoded)
+            }
+            _ => Err(Error::ValueNotRecordable(
+                "durable recording currently supports only immutable Bytes and Buffer values"
+                    .to_owned(),
+            )),
+        }
     }
 
     fn put_known(
@@ -245,7 +266,95 @@ fn identity_for(kind: ContentKind, bytes: &[u8]) -> Result<ContentIdentity> {
             bytes.to_vec(),
         ))))
         .map_err(|error| Error::catalog(format!("cannot identify stored byte value: {error}"))),
+        ContentKind::Buffer => {
+            let value = decode_buffer(bytes)?;
+            content_identity(&OuterValue::buffer(value)).map_err(|error| {
+                Error::catalog(format!("cannot identify stored Buffer value: {error}"))
+            })
+        }
     }
+}
+
+pub(crate) fn decode_typed_value(kind: ContentKind, bytes: &[u8]) -> Result<Option<OuterValue>> {
+    match kind {
+        ContentKind::Raw => Ok(None),
+        ContentKind::Bytes => Ok(Some(OuterValue::plain(ValueData::Bytes(Arc::new(
+            bytes.to_vec(),
+        ))))),
+        ContentKind::Buffer => Ok(Some(OuterValue::buffer(decode_buffer(bytes)?))),
+    }
+}
+
+fn encode_buffer(buffer: &tima::runtime::BufferValue) -> Result<Vec<u8>> {
+    let rank = u8::try_from(buffer.shape().len())
+        .map_err(|_| Error::catalog("Buffer rank does not fit storage encoding"))?;
+    let mut encoded = Vec::with_capacity(
+        BUFFER_ENCODING_MAGIC.len() + 1 + buffer.shape().len() * 8 + 16 + buffer.byte_len(),
+    );
+    encoded.extend_from_slice(BUFFER_ENCODING_MAGIC);
+    encoded.push(rank);
+    for dimension in buffer.shape() {
+        encoded.extend_from_slice(
+            &u64::try_from(*dimension)
+                .map_err(|_| Error::catalog("Buffer dimension does not fit storage encoding"))?
+                .to_le_bytes(),
+        );
+    }
+    encoded.extend_from_slice(
+        &u64::try_from(buffer.outer_stride())
+            .map_err(|_| Error::catalog("Buffer stride does not fit storage encoding"))?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(
+        &u64::try_from(buffer.byte_len())
+            .map_err(|_| Error::catalog("Buffer byte length does not fit storage encoding"))?
+            .to_le_bytes(),
+    );
+    buffer.with_bytes(|bytes| encoded.extend_from_slice(bytes));
+    Ok(encoded)
+}
+
+fn decode_buffer(bytes: &[u8]) -> Result<tima::runtime::BufferValue> {
+    let Some(mut remaining) = bytes.strip_prefix(BUFFER_ENCODING_MAGIC) else {
+        return Err(Error::catalog(
+            "stored Buffer has an invalid encoding header",
+        ));
+    };
+    let (&rank, tail) = remaining
+        .split_first()
+        .ok_or_else(|| Error::catalog("stored Buffer has no encoded rank"))?;
+    remaining = tail;
+    if !(1..=3).contains(&rank) {
+        return Err(Error::catalog(format!(
+            "stored Buffer has invalid rank {rank}"
+        )));
+    }
+    let shape = (0..rank)
+        .map(|_| read_usize(&mut remaining, "dimension"))
+        .collect::<Result<Vec<_>>>()?;
+    let outer_stride = read_usize(&mut remaining, "outer stride")?;
+    let byte_len = read_usize(&mut remaining, "byte length")?;
+    if remaining.len() != byte_len {
+        return Err(Error::catalog(format!(
+            "stored Buffer declares {byte_len} bytes but contains {}",
+            remaining.len()
+        )));
+    }
+    tima::runtime::BufferValue::new(shape, outer_stride, remaining.to_vec())
+        .map_err(|error| Error::catalog(format!("stored Buffer has invalid layout: {error}")))
+}
+
+fn read_usize(bytes: &mut &[u8], field: &str) -> Result<usize> {
+    if bytes.len() < 8 {
+        return Err(Error::catalog(format!(
+            "stored Buffer is truncated before its {field}"
+        )));
+    }
+    let (encoded, remaining) = bytes.split_at(8);
+    *bytes = remaining;
+    let encoded = u64::from_le_bytes(encoded.try_into().expect("slice length was checked"));
+    usize::try_from(encoded)
+        .map_err(|_| Error::catalog(format!("stored Buffer {field} does not fit usize")))
 }
 
 struct PendingFile {
@@ -273,5 +382,57 @@ impl Drop for PendingFile {
     fn drop(&mut self) {
         drop(self.file.take());
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContentKind, decode_typed_value, encode_buffer, identity_for};
+    use tima::identity::content_identity;
+    use tima::runtime::{BufferValue, OuterValue, ValueData};
+
+    #[test]
+    fn buffer_storage_encoding_round_trips_layout_content_and_identity() {
+        let buffer = BufferValue::new(vec![2, 2, 4], 10, (0..20).collect()).unwrap();
+        let expected = content_identity(&OuterValue::buffer(buffer.clone())).unwrap();
+        let encoded = encode_buffer(&buffer).unwrap();
+        assert_eq!(
+            identity_for(ContentKind::Buffer, &encoded).unwrap(),
+            expected
+        );
+
+        let decoded = decode_typed_value(ContentKind::Buffer, &encoded)
+            .unwrap()
+            .unwrap();
+        let ValueData::Buffer(decoded) = decoded.data else {
+            panic!("Buffer storage must decode as an outer Buffer");
+        };
+        assert_eq!(decoded.shape(), &[2, 2, 4]);
+        assert_eq!(decoded.outer_stride(), 10);
+        assert_eq!(
+            decoded.with_bytes(<[u8]>::to_vec),
+            (0..20).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn buffer_storage_encoding_rejects_truncation_and_trailing_bytes() {
+        let buffer = BufferValue::new(vec![2], 2, vec![1, 2]).unwrap();
+        let mut encoded = encode_buffer(&buffer).unwrap();
+        encoded.pop();
+        assert!(
+            decode_typed_value(ContentKind::Buffer, &encoded)
+                .unwrap_err()
+                .to_string()
+                .contains("declares 2 bytes but contains 1")
+        );
+        let mut encoded = encode_buffer(&buffer).unwrap();
+        encoded.push(3);
+        assert!(
+            decode_typed_value(ContentKind::Buffer, &encoded)
+                .unwrap_err()
+                .to_string()
+                .contains("declares 2 bytes but contains 3")
+        );
     }
 }
