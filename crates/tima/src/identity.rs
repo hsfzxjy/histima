@@ -803,6 +803,142 @@ mod tests {
                 1,
             )
         );
+        assert_ne!(
+            base,
+            registered_wasm_transform_identity(
+                "fixture.encode",
+                1,
+                5,
+                &[("buffer", 2), ("quality", 3)],
+                1,
+            )
+        );
+        assert_ne!(
+            base,
+            registered_wasm_transform_identity(
+                "fixture.encode",
+                1,
+                4,
+                &[("buffer", 3), ("quality", 2)],
+                1,
+            )
+        );
+        assert_ne!(
+            base,
+            registered_wasm_transform_identity(
+                "fixture.encode",
+                1,
+                4,
+                &[("quality", 3), ("buffer", 2)],
+                1,
+            )
+        );
+        assert_ne!(
+            base,
+            registered_wasm_transform_identity(
+                "fixture.encode",
+                1,
+                4,
+                &[("buffer", 2), ("quality", 3)],
+                2,
+            )
+        );
+    }
+
+    #[test]
+    fn hash_ir_equivalence_corpus_excludes_source_only_distinctions() {
+        let cases = [
+            (
+                "formatting and source names",
+                "transform first(left: i64) -> i64 { return left + 2 }\n",
+                "// same semantics\ntransform renamed(right:i64)->i64 {\n return right+2\n}\n",
+            ),
+            (
+                "local names",
+                "transform f(x: i64) -> i64 { value = x * 2; return value }\n",
+                "transform g(y: i64) -> i64 { renamed = y * 2; return renamed }\n",
+            ),
+            (
+                "capability declaration order",
+                "transform f() -> i64 uses env.read, file.read { return 1 }\n",
+                "transform g() -> i64 uses file.read, env.read { return 1 }\n",
+            ),
+            (
+                "normalized buffer fill surface",
+                "transform f(data: Buffer, byte: u8) -> Buffer { return buffer_fill(data, byte) }\n",
+                "transform g(data: Buffer, byte: u8) -> Buffer { for item in data.bytes { item = byte }; return data }\n",
+            ),
+        ];
+
+        for (label, first, second) in cases {
+            assert_eq!(
+                single_transform_id(first),
+                single_transform_id(second),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_ir_distinction_corpus_includes_tima_semantics() {
+        let cases = [
+            (
+                "parameter type",
+                "transform f(value: i64) -> i64 { return value }\n",
+                "transform f(value: f32) -> f32 { return value }\n",
+            ),
+            (
+                "parameter order",
+                "transform f(first: i64, second: f32) -> i64 { return first }\n",
+                "transform f(first: f32, second: i64) -> i64 { return second }\n",
+            ),
+            (
+                "constant value",
+                "transform f() -> f32 { return 0.0 }\n",
+                "transform f() -> f32 { return 1.0 }\n",
+            ),
+            (
+                "binary operation",
+                "transform f(a: i64, b: i64) -> i64 { return a + b }\n",
+                "transform f(a: i64, b: i64) -> i64 { return a - b }\n",
+            ),
+            (
+                "call argument order",
+                "transform subtract(a: i64, b: i64) -> i64 { return a - b }\ntransform f(a: i64, b: i64) -> i64 { return subtract(a, b) }\n",
+                "transform subtract(a: i64, b: i64) -> i64 { return a - b }\ntransform f(a: i64, b: i64) -> i64 { return subtract(b, a) }\n",
+            ),
+            (
+                "control flow",
+                "transform f(flag: bool, a: i64, b: i64) -> i64 { if flag { return a } else { return b } }\n",
+                "transform f(flag: bool, a: i64, b: i64) -> i64 { if flag { return b } else { return a } }\n",
+            ),
+            (
+                "runtime operation",
+                "transform f() -> Bytes uses file.read { return file.read(\"value\") }\n",
+                "transform f() -> Bytes uses http.get { return http.get(\"value\") }\n",
+            ),
+            (
+                "runtime key",
+                "transform f() -> Bytes uses file.read { return file.read(\"first\") }\n",
+                "transform f() -> Bytes uses file.read { return file.read(\"second\") }\n",
+            ),
+            (
+                "declared authority",
+                "transform f() -> i64 { return 1 }\n",
+                "transform f() -> i64 uses env.read { return 1 }\n",
+            ),
+            (
+                "owned buffer primitive",
+                "transform f(data: Buffer) -> Buffer { return data }\n",
+                "transform f(data: Buffer) -> Buffer { return buffer_zero(data) }\n",
+            ),
+        ];
+
+        for (label, first, second) in cases {
+            let first = named_transform_id(first, "f");
+            let second = named_transform_id(second, "f");
+            assert_ne!(first, second, "{label}");
+        }
     }
 
     #[test]
@@ -1162,6 +1298,20 @@ mod tests {
                 .message
                 .contains("recursive transform definitions")
         );
+    }
+
+    fn single_transform_id(source: &str) -> TransformIdentity {
+        let compiled = crate::compile("corpus.tima", source).unwrap();
+        assert_eq!(compiled.transforms.transforms.len(), 1);
+        compiled.identities.get(TransformId(0))
+    }
+
+    fn named_transform_id(source: &str, name: &str) -> TransformIdentity {
+        let compiled = crate::compile("corpus.tima", source).unwrap();
+        compiled
+            .identities
+            .find(&compiled.transforms, name)
+            .unwrap()
     }
 
     fn hex(bytes: [u8; 32]) -> String {
