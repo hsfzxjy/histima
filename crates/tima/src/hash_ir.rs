@@ -419,6 +419,7 @@ pub(crate) fn external(scheme: &str, name: &str, semantic_version: u32) -> Defin
     external_definition(scheme, name, semantic_version, None, &[], None)
 }
 
+#[cfg(test)]
 pub(crate) fn registered_wasm_external(
     name: &str,
     semantic_version: u32,
@@ -434,6 +435,42 @@ pub(crate) fn registered_wasm_external(
         parameters,
         Some(result),
     )
+}
+
+pub(crate) fn workspace_wasm(
+    name: &str,
+    semantic_version: u32,
+    abi_version: u32,
+    parameters: &[(&str, u8)],
+    result: u8,
+    module_content: [u8; 32],
+) -> Definition {
+    let mut builder = Builder::default();
+    let parameters = parameters
+        .iter()
+        .map(|(name, type_code)| {
+            let parameter = builder.node(
+                histima("external.parameter"),
+                vec![
+                    field("name", Data::Text((*name).to_owned())),
+                    field("type_code", Data::UInt(u64::from(*type_code))),
+                ],
+            );
+            Data::Node(parameter)
+        })
+        .collect();
+    let root = builder.node(
+        histima("definition.workspace-wasm"),
+        vec![
+            field("abi_version", Data::UInt(u64::from(abi_version))),
+            field("module_content", Data::Digest(module_content)),
+            field("name", Data::Text(name.to_owned())),
+            field("parameters", Data::Sequence(parameters)),
+            field("result_type", Data::UInt(u64::from(result))),
+            field("semantic_version", Data::UInt(u64::from(semantic_version))),
+        ],
+    );
+    builder.finish(root)
 }
 
 fn external_definition(

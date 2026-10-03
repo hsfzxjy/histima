@@ -258,6 +258,13 @@ Artifact, and module Content IDs; add `--json` for machine-readable output.
 standard registry with configured workspace plugins and reports implementation
 kind, semantic version, signature, and Transform ID.
 
+Workspace plugin Transform IDs conservatively include the verified module
+Content ID as well as the manifest's name, semantic version, ABI, and
+signature. Replacing module bytes therefore changes Transform ID even if the
+manifest author forgets to bump `semantic_version`, preventing unsafe Recipe
+cache reuse. There is currently no opt-out. Artifact ID remains distinct and
+also records the concrete registered-Wasm execution configuration.
+
 ## Storage, lineage, and identity
 
 The filesystem CAS contains immutable payloads; SQLite contains queryable

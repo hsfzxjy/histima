@@ -809,11 +809,19 @@ the isolation contract.
 
 Built-in Transform ID remains the registry's semantic name/version identity.
 For workspace plugins it includes the namespaced name, semantic version, ABI
-version, ordered parameter names and types, and result type. A registered-Wasm
-Artifact ID is separate and includes Transform ID, ABI/backend configuration,
-and the exact module content identity. Replacing a module while claiming the
-same semantic contract changes Artifact ID but not Transform ID; changing
-observable behavior requires a semantic version bump.
+version, ordered parameter names and types, result type, **and the verified
+module Content ID**. This conservative default prevents result-cache reuse if
+module behavior changes while an author forgets to increment the semantic
+version. The current manifest format has no opt-out or manual
+implementation-equivalence assertion.
+
+A registered-Wasm Artifact ID remains a separate concept. It includes the
+Transform ID, ABI/backend configuration, and exact module content identity.
+Thus identical module and contract data produce the same Transform and
+Artifact IDs; changing module bytes changes both under the default policy.
+Including content in semantic identity is a safety policy, not a conflation of
+the two domains: future execution packaging or backend configuration may
+change Artifact ID without changing Transform ID.
 
 ### 11.2 Workspace-local plugin registration
 
@@ -1135,14 +1143,22 @@ current typed IR), `instructions` (evaluation-order node sequence), and
 `terminator.branch` with `condition`, `then`, and `else`, and
 `terminator.jump` with `target`.
 
-Non-Tima transforms currently use root schema
+Standard and contract-only non-Tima transforms use root schema
 `histima:definition.external-transform@1` with text `scheme` and `name`,
 unsigned `semantic_version`, unit-or-unsigned `interface_version`, ordered
 `parameters`, and unit-or-unsigned `result_type`. Each parameter uses
 `histima:external.parameter@1` with text `name` and unsigned `type_code`.
-Type codes are interpreted by the external scheme. Exact Wasm module bytes and
-Artifact IDs remain outside Hash IR. A richer external contract may define a
-new schema without changing the v1 graph grammar.
+Type codes are interpreted by the external scheme. Its meaning and fields are
+unchanged.
+
+Workspace-provided Wasm transforms use the additive root schema
+`histima:definition.workspace-wasm@1` with text `name`; unsigned
+`semantic_version`, `abi_version`, and `result_type`; ordered `parameters`
+using `histima:external.parameter@1`; and digest `module_content`. The digest
+is the verified module Content ID and is part of semantic identity by the
+workspace safety policy. Artifact IDs remain outside Hash IR. This new schema
+does not change the frozen v1 graph grammar or the existing external-transform
+schema.
 
 Transform ID is:
 
@@ -1164,7 +1180,7 @@ The following golden vectors are normative:
 | `transform keep(value: i64) -> i64 { return value }` | `ee7691ec5931fd0275c2bab44a630077922ccbc60215caf1d75f8f07a6475c35` |
 | the preceding `keep` called by `transform apply(value: i64) -> i64 { return keep(value) }` | `2aed765597ed27f4890088f3467637376071c78815a017efdb4b6419636c2551` |
 | standard operation `ppm.decode`, semantic version 3 | `05b5808b2657b94dce94a07cc7f476f4cc91934da878f3371365968f926154c1` |
-| registered-Wasm `fixture.encode`, semantic version 1, ABI 4, parameters `buffer:2, quality:3`, result 1 | `f365c363fa4e2ea1902a839ada1679deae2bc9a9a0148c2fd1b275a9c8279404` |
+| contract-only registered-Wasm `fixture.encode`, semantic version 1, ABI 4, parameters `buffer:2, quality:3`, result 1 | `f365c363fa4e2ea1902a839ada1679deae2bc9a9a0148c2fd1b275a9c8279404` |
 
 For an encoding-level vector, a one-node graph whose root schema is namespace
 `a`, name `bc`, schema version 1, with no fields, encodes as hexadecimal:

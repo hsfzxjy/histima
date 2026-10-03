@@ -237,12 +237,11 @@ pub fn registered_transform_identity(name: &str, semantic_version: u32) -> Trans
     ))
 }
 
-/// Semantic identity for an explicitly registered Wasm transform contract.
-///
-/// Exact module bytes are deliberately excluded: replacing an artifact with a
-/// semantically equivalent implementation preserves this identity. Parameter
-/// names are included because they are part of outer named-call semantics.
-pub fn registered_wasm_transform_identity(
+/// Contract-only registered-Wasm identity retained for the frozen archival
+/// Hash IR vector. Workspace plugins use [`workspace_wasm_transform_identity`]
+/// so an unacknowledged module replacement cannot retain semantic identity.
+#[cfg(test)]
+pub(crate) fn registered_wasm_transform_identity(
     name: &str,
     semantic_version: u32,
     abi_version: u32,
@@ -255,6 +254,30 @@ pub fn registered_wasm_transform_identity(
         abi_version,
         parameters,
         result,
+    ))
+}
+
+/// Conservative semantic identity for a workspace-provided Wasm transform.
+///
+/// The verified module Content ID is a semantic safety pin in addition to the
+/// manifest contract. Consequently changing module bytes changes Transform ID
+/// even if the author forgets to increment `semantic_version`. Artifact ID
+/// remains separate and describes the concrete Wasm execution artifact.
+pub fn workspace_wasm_transform_identity(
+    name: &str,
+    semantic_version: u32,
+    abi_version: u32,
+    parameters: &[(&str, u8)],
+    result: u8,
+    module_content: ContentIdentity,
+) -> TransformIdentity {
+    hash_transform_definition(&hash_ir::workspace_wasm(
+        name,
+        semantic_version,
+        abi_version,
+        parameters,
+        result,
+        *module_content.as_bytes(),
     ))
 }
 
@@ -765,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_wasm_semantic_identity_includes_the_manifest_contract() {
+    fn archival_registered_wasm_contract_identity_includes_every_contract_field() {
         let base = registered_wasm_transform_identity(
             "fixture.encode",
             1,
@@ -845,6 +868,53 @@ mod tests {
                 4,
                 &[("buffer", 2), ("quality", 3)],
                 2,
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_wasm_identity_includes_contract_and_module_content() {
+        let first_module = byte_content_identity(b"first module");
+        let second_module = byte_content_identity(b"second module");
+        let base = workspace_wasm_transform_identity(
+            "fixture.encode",
+            1,
+            4,
+            &[("buffer", 2)],
+            1,
+            first_module,
+        );
+        assert_eq!(
+            base,
+            workspace_wasm_transform_identity(
+                "fixture.encode",
+                1,
+                4,
+                &[("buffer", 2)],
+                1,
+                first_module,
+            )
+        );
+        assert_ne!(
+            base,
+            workspace_wasm_transform_identity(
+                "fixture.encode",
+                1,
+                4,
+                &[("buffer", 2)],
+                1,
+                second_module,
+            )
+        );
+        assert_ne!(
+            base,
+            workspace_wasm_transform_identity(
+                "fixture.encode",
+                2,
+                4,
+                &[("buffer", 2)],
+                1,
+                first_module,
             )
         );
     }

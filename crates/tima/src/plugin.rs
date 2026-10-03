@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::diagnostic::Diagnostic;
 use crate::identity::{
     ArtifactIdentity, ContentIdentity, TransformIdentity, byte_content_identity,
-    registered_wasm_artifact_identity, registered_wasm_transform_identity,
+    registered_wasm_artifact_identity, workspace_wasm_transform_identity,
 };
 use crate::ir::Type;
 use crate::registered::RegisteredTransform;
@@ -139,12 +139,13 @@ impl PluginRegistry {
                 .iter()
                 .map(|parameter| (parameter.name.as_str(), parameter.value_type.identity_tag()))
                 .collect::<Vec<_>>();
-            let identity = registered_wasm_transform_identity(
+            let identity = workspace_wasm_transform_identity(
                 &definition.name,
                 definition.semantic_version,
                 definition.abi_version,
                 &parameter_contract,
                 definition.result.identity_tag(),
+                observed_content,
             );
             let artifact_identity = registered_wasm_artifact_identity(
                 identity,
@@ -406,6 +407,7 @@ fn type_name(value_type: PluginValueType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::recipe_identity;
     use crate::source::Span;
 
     const PPM_DECODE: &[u8] = include_bytes!("../../../plugins/ppm-decode/ppm_decode.wasm");
@@ -492,19 +494,43 @@ mod tests {
     }
 
     #[test]
-    fn semantic_contract_and_module_artifact_identities_remain_distinct() {
+    fn workspace_module_content_safely_pins_semantics_and_artifacts() {
         let ppm = PluginRegistry::new([decoder_definition("fixture.decode", PPM_DECODE.to_vec())])
             .unwrap();
+        let same_ppm =
+            PluginRegistry::new([decoder_definition("fixture.decode", PPM_DECODE.to_vec())])
+                .unwrap();
         let png = PluginRegistry::new([decoder_definition("fixture.decode", PNG_DECODE.to_vec())])
             .unwrap();
 
         assert_eq!(
+            ppm.find("fixture.decode").unwrap().identity(),
+            same_ppm.find("fixture.decode").unwrap().identity()
+        );
+        assert_eq!(
+            ppm.artifact_identities().next().unwrap(),
+            same_ppm.artifact_identities().next().unwrap()
+        );
+        assert_ne!(
             ppm.find("fixture.decode").unwrap().identity(),
             png.find("fixture.decode").unwrap().identity()
         );
         assert_ne!(
             ppm.artifact_identities().next().unwrap(),
             png.artifact_identities().next().unwrap()
+        );
+        let argument = byte_content_identity(b"same invocation input");
+        assert_ne!(
+            recipe_identity(
+                ppm.find("fixture.decode").unwrap().identity(),
+                &[argument.into()],
+                &[],
+            ),
+            recipe_identity(
+                png.find("fixture.decode").unwrap().identity(),
+                &[argument.into()],
+                &[],
+            )
         );
     }
 }

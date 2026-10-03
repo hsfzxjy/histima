@@ -1070,12 +1070,13 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
     let module_path = plugin_directory.join("fixture.wasm");
     fs::write(&module_path, &module).unwrap();
     let module_content = tima::identity::byte_content_identity(&module);
-    let transform_id = tima::identity::registered_wasm_transform_identity(
+    let transform_id = tima::identity::workspace_wasm_transform_identity(
         "fixture.encode",
         1,
         4,
         &[("buffer", 2)],
         1,
+        module_content,
     );
     fs::write(
         plugin_directory.join("fixture.toml"),
