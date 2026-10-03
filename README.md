@@ -61,6 +61,11 @@ the current directory to the nearest ancestor containing `.histima.sql3`.
 Opening an older workspace migrates `catalog.sqlite3` to that hidden name.
 Add `--json` anywhere for structured output.
 
+`histima run` accepts repeated `--record <binding>` options to stock several
+materialized outputs from one execution. JSON keeps the legacy `recorded`
+object for a single binding and reports every selected result in the `records`
+array; for a multi-record run, `recorded` is null and `records` is authoritative.
+
 `histima summary [workspace]` combines catalog counts with bounded first pages
 of assets and recipes and the callable transform registry. `--limit <1-100>`
 applies independently to each section; asset and recipe cursors can be passed

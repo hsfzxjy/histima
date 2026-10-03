@@ -10,10 +10,11 @@ From this directory, create a disposable workspace and run the pipeline:
 ```text
 cargo run --manifest-path ../../Cargo.toml -p histima -- init ../../build/site-assets-work
 cargo run --manifest-path ../../Cargo.toml -p histima -- import --workspace ../../build/site-assets-work inputs --recursive
-cargo run --manifest-path ../../Cargo.toml -p histima -- run ../../build/site-assets-work pipeline.tima --record hero_webp --json
+cargo run --manifest-path ../../Cargo.toml -p histima -- run ../../build/site-assets-work pipeline.tima --record hero_png --record hero_webp --record thumbnail_png --record thumbnail_webp --json
 ```
 
-The last command prints the recorded Recipe and Content IDs. Run it again to
+The last command prints all four recorded Recipe and Content IDs in one
+`records` array. Run it again to
 observe result-cache reuse, or select the optional hybrid engine to exercise
 its interpreter fallback for the Buffer transform:
 
@@ -31,14 +32,12 @@ mkdir ../../build/site-assets-dist
 cargo run --manifest-path ../../Cargo.toml -p histima -- materialize ../../build/site-assets-work <content-id> ../../build/site-assets-dist/hero.webp
 ```
 
-Repeat `run --record` with `hero_png`, `thumbnail_png`, and `thumbnail_webp` to
-stock and materialize the other outputs.
-
 ## Product pressure observed
 
-- **CLI/product problem:** `run --record` stocks only one binding, so a
-  multi-output asset build needs repeated executions and manual collection of
-  IDs. A future batch-record/materialize surface would remove this friction.
+- **CLI/product problem (fixed after the first run):** `run --record` initially
+  stocked only one binding, forcing repeated executions. Repeating
+  `--record <binding>` now stocks all selected outputs in one execution and
+  reports them through the JSON `records` array.
 - **Runtime problem:** across processes, only explicitly stocked outputs are
   durable result-cache hits; unrecorded sibling outputs and intermediates are
   recomputed. Eagerly stocking a successful build graph needs a deliberate
@@ -58,6 +57,6 @@ stock and materialize the other outputs.
   to resolve. Imported filesystem locators are now slash-normalized on
   Windows.
 
-The selected immediate follow-up is only the portable-locator fix. The other
-items remain evidence for later prioritization rather than invitations to
-broaden Tima now.
+The selected immediate follow-ups were the portable-locator fix and repeated
+`--record` for multi-output stocking. The other items remain evidence for later
+prioritization rather than invitations to broaden Tima now.

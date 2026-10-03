@@ -308,7 +308,7 @@ pub fn recipe_expression(
     })
 }
 
-pub fn run(result: &ProgramExecution, recorded: Option<(&str, &RecordedResult)>) -> Value {
+pub fn run(result: &ProgramExecution, recorded: &[(String, RecordedResult)]) -> Value {
     let bindings = result
         .execution
         .bindings
@@ -326,6 +326,11 @@ pub fn run(result: &ProgramExecution, recorded: Option<(&str, &RecordedResult)>)
             .any(|value| value == last))
         .then(|| lineage.render())
     });
+    let records = recorded
+        .iter()
+        .map(|(binding, recorded)| recorded_result(binding, recorded))
+        .collect::<Vec<_>>();
+    let single_record = (records.len() == 1).then(|| records[0].clone());
     json!({
         "execution_engine": result.engine.name(),
         "artifact_cache": result.artifact_cache.map(|status| match status {
@@ -336,12 +341,17 @@ pub fn run(result: &ProgramExecution, recorded: Option<(&str, &RecordedResult)>)
         "artifact": result.artifact.as_ref().map(artifact_info),
         "bindings": bindings,
         "trace": trace,
-        "recorded": recorded.map(|(binding, recorded)| json!({
-            "binding": binding,
-            "recipe_id": recorded.recipe_id.to_string(),
-            "content_id": recorded.content_id.to_string(),
-            "byte_length": recorded.byte_len,
-        })),
+        "recorded": single_record,
+        "records": records,
+    })
+}
+
+fn recorded_result(binding: &str, recorded: &RecordedResult) -> Value {
+    json!({
+        "binding": binding,
+        "recipe_id": recorded.recipe_id.to_string(),
+        "content_id": recorded.content_id.to_string(),
+        "byte_length": recorded.byte_len,
     })
 }
 

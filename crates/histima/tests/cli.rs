@@ -690,7 +690,13 @@ fn cli_runs_the_repository_site_asset_workflow() {
             text(&workspace),
             "pipeline.tima",
             "--record",
+            "hero_png",
+            "--record",
             "hero_webp",
+            "--record",
+            "thumbnail_png",
+            "--record",
+            "thumbnail_webp",
             "--json",
         ],
     );
@@ -701,8 +707,16 @@ fn cli_runs_the_repository_site_asset_workflow() {
         first["bindings"]["thumbnail_buffer"]["shape"],
         json!([2, 2, 4])
     );
-    let recipe_id = json_string(&first["recorded"], "recipe_id").to_owned();
-    let content_id = json_string(&first["recorded"], "content_id").to_owned();
+    assert_eq!(first["recorded"], Value::Null);
+    assert_eq!(first["records"].as_array().unwrap().len(), 4);
+    let hero_webp = first["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["binding"] == "hero_webp")
+        .unwrap();
+    let recipe_id = json_string(hero_webp, "recipe_id").to_owned();
+    let content_id = json_string(hero_webp, "content_id").to_owned();
     assert!(first["trace"].as_str().unwrap().contains("invoke darken"));
     assert!(
         first["trace"]
@@ -718,7 +732,13 @@ fn cli_runs_the_repository_site_asset_workflow() {
             text(&workspace),
             "pipeline.tima",
             "--record",
+            "hero_png",
+            "--record",
             "hero_webp",
+            "--record",
+            "thumbnail_png",
+            "--record",
+            "thumbnail_webp",
             "--json",
         ],
     );
@@ -727,8 +747,9 @@ fn cli_runs_the_repository_site_asset_workflow() {
         json_output(&repeated)["result_cache"]["hits"]
             .as_u64()
             .unwrap()
-            > 0
+            >= 4
     );
+    assert_eq!(json_output(&repeated)["records"], first["records"]);
 
     let expression = histima_in(&example, ["expression", text(&workspace), &recipe_id]);
     assert_success(&expression);
@@ -761,6 +782,21 @@ fn cli_runs_the_repository_site_asset_workflow() {
     let bytes = fs::read(materialized).unwrap();
     assert!(bytes.starts_with(b"RIFF"));
     assert_eq!(&bytes[8..12], b"WEBP");
+
+    let duplicate = histima_in(
+        &example,
+        [
+            "run",
+            text(&workspace),
+            "pipeline.tima",
+            "--record",
+            "hero_webp",
+            "--record",
+            "hero_webp",
+        ],
+    );
+    assert!(!duplicate.status.success());
+    assert!(stderr(&duplicate).contains("more than once"));
 }
 
 #[test]
@@ -1049,6 +1085,8 @@ fn cli_json_covers_the_workspace_lifecycle() {
     assert_eq!(run["result_cache"]["hits"], 0);
     assert_eq!(run["bindings"]["out"]["type"], "bytes");
     assert_eq!(run["recorded"]["binding"], "out");
+    assert_eq!(run["records"].as_array().unwrap().len(), 1);
+    assert_eq!(run["records"][0], run["recorded"]);
     let recipe_id = json_string(&run["recorded"], "recipe_id").to_owned();
     let content_id = json_string(&run["recorded"], "content_id").to_owned();
     for identity in [&recipe_id, &content_id] {

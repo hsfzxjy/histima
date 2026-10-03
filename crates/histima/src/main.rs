@@ -639,7 +639,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 .map(|value| value.parse::<ExecutionEngine>())
                 .transpose()?
                 .unwrap_or_default();
-            let record_binding = take_record_option(&mut arguments)?;
+            let record_bindings = take_record_options(&mut arguments)?;
             let workspace_path = workspace_path(&mut arguments, 1)?;
             let script_path = required(&mut arguments, "Tima source path")?;
             finished(&mut arguments)?;
@@ -659,19 +659,20 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let result = workspace
                 .execute_with_engine(&compiled, engine)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
-            let recorded = record_binding
-                .as_ref()
+            let recorded = record_bindings
+                .iter()
                 .map(|name| {
                     let value =
                         result.execution.bindings.get(name).ok_or_else(|| {
                             format!("cannot record unknown outer binding {name:?}")
                         })?;
-                    workspace
+                    let recorded = workspace
                         .record_value(value)
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| error.to_string())?;
+                    Ok((name.clone(), recorded))
                 })
-                .transpose()?;
-            let json = cli_json::run(&result, record_binding.as_deref().zip(recorded.as_ref()));
+                .collect::<Result<Vec<_>, String>>()?;
+            let json = cli_json::run(&result, &recorded);
             output.emit(json, || {
                 println!("execution_engine = {}", result.engine.name());
                 println!(
@@ -705,11 +706,20 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 if let Some(lineage) = unbound_trace {
                     println!("{}", lineage.render());
                 }
-                if let (Some(name), Some(recorded)) = (record_binding, recorded) {
+                if recorded.len() == 1 {
+                    let (name, recorded) = &recorded[0];
                     println!("recorded_binding = {name}");
                     println!("recipe_id = {}", recorded.recipe_id);
                     println!("content_id = {}", recorded.content_id);
                     println!("byte_length = {}", recorded.byte_len);
+                } else if !recorded.is_empty() {
+                    println!("recorded_count = {}", recorded.len());
+                    for (index, (name, recorded)) in recorded.iter().enumerate() {
+                        println!("record[{index}].binding = {name}");
+                        println!("record[{index}].recipe_id = {}", recorded.recipe_id);
+                        println!("record[{index}].content_id = {}", recorded.content_id);
+                        println!("record[{index}].byte_length = {}", recorded.byte_len);
+                    }
                 }
             })?;
         }
@@ -916,28 +926,22 @@ fn collect_directory_files(
     Ok(())
 }
 
-fn take_record_option(arguments: &mut VecDeque<String>) -> Result<Option<String>, String> {
-    let Some(position) = arguments.iter().position(|argument| argument == "--record") else {
-        return Ok(None);
-    };
-    if arguments
-        .iter()
-        .skip(position + 1)
-        .any(|argument| argument == "--record")
-    {
-        return Err("--record may be supplied only once".to_owned());
+fn take_record_options(arguments: &mut VecDeque<String>) -> Result<Vec<String>, String> {
+    let mut bindings = Vec::new();
+    while let Some(position) = arguments.iter().position(|argument| argument == "--record") {
+        arguments.remove(position);
+        let binding = arguments
+            .get(position)
+            .filter(|binding| !binding.starts_with("--"))
+            .ok_or_else(|| "--record requires a binding name".to_owned())?
+            .clone();
+        arguments.remove(position);
+        if bindings.contains(&binding) {
+            return Err(format!("--record names binding {binding:?} more than once"));
+        }
+        bindings.push(binding);
     }
-    if position + 2 != arguments.len() {
-        return Err("--record must follow the Tima source path and name one binding".to_owned());
-    }
-    let binding = arguments
-        .pop_back()
-        .expect("record option has a binding position");
-    let option = arguments
-        .pop_back()
-        .expect("record option position was found");
-    debug_assert_eq!(option, "--record");
-    Ok(Some(binding))
+    Ok(bindings)
 }
 
 fn take_flag(arguments: &mut VecDeque<String>, flag: &str) -> Result<bool, String> {
@@ -1028,7 +1032,7 @@ fn print_usage() {
     eprintln!("  histima expression [workspace] <recipe-id> [--input <tima-expression>]");
     eprintln!("  histima pipeline [workspace] <tima-expression>");
     eprintln!(
-        "  histima run [workspace] <file.tima> [--engine <interpreter|hybrid-aot>] [--record <binding>]"
+        "  histima run [workspace] <file.tima> [--engine <interpreter|hybrid-aot>] [--record <binding>]..."
     );
     eprintln!("  histima replay [workspace] <file.tima> <recipe-id> [--snapshot]");
     eprintln!("  histima trace [workspace] <recipe-id>");
