@@ -555,6 +555,110 @@ fn cli_executes_and_strictly_replays_workspace_world_file_reads() {
 }
 
 #[test]
+fn cli_hybrid_aot_matches_interpreter_semantics_and_reuses_artifacts() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    let source = test.path().join("source.bin");
+    let script = test.path().join("pipeline.tima");
+    fs::write(&source, b"same semantics across engines").unwrap();
+    let source_locator = portable(&source);
+    fs::write(
+        &script,
+        format!(
+            "source = asset({source_locator:?})\n\
+             transform keep(data: Bytes) -> Bytes {{\n\
+                 return data\n\
+             }}\n\
+             out = source | read | keep\n\
+             trace(out)\n"
+        ),
+    )
+    .unwrap();
+
+    assert_success(&histima(["init", text(&workspace)]));
+    assert_success(&histima(["import", text(&workspace), &source_locator]));
+
+    let first_native = histima([
+        "run",
+        text(&workspace),
+        text(&script),
+        "--engine",
+        "hybrid-aot",
+        "--record",
+        "out",
+        "--json",
+    ]);
+    assert_success(&first_native);
+    let first_native = json_output(&first_native);
+    assert_eq!(first_native["execution_engine"], "hybrid-aot");
+    assert_eq!(first_native["artifact_cache"], "miss");
+    assert!(first_native["artifact"].is_object());
+    assert_eq!(first_native["bindings"]["out"]["type"], "bytes");
+    assert_eq!(
+        first_native["bindings"]["out"]["byte_length"],
+        b"same semantics across engines".len()
+    );
+    assert!(
+        first_native["trace"]
+            .as_str()
+            .unwrap()
+            .contains("invoke keep")
+    );
+
+    let second_native = histima([
+        "run",
+        text(&workspace),
+        text(&script),
+        "--engine",
+        "hybrid-aot",
+        "--record",
+        "out",
+        "--json",
+    ]);
+    assert_success(&second_native);
+    let second_native = json_output(&second_native);
+    assert_eq!(second_native["artifact_cache"], "hit");
+    assert_eq!(second_native["artifact"], first_native["artifact"]);
+
+    let interpreted = histima([
+        "run",
+        text(&workspace),
+        text(&script),
+        "--engine",
+        "interpreter",
+        "--record",
+        "out",
+        "--json",
+    ]);
+    assert_success(&interpreted);
+    let interpreted = json_output(&interpreted);
+    assert_eq!(interpreted["execution_engine"], "interpreter");
+    assert_eq!(interpreted["artifact_cache"], Value::Null);
+    assert_eq!(interpreted["artifact"], Value::Null);
+    assert_eq!(interpreted["bindings"], first_native["bindings"]);
+    assert_eq!(interpreted["trace"], first_native["trace"]);
+    assert_eq!(interpreted["recorded"], first_native["recorded"]);
+    assert!(interpreted["result_cache"]["hits"].as_u64().unwrap() > 0);
+
+    let recipe_id = json_string(&first_native["recorded"], "recipe_id");
+    let replay = histima([
+        "replay",
+        text(&workspace),
+        text(&script),
+        recipe_id,
+        "--json",
+    ]);
+    assert_success(&replay);
+    let replay = json_output(&replay);
+    assert_eq!(replay["recipe_id"], first_native["recorded"]["recipe_id"]);
+    assert_eq!(replay["content_id"], first_native["recorded"]["content_id"]);
+
+    let invalid = histima(["run", text(&workspace), text(&script), "--engine", "jit"]);
+    assert!(!invalid.status.success());
+    assert!(stderr(&invalid).contains("expected interpreter or hybrid-aot"));
+}
+
+#[test]
 fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");

@@ -7,6 +7,7 @@ use histima::{
     WorkspaceSummary, WorkspaceVerification,
 };
 use serde_json::{Map, Value, json};
+use tima::backend::cache::ArtifactCacheStatus;
 use tima::cache::CacheStats;
 use tima::identity::SemanticValueIdentity;
 use tima::lineage::{LineageNode, RecordedValue};
@@ -326,8 +327,11 @@ pub fn run(result: &ProgramExecution, recorded: Option<(&str, &RecordedResult)>)
         .then(|| lineage.render())
     });
     json!({
-        "execution_engine": "interpreter",
-        "artifact_cache": Value::Null,
+        "execution_engine": result.engine.name(),
+        "artifact_cache": result.artifact_cache.map(|status| match status {
+            ArtifactCacheStatus::Hit => "hit",
+            ArtifactCacheStatus::Miss => "miss",
+        }),
         "result_cache": cache_stats(result.result_cache),
         "artifact": result.artifact.as_ref().map(artifact_info),
         "bindings": bindings,

@@ -6,7 +6,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use histima::{CATALOG_LIST_LIMIT, ReplayPolicy, RunError, Workspace};
+use histima::{CATALOG_LIST_LIMIT, ExecutionEngine, ReplayPolicy, RunError, Workspace};
+use tima::backend::cache::ArtifactCacheStatus;
 use tima::identity::{ArtifactIdentity, ContentIdentity, RecipeIdentity, content_identity};
 use tima::lineage::{LineageNode, RecordedValue};
 use tima::runtime::{OuterValue, ValueData};
@@ -634,6 +635,10 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             })?;
         }
         "run" => {
+            let engine = take_value_option(&mut arguments, "--engine")?
+                .map(|value| value.parse::<ExecutionEngine>())
+                .transpose()?
+                .unwrap_or_default();
             let record_binding = take_record_option(&mut arguments)?;
             let workspace_path = workspace_path(&mut arguments, 1)?;
             let script_path = required(&mut arguments, "Tima source path")?;
@@ -652,7 +657,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                     )
                 })?;
             let result = workspace
-                .execute(&compiled)
+                .execute_with_engine(&compiled, engine)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
             let recorded = record_binding
                 .as_ref()
@@ -668,8 +673,18 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 .transpose()?;
             let json = cli_json::run(&result, record_binding.as_deref().zip(recorded.as_ref()));
             output.emit(json, || {
-                println!("execution_engine = interpreter");
-                println!("artifact_cache = none");
+                println!("execution_engine = {}", result.engine.name());
+                println!(
+                    "artifact_cache = {}",
+                    result.artifact_cache.map_or("none", |status| match status {
+                        ArtifactCacheStatus::Hit => "hit",
+                        ArtifactCacheStatus::Miss => "miss",
+                    })
+                );
+                if let Some(artifact) = &result.artifact {
+                    println!("artifact_bundle_id = {}", artifact.bundle_id);
+                    println!("artifact_content_id = {}", artifact.artifact_content_id);
+                }
                 println!("result_cache_hits = {}", result.result_cache.hits);
                 println!("result_cache_misses = {}", result.result_cache.misses);
                 println!("result_cache_stores = {}", result.result_cache.stores);
@@ -1012,7 +1027,9 @@ fn print_usage() {
     eprintln!("  histima materialize [workspace] <content-id> <destination>");
     eprintln!("  histima expression [workspace] <recipe-id> [--input <tima-expression>]");
     eprintln!("  histima pipeline [workspace] <tima-expression>");
-    eprintln!("  histima run [workspace] <file.tima> [--record <binding>]");
+    eprintln!(
+        "  histima run [workspace] <file.tima> [--engine <interpreter|hybrid-aot>] [--record <binding>]"
+    );
     eprintln!("  histima replay [workspace] <file.tima> <recipe-id> [--snapshot]");
     eprintln!("  histima trace [workspace] <recipe-id>");
     eprintln!(

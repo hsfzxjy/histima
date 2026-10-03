@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt;
+use std::fs;
+use std::str::FromStr;
 
 use tima::CompiledProgram;
 use tima::ast::Item;
+use tima::backend::cache::{ArtifactCacheStatus, CachedArtifact};
 use tima::cache::{CacheError, CacheStats, ResultCache, TransformResultCache};
 use tima::capability::World;
 use tima::identity::{ContentIdentity, RecipeIdentity, byte_content_identity};
@@ -19,8 +22,43 @@ use crate::{ArtifactInfo, Workspace};
 #[derive(Debug)]
 pub struct ProgramExecution {
     pub execution: Execution,
+    pub engine: ExecutionEngine,
     pub artifact: Option<ArtifactInfo>,
+    pub artifact_cache: Option<ArtifactCacheStatus>,
     pub result_cache: CacheStats,
+}
+
+/// Explicit execution policy for source-defined Tima transforms.
+/// Registered host and Wasm transforms use their existing implementations in
+/// either mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutionEngine {
+    #[default]
+    Interpreter,
+    HybridAot,
+}
+
+impl ExecutionEngine {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Interpreter => "interpreter",
+            Self::HybridAot => "hybrid-aot",
+        }
+    }
+}
+
+impl FromStr for ExecutionEngine {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "interpreter" => Ok(Self::Interpreter),
+            "hybrid-aot" => Ok(Self::HybridAot),
+            _ => Err(format!(
+                "unknown execution engine {value:?}; expected interpreter or hybrid-aot"
+            )),
+        }
+    }
 }
 
 /// The result of replaying one durable semantic recipe.
@@ -97,17 +135,52 @@ impl Workspace {
     /// Executes checked inner Tima through the typed-IR interpreter with this
     /// workspace as the only host capability provider.
     pub fn execute(&self, program: &CompiledProgram) -> Result<ProgramExecution, RunError> {
+        self.execute_with_engine(program, ExecutionEngine::Interpreter)
+    }
+
+    /// Executes a program with an explicit source-transform engine. Hybrid AOT
+    /// compiles supported definitions and interprets unsupported definitions.
+    pub fn execute_with_engine(
+        &self,
+        program: &CompiledProgram,
+        engine: ExecutionEngine,
+    ) -> Result<ProgramExecution, RunError> {
         let mut result_cache = WorkspaceResultCache::new(self);
-        let execution = tima::runtime::execute_cached_with_capabilities_and_identity_prefixes(
-            program,
-            &mut result_cache,
-            self,
-            self,
-        )
-        .map_err(RunError::Runtime)?;
+        let (execution, cached_artifact) = match engine {
+            ExecutionEngine::Interpreter => (
+                tima::runtime::execute_cached_with_capabilities_and_identity_prefixes(
+                    program,
+                    &mut result_cache,
+                    self,
+                    self,
+                )
+                .map_err(RunError::Runtime)?,
+                None,
+            ),
+            ExecutionEngine::HybridAot => {
+                let execution =
+                    tima::runtime::execute_aot_cached_with_capabilities_and_identity_prefixes(
+                        program,
+                        &mut result_cache,
+                        self,
+                        self.artifact_cache_root(),
+                        self,
+                    )
+                    .map_err(RunError::Runtime)?;
+                (execution.execution, execution.artifact)
+            }
+        };
+        let artifact_cache = cached_artifact.as_ref().map(|artifact| artifact.status);
+        let artifact = cached_artifact
+            .as_ref()
+            .map(cached_artifact_info)
+            .transpose()
+            .map_err(RunError::Storage)?;
         Ok(ProgramExecution {
             execution,
-            artifact: None,
+            engine,
+            artifact,
+            artifact_cache,
             result_cache: result_cache.stats,
         })
     }
@@ -149,6 +222,17 @@ impl Workspace {
             result_cache: result_cache.stats,
         })
     }
+}
+
+fn cached_artifact_info(artifact: &CachedArtifact) -> crate::Result<ArtifactInfo> {
+    let path = &artifact.artifact.artifact_path;
+    let bytes = fs::read(path)
+        .map_err(|error| crate::Error::io("read compiled artifact metadata", path, error))?;
+    Ok(ArtifactInfo {
+        bundle_id: artifact.bundle_id,
+        artifact_ids: artifact.artifact_ids.clone(),
+        artifact_content_id: byte_content_identity(&bytes),
+    })
 }
 
 struct SnapshotWorld<'workspace> {

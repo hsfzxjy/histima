@@ -39,9 +39,10 @@ Tima source
        or AOT Cranelift artifact
 ```
 
-The interpreter is the Histima product execution engine in this version. The
-standalone Tima runtime can emit, cache, link, load, and execute host artifacts
-for a subset of the same typed IR, while interpreting unsupported transforms.
+The interpreter is the default and reference Histima execution engine. Normal
+Histima script execution may explicitly select a hybrid AOT engine, which can
+emit, cache, link, load, and execute host artifacts for a subset of the same
+typed IR while interpreting unsupported transforms.
 The native subset includes scalar, String, and Bytes code. Generic Buffer
 operations currently remain interpreted. This remains an additive
 implementation of `TypedIR -> NativeArtifact`; Cranelift IR is not Tima's
@@ -1292,9 +1293,12 @@ Examples include:
 
 ## 14. Execution and backend contract
 
-The typed-IR interpreter is the production executor for inner transforms. It
+The typed-IR interpreter is the reference executor for inner transforms. It
 defines current evaluation, ownership, World-observation, lineage, and error
-behavior together with the typed IR contract.
+behavior together with the typed IR contract. Normal Histima script execution
+uses it by default and may explicitly select the hybrid AOT engine with
+`histima run ... --engine hybrid-aot`; `--engine interpreter` selects the
+reference path explicitly.
 
 The backend boundary is conceptually:
 
@@ -1324,10 +1328,12 @@ compiled for both literal keys and keys supplied by native-compatible
 `StringView` values. They call the host through the runtime context, retain
 precise observations, propagate source-spanned errors, and return registered
 host allocations for zero-copy freeze. A transform remains interpreted when
-any transitive callee uses unsupported behavior. The hybrid `run-native` path
-makes that decision per outer invocation without changing lineage or Recipe
-identity. Histima product execution remains interpreted while the native path
-matures.
+any transitive callee uses unsupported behavior. The hybrid engine makes that
+decision per outer invocation without changing Transform, Recipe, or Content
+identity, lineage, replay semantics, or registered standard/Wasm dispatch.
+Backend and artifact-cache details are execution metadata only. The standalone
+`tima run-native` command and Histima's explicit `hybrid-aot` choice exercise
+the same boundary; neither makes AOT the mandatory default.
 
 Native artifacts are cached independently using Artifact IDs derived from the
 Transform ID plus the Cranelift/compiler version, target, inferred CPU feature

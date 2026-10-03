@@ -41,7 +41,9 @@ pub use catalog::{
     CatalogInfo, CatalogPage, CatalogSearch, CatalogStats, RecipeSummary,
 };
 pub use error::{Error, Result};
-pub use runner::{PipelineExecution, ProgramExecution, RecipeReplay, ReplayPolicy, RunError};
+pub use runner::{
+    ExecutionEngine, PipelineExecution, ProgramExecution, RecipeReplay, ReplayPolicy, RunError,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedAsset {

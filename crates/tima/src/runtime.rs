@@ -375,6 +375,40 @@ pub fn execute_aot_cached_with_capabilities(
     capabilities: &dyn World,
     artifact_cache_root: impl AsRef<Path>,
 ) -> Result<AotExecution, Vec<Diagnostic>> {
+    execute_aot_with(
+        program,
+        cache,
+        capabilities,
+        artifact_cache_root.as_ref(),
+        None,
+    )
+}
+
+/// Hybrid-AOT execution with host-local semantic identity-prefix resolution.
+/// Backend selection remains execution metadata and does not enter lineage.
+pub fn execute_aot_cached_with_capabilities_and_identity_prefixes(
+    program: &CompiledProgram,
+    cache: &mut dyn ResultCache,
+    capabilities: &dyn World,
+    artifact_cache_root: impl AsRef<Path>,
+    identity_prefixes: &dyn IdentityPrefixResolver,
+) -> Result<AotExecution, Vec<Diagnostic>> {
+    execute_aot_with(
+        program,
+        cache,
+        capabilities,
+        artifact_cache_root.as_ref(),
+        Some(identity_prefixes),
+    )
+}
+
+fn execute_aot_with(
+    program: &CompiledProgram,
+    cache: &mut dyn ResultCache,
+    capabilities: &dyn World,
+    artifact_cache_root: &Path,
+    identity_prefixes: Option<&dyn IdentityPrefixResolver>,
+) -> Result<AotExecution, Vec<Diagnostic>> {
     let native = NativeModule::build(
         &program.transforms,
         &program.identities,
@@ -389,7 +423,13 @@ pub fn execute_aot_cached_with_capabilities(
         interpreter,
         native: native.as_ref(),
     };
-    let execution = execute_with(program, &engine, BTreeMap::new(), Some(cache), None)?;
+    let execution = execute_with(
+        program,
+        &engine,
+        BTreeMap::new(),
+        Some(cache),
+        identity_prefixes,
+    )?;
     Ok(AotExecution {
         execution,
         artifact,
