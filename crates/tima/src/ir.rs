@@ -138,6 +138,11 @@ pub enum ValueKind {
         left: ValueId,
         right: ValueId,
     },
+    /// Multiplies a byte by an `f32`, then truncates and saturates to `u8`.
+    U8Scale {
+        value: ValueId,
+        factor: ValueId,
+    },
     /// Calls another checked transform. Arguments with owned types are
     /// consumed; their type makes the ownership transfer backend-neutral.
     Call {
@@ -158,11 +163,15 @@ pub enum ValueKind {
     /// Per-iteration `u8` value supplied by an enclosing `BufferByteMap`.
     /// It is not an ordinary block instruction or a native boundary value.
     BufferByteElement,
+    /// Zero-based storage-byte offset supplied by an indexed
+    /// `BufferByteMap`. Padding bytes participate in this index.
+    BufferByteIndex,
     /// Consumes one uniquely owned buffer and evaluates a scalar instruction
     /// sequence once per byte, storing the `u8` result back into that byte.
     BufferByteMap {
         buffer: ValueId,
         element: ValueId,
+        index: Option<ValueId>,
         instructions: Vec<ValueId>,
         result: ValueId,
     },

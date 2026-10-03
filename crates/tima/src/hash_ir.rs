@@ -518,6 +518,13 @@ fn lower_value(
                 field("right", node_data(values[right.0 as usize])),
             ]),
         ),
+        IrValueKind::U8Scale { value, factor } => Node::new(
+            tima("numeric.u8-scale"),
+            typed(vec![
+                field("value", node_data(values[value.0 as usize])),
+                field("factor", node_data(values[factor.0 as usize])),
+            ]),
+        ),
         IrValueKind::Call { arguments, .. } => Node::new(
             tima("operation.call"),
             typed(vec![
@@ -567,9 +574,11 @@ fn lower_value(
             ]),
         ),
         IrValueKind::BufferByteElement => Node::new(tima("buffer.byte-element"), typed(Vec::new())),
+        IrValueKind::BufferByteIndex => Node::new(tima("buffer.byte-index"), typed(Vec::new())),
         IrValueKind::BufferByteMap {
             buffer,
             element,
+            index: None,
             instructions,
             result,
         } => Node::new(
@@ -577,6 +586,25 @@ fn lower_value(
             typed(vec![
                 field("buffer", node_data(values[buffer.0 as usize])),
                 field("element", node_data(values[element.0 as usize])),
+                field(
+                    "instructions",
+                    nodes_data(instructions.iter().map(|value| values[value.0 as usize])),
+                ),
+                field("result", node_data(values[result.0 as usize])),
+            ]),
+        ),
+        IrValueKind::BufferByteMap {
+            buffer,
+            element,
+            index: Some(index),
+            instructions,
+            result,
+        } => Node::new(
+            tima("buffer.byte-map-indexed"),
+            typed(vec![
+                field("buffer", node_data(values[buffer.0 as usize])),
+                field("element", node_data(values[element.0 as usize])),
+                field("index", node_data(values[index.0 as usize])),
                 field(
                     "instructions",
                     nodes_data(instructions.iter().map(|value| values[value.0 as usize])),

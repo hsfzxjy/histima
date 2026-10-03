@@ -700,12 +700,13 @@ fn cli_runs_an_interpreted_tima_pipeline_against_imported_assets() {
 }
 
 #[test]
-fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
+fn cli_runs_records_and_replays_a_user_darkened_png_to_webp_pipeline() {
     let test = TestDirectory::new();
     let workspace = test.path().join("workspace");
     let source = test.path().join("source.png");
     let script = test.path().join("pipeline.tima");
-    let output = test.path().join("copied.webp");
+    let output = test.path().join("darkened.webp");
+    let proof = test.path().join("darkened.png");
     fs::write(
         &source,
         encode_test_png(2, 1, &[100, 50, 20, 255, 200, 100, 50, 128]),
@@ -713,15 +714,27 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
     .unwrap();
     let source_locator = portable(&source);
     let output_locator = portable(&output);
+    let proof_locator = portable(&proof);
     fs::write(
         &script,
         format!(
             "source = asset({source_locator:?})\n\
-             transform copy(img: Buffer) -> Buffer {{\n\
-                 return img\n\
+             transform darken_byte(value: u8, offset: i64, factor: f32) -> u8 {{\n\
+                 pixel = offset / 4\n\
+                 alpha = pixel * 4 + 3\n\
+                 if offset == alpha {{ return value }} else {{ return u8.scale(value, factor) }}\n\
              }}\n\
-             out = source | read | png.decode | copy | webp.encode\n\
-             saved = out | save({output_locator:?})\n"
+             transform darken(buffer: Buffer, factor: f32) -> Buffer {{\n\
+                 for byte, offset in buffer.bytes {{\n\
+                     byte = darken_byte(byte, offset, factor)\n\
+                 }}\n\
+                 return buffer\n\
+             }}\n\
+             darkened = source | read | png.decode | darken(0.5)\n\
+             out = darkened | webp.encode\n\
+             proof = darkened | png.encode\n\
+             saved = out | save({output_locator:?})\n\
+             proof_saved = proof | save({proof_locator:?})\n"
         ),
     )
     .unwrap();
@@ -734,15 +747,23 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
     let encoded = fs::read(&output).unwrap();
     assert_eq!(&encoded[..4], b"RIFF");
     assert_eq!(&encoded[8..12], b"WEBP");
+    assert_eq!(
+        decode_test_png_rgba(&fs::read(&proof).unwrap()),
+        (2, 1, vec![50, 25, 10, 255, 100, 50, 25, 128])
+    );
     let recipe_id = field(&run, "recipe_id");
 
     let source_text = fs::read_to_string(&script).unwrap();
     fs::write(
         &script,
-        source_text.replace("| webp.encode\n", "| webp.encode(quality=85)\n"),
+        source_text.replace(
+            "out = darkened | webp.encode\n",
+            "out = darkened | webp.encode(quality=85)\n",
+        ),
     )
     .unwrap();
     fs::remove_file(&output).unwrap();
+    fs::remove_file(&proof).unwrap();
     let explicit_default = histima(["run", text(&workspace), text(&script), "--record", "out"]);
     assert_success(&explicit_default);
     assert_eq!(field(&explicit_default, "recipe_id"), recipe_id);
@@ -751,7 +772,7 @@ fn cli_runs_records_and_replays_a_png_to_webp_pipeline() {
     let trace = histima(["trace", text(&workspace), &recipe_id]);
     assert_success(&trace);
     assert!(stdout(&trace).contains("invoke png.decode"));
-    assert!(stdout(&trace).contains("invoke copy"));
+    assert!(stdout(&trace).contains("invoke darken"));
     assert!(stdout(&trace).contains("invoke webp.encode"));
 
     let replay = histima(["replay", text(&workspace), text(&script), &recipe_id]);
@@ -1263,6 +1284,17 @@ fn encode_test_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
         writer.finish().unwrap();
     }
     encoded
+}
+
+fn decode_test_png_rgba(encoded: &[u8]) -> (u32, u32, Vec<u8>) {
+    let decoder = png::Decoder::new(std::io::Cursor::new(encoded));
+    let mut reader = decoder.read_info().unwrap();
+    assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+    assert_eq!(reader.info().bit_depth, png::BitDepth::Eight);
+    let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+    let frame = reader.next_frame(&mut pixels).unwrap();
+    pixels.truncate(frame.buffer_size());
+    (frame.width, frame.height, pixels)
 }
 
 struct TestDirectory(PathBuf);

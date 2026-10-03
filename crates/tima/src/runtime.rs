@@ -2317,7 +2317,9 @@ impl IrInterpreter<'_> {
     ) -> Result<InterpretedValue, Diagnostic> {
         let value = transform.value(id);
         Ok(match &value.kind {
-            ValueKind::Parameter { .. } | ValueKind::BufferByteElement => unreachable!(),
+            ValueKind::Parameter { .. }
+            | ValueKind::BufferByteElement
+            | ValueKind::BufferByteIndex => unreachable!(),
             ValueKind::Constant(constant) => match constant {
                 Constant::Bool(value) => InterpretedValue::Scalar(NativeScalar::Bool(*value)),
                 Constant::I64(value) => InterpretedValue::Scalar(NativeScalar::I64(*value)),
@@ -2330,6 +2332,18 @@ impl IrInterpreter<'_> {
                 values[right.0 as usize].as_ref().unwrap().scalar(),
                 value.span,
             )?),
+            ValueKind::U8Scale { value, factor } => {
+                let NativeScalar::U8(value) = values[value.0 as usize].as_ref().unwrap().scalar()
+                else {
+                    unreachable!("typed u8.scale value is u8")
+                };
+                let NativeScalar::F32(factor) =
+                    values[factor.0 as usize].as_ref().unwrap().scalar()
+                else {
+                    unreachable!("typed u8.scale factor is f32")
+                };
+                InterpretedValue::Scalar(NativeScalar::U8(scale_u8(value, factor)))
+            }
             ValueKind::Call {
                 transform: callee,
                 arguments,
@@ -2373,6 +2387,7 @@ impl IrInterpreter<'_> {
             ValueKind::BufferByteMap {
                 buffer,
                 element,
+                index: byte_index,
                 instructions,
                 result,
             } => {
@@ -2384,6 +2399,16 @@ impl IrInterpreter<'_> {
                     values[element.0 as usize] = Some(InterpretedValue::Scalar(NativeScalar::U8(
                         buffer.storage[index],
                     )));
+                    if let Some(byte_index) = byte_index {
+                        let index = i64::try_from(index).map_err(|_| {
+                            Diagnostic::error(
+                                "buffer byte offset exceeds the inner i64 index range",
+                                value.span,
+                            )
+                        })?;
+                        values[byte_index.0 as usize] =
+                            Some(InterpretedValue::Scalar(NativeScalar::I64(index)));
+                    }
                     for instruction in instructions {
                         let evaluated = self.evaluate_instruction(
                             transform,
@@ -2635,6 +2660,17 @@ fn native_binary(
             }
             _ => unreachable!("typed ordering operands are matching numeric values"),
         }
+    }
+}
+
+fn scale_u8(value: u8, factor: f32) -> u8 {
+    let scaled = f32::from(value) * factor;
+    if scaled.is_nan() || scaled <= 0.0 {
+        0
+    } else if scaled >= 255.0 {
+        255
+    } else {
+        scaled.trunc() as u8
     }
 }
 
@@ -4235,6 +4271,61 @@ mod tests {
             assert_eq!(result.bytes(), &[9, 2, 9, 8, 3, 9, 4, 9]);
             assert!(!original.shares_storage_with(result));
         }
+    }
+
+    #[test]
+    fn indexed_buffer_map_darkens_rgba_storage_without_mutating_the_outer_input() {
+        let world = FixedWorld::empty();
+        let executions = assert_successful_engine_conformance(
+            "indexed-buffer-darken",
+            "transform darken_byte(value: u8, offset: i64, factor: f32) -> u8 {\n\
+                 pixel = offset / 4\n\
+                 alpha = pixel * 4 + 3\n\
+                 if offset == alpha { return value } else { return u8.scale(value, factor) }\n\
+             }\n\
+             transform darken(buffer: Buffer, factor: f32) -> Buffer {\n\
+                 for byte, offset in buffer.bytes {\n\
+                     byte = darken_byte(byte, offset, factor)\n\
+                 }\n\
+                 return buffer\n\
+             }\n\
+             out = darken(img, 0.5)\n",
+            BTreeMap::from([(
+                "img".to_owned(),
+                OuterValue::buffer(
+                    BufferValue::new(vec![1, 2, 4], 8, vec![100, 50, 20, 255, 200, 100, 50, 128])
+                        .unwrap(),
+                ),
+            )]),
+            &world,
+            &[],
+            &["darken_byte", "darken"],
+        );
+
+        for execution in [&executions.interpreted, &executions.hybrid] {
+            let ValueData::Buffer(original) = &execution.bindings["img"].data else {
+                panic!("expected original Buffer")
+            };
+            let ValueData::Buffer(darkened) = &execution.bindings["out"].data else {
+                panic!("expected darkened Buffer")
+            };
+            assert_eq!(original.bytes(), &[100, 50, 20, 255, 200, 100, 50, 128]);
+            assert_eq!(darkened.bytes(), &[50, 25, 10, 255, 100, 50, 25, 128]);
+            assert_eq!(darkened.shape(), &[1, 2, 4]);
+            assert_eq!(darkened.outer_stride(), 8);
+            assert!(!original.shares_storage_with(darkened));
+            assert!(execution.bindings["out"].lineage.is_some());
+        }
+    }
+
+    #[test]
+    fn u8_scale_truncates_saturates_and_defines_non_finite_results() {
+        assert_eq!(super::scale_u8(101, 0.5), 50);
+        assert_eq!(super::scale_u8(200, 2.0), 255);
+        assert_eq!(super::scale_u8(200, -1.0), 0);
+        assert_eq!(super::scale_u8(200, f32::INFINITY), 255);
+        assert_eq!(super::scale_u8(200, f32::NEG_INFINITY), 0);
+        assert_eq!(super::scale_u8(200, f32::NAN), 0);
     }
 
     #[test]

@@ -317,10 +317,15 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
                 );
             }
             ValueKind::Binary { .. } => {}
+            ValueKind::U8Scale { .. } => diagnostics.push(Diagnostic::error(
+                "u8.scale is outside the current Cranelift AOT subset",
+                value.span,
+            )),
             ValueKind::Call { .. } => {}
             ValueKind::BufferZero { .. }
             | ValueKind::BufferFill { .. }
             | ValueKind::BufferByteElement
+            | ValueKind::BufferByteIndex
             | ValueKind::BufferByteMap { .. } => diagnostics.push(Diagnostic::error(
                 "generic Buffer operations are outside the current Cranelift AOT subset",
                 value.span,
@@ -423,6 +428,9 @@ fn lower_transform(
                         required_scalar(&values, *right),
                         transform.value(*left).ty,
                     )),
+                    ValueKind::U8Scale { .. } => {
+                        unreachable!("validation rejects u8.scale")
+                    }
                     ValueKind::Call {
                         transform: callee,
                         arguments,
@@ -437,6 +445,7 @@ fn lower_transform(
                     ValueKind::BufferZero { .. }
                     | ValueKind::BufferFill { .. }
                     | ValueKind::BufferByteElement
+                    | ValueKind::BufferByteIndex
                     | ValueKind::BufferByteMap { .. } => {
                         unreachable!("validation rejects generic Buffer operations")
                     }

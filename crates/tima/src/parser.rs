@@ -180,6 +180,11 @@ impl Parser {
         if self.eat(|kind| matches!(kind, TokenKind::For)) {
             let start = self.previous().span;
             let (binding, binding_span) = self.identifier("a loop binding")?;
+            let index_binding = if self.eat(|kind| matches!(kind, TokenKind::Comma)) {
+                Some(self.identifier("a byte-index binding after `,`")?)
+            } else {
+                None
+            };
             self.expect(|kind| matches!(kind, TokenKind::In), "`in`")?;
             let iterable = self.expression()?;
             self.expect(|kind| matches!(kind, TokenKind::LeftBrace), "`{`")?;
@@ -187,6 +192,7 @@ impl Parser {
             return Ok(InnerStmt::For {
                 binding,
                 binding_span,
+                index_binding,
                 iterable,
                 body,
                 span: start.join(end),
@@ -648,6 +654,7 @@ mod tests {
         };
         let InnerStmt::For {
             binding,
+            index_binding,
             iterable,
             body,
             ..
@@ -656,6 +663,7 @@ mod tests {
             panic!("expected for statement")
         };
         assert_eq!(binding, "byte");
+        assert!(index_binding.is_none());
         assert!(matches!(
             &program.expr(*iterable).kind,
             ExprKind::Member { receiver, name, .. }
@@ -666,6 +674,31 @@ mod tests {
             &body[..],
             [InnerStmt::Binding(Binding { name, .. })] if name == "byte"
         ));
+    }
+
+    #[test]
+    fn parses_an_optional_buffer_byte_index_binding() {
+        let source = SourceFile::new(
+            "test.tima",
+            "transform map(img: Buffer) -> Buffer {\n\
+                 for byte, offset in img.bytes { byte = byte }\n\
+                 return img\n\
+             }\n",
+        );
+        let program = parse(&source).unwrap();
+        let Item::Transform(transform) = &program.items[0] else {
+            panic!("expected transform")
+        };
+        let InnerStmt::For {
+            binding,
+            index_binding,
+            ..
+        } = &transform.body[0]
+        else {
+            panic!("expected for statement")
+        };
+        assert_eq!(binding, "byte");
+        assert!(matches!(index_binding, Some((name, _)) if name == "offset"));
     }
 
     #[test]

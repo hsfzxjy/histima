@@ -1234,6 +1234,70 @@ mod tests {
     }
 
     #[test]
+    fn indexed_buffer_map_identity_ignores_bindings_but_preserves_index_semantics() {
+        let first = crate::compile(
+            "first.tima",
+            "transform select(flag: bool, value: u8) -> u8 {\n\
+                 if flag { return value } else { return value }\n\
+             }\n\
+             transform map(img: Buffer) -> Buffer {\n\
+                 for byte, offset in img.bytes { byte = select(offset == 0, byte) }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let renamed = crate::compile(
+            "renamed.tima",
+            "transform select(flag: bool, value: u8) -> u8 {\n\
+                 if flag { return value } else { return value }\n\
+             }\n\
+             transform map(img: Buffer) -> Buffer {\n\
+                 for element, position in img.bytes { element = select(position == 0, element) }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+        let unindexed = crate::compile(
+            "unindexed.tima",
+            "transform select(flag: bool, value: u8) -> u8 {\n\
+                 if flag { return value } else { return value }\n\
+             }\n\
+             transform map(img: Buffer) -> Buffer {\n\
+                 for byte in img.bytes { byte = select(false, byte) }\n\
+                 return img\n\
+             }\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.identities.get(TransformId(1)),
+            renamed.identities.get(TransformId(1))
+        );
+        assert_ne!(
+            first.identities.get(TransformId(1)),
+            unindexed.identities.get(TransformId(1))
+        );
+    }
+
+    #[test]
+    fn u8_scale_operation_is_part_of_transform_identity() {
+        let keep = crate::compile(
+            "keep.tima",
+            "transform apply(value: u8, factor: f32) -> u8 { return value }\n",
+        )
+        .unwrap();
+        let scale = crate::compile(
+            "scale.tima",
+            "transform apply(value: u8, factor: f32) -> u8 { return u8.scale(value, factor) }\n",
+        )
+        .unwrap();
+        assert_ne!(
+            keep.identities.get(TransformId(0)),
+            scale.identities.get(TransformId(0))
+        );
+    }
+
+    #[test]
     fn capability_operation_and_key_are_part_of_transform_identity() {
         let first = crate::compile(
             "one.tima",

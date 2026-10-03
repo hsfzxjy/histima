@@ -77,6 +77,7 @@ pub enum InnerStmt {
     For {
         binding: String,
         binding_span: Span,
+        index_binding: Option<(String, Span)>,
         iterable: ExprId,
         body: Vec<InnerStmt>,
         span: Span,

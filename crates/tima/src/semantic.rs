@@ -329,10 +329,18 @@ impl<'a> Lowerer<'a> {
                 InnerStmt::For {
                     binding,
                     binding_span,
+                    index_binding,
                     iterable,
                     body,
                     span,
-                } => self.buffer_byte_loop(binding, *binding_span, *iterable, body, *span),
+                } => self.buffer_byte_loop(
+                    binding,
+                    *binding_span,
+                    index_binding.as_ref(),
+                    *iterable,
+                    body,
+                    *span,
+                ),
                 InnerStmt::Assignment { span, .. } => self.diagnostics.push(Diagnostic::error(
                     "inner field assignment is not implemented",
                     *span,
@@ -346,6 +354,7 @@ impl<'a> Lowerer<'a> {
         &mut self,
         binding: &str,
         binding_span: crate::source::Span,
+        index_binding: Option<&(String, crate::source::Span)>,
         iterable: ExprId,
         body: &[InnerStmt],
         span: crate::source::Span,
@@ -360,6 +369,31 @@ impl<'a> Lowerer<'a> {
                 .with_note("inner bindings cannot shadow parameters or earlier locals"),
             );
             return;
+        }
+        if let Some((index_name, index_span)) = index_binding {
+            if index_name == binding {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "buffer byte value and index bindings must have different names",
+                        *index_span,
+                    )
+                    .with_label(binding_span, "byte value binding is declared here"),
+                );
+                return;
+            }
+            if let Some((_, previous_span)) = self.environment.get(index_name) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "inner loop index binding `{index_name}` would shadow an existing value"
+                        ),
+                        *index_span,
+                    )
+                    .with_label(*previous_span, "existing value is here")
+                    .with_note("inner bindings cannot shadow parameters or earlier locals"),
+                );
+                return;
+            }
         }
 
         let iterable_expression = self.program.expr(iterable);
@@ -442,7 +476,11 @@ impl<'a> Lowerer<'a> {
             return;
         }
         let buffer_name_span = self.environment[buffer_name].1;
-        if !expression_mentions_name(self.program, assignment.value, binding) {
+        let mentions_element = expression_mentions_name(self.program, assignment.value, binding);
+        let mentions_index = index_binding.is_some_and(|(name, _)| {
+            expression_mentions_name(self.program, assignment.value, name)
+        });
+        if !mentions_element && !mentions_index {
             let Some(value) = self.expression(assignment.value) else {
                 return;
             };
@@ -466,6 +504,15 @@ impl<'a> Lowerer<'a> {
         let element = self.alloc(Type::U8, ValueKind::BufferByteElement, binding_span, false);
         self.environment
             .insert(binding.to_owned(), (element, binding_span));
+        let index = if mentions_index {
+            index_binding.map(|(name, index_span)| {
+                let value = self.alloc(Type::I64, ValueKind::BufferByteIndex, *index_span, false);
+                self.environment.insert(name.clone(), (value, *index_span));
+                value
+            })
+        } else {
+            None
+        };
         let instruction_start = self.blocks[self.current_block.0 as usize]
             .instructions
             .len();
@@ -474,6 +521,9 @@ impl<'a> Lowerer<'a> {
             .instructions
             .split_off(instruction_start);
         self.environment.remove(binding);
+        if let Some((name, _)) = index_binding {
+            self.environment.remove(name);
+        }
         let Some(value) = value else {
             return;
         };
@@ -499,6 +549,7 @@ impl<'a> Lowerer<'a> {
             ValueKind::BufferByteMap {
                 buffer,
                 element,
+                index,
                 instructions,
                 result: value,
             },
@@ -811,6 +862,16 @@ impl<'a> Lowerer<'a> {
                     }
                     return self.buffer_fill(arguments, expression.span);
                 }
+                if name == "u8.scale" {
+                    if asserted {
+                        self.diagnostics.push(Diagnostic::error(
+                            "inner runtime operations cannot use semantic identity assertions",
+                            self.program.expr(*callee).span,
+                        ));
+                        return None;
+                    }
+                    return self.u8_scale(arguments, expression.span);
+                }
                 let Some(signature) = self.signatures.get(&name) else {
                     self.diagnostics.push(Diagnostic::error(
                         format!("unknown inner transform `{name}`"),
@@ -1087,6 +1148,37 @@ impl<'a> Lowerer<'a> {
             span,
             true,
         ))
+    }
+
+    fn u8_scale(
+        &mut self,
+        arguments: &[ast::Argument],
+        span: crate::source::Span,
+    ) -> Option<ValueId> {
+        if arguments.len() != 2 || arguments.iter().any(|argument| argument.name.is_some()) {
+            self.diagnostics.push(
+                Diagnostic::error("u8.scale expects positional u8 value and f32 factor", span)
+                    .with_note("example: scaled = u8.scale(value, factor)"),
+            );
+            return None;
+        }
+        let value = self.expression(arguments[0].value)?;
+        let factor = self.expression(arguments[1].value)?;
+        let value_type = self.values[value.0 as usize].ty;
+        let factor_type = self.values[factor.0 as usize].ty;
+        if value_type != Type::U8 || factor_type != Type::F32 {
+            self.diagnostics.push(
+                Diagnostic::error("u8.scale requires a u8 value and f32 factor", span).with_note(
+                    format!(
+                        "value is {}, factor is {}",
+                        value_type.name(),
+                        factor_type.name()
+                    ),
+                ),
+            );
+            return None;
+        }
+        Some(self.alloc(Type::U8, ValueKind::U8Scale { value, factor }, span, true))
     }
 }
 
@@ -1748,6 +1840,7 @@ mod tests {
             ir::ValueKind::BufferByteMap {
                 buffer: ir::ValueId(0),
                 element: ir::ValueId(3),
+                index: None,
                 instructions,
                 result: ir::ValueId(4),
             } if instructions == &[ir::ValueId(4)]
@@ -1770,6 +1863,76 @@ mod tests {
             diagnostic
                 .message
                 .contains("cannot consume another owned value")
+        }));
+    }
+
+    #[test]
+    fn lowers_indexed_buffer_byte_maps_and_u8_scaling() {
+        let compiled = compile(
+            "indexed-map.tima",
+            "transform darken_byte(value: u8, offset: i64, factor: f32) -> u8 {\n\
+                 pixel = offset / 4\n\
+                 alpha = pixel * 4 + 3\n\
+                 if offset == alpha { return value } else { return u8.scale(value, factor) }\n\
+             }\n\
+             transform darken(buffer: Buffer, factor: f32) -> Buffer {\n\
+                 for byte, offset in buffer.bytes {\n\
+                     byte = darken_byte(byte, offset, factor)\n\
+                 }\n\
+                 return buffer\n\
+             }\n",
+        )
+        .unwrap();
+        assert!(
+            compiled.transforms.transforms[0]
+                .values
+                .iter()
+                .any(|value| matches!(value.kind, ir::ValueKind::U8Scale { .. }))
+        );
+
+        let transform = &compiled.transforms.transforms[1];
+        assert!(matches!(
+            transform.values[2].kind,
+            ir::ValueKind::BufferByteElement
+        ));
+        assert!(matches!(
+            transform.values[3].kind,
+            ir::ValueKind::BufferByteIndex
+        ));
+        assert!(matches!(
+            &transform.values[5].kind,
+            ir::ValueKind::BufferByteMap {
+                buffer: ir::ValueId(0),
+                element: ir::ValueId(2),
+                index: Some(ir::ValueId(3)),
+                instructions,
+                result: ir::ValueId(4),
+            } if instructions == &[ir::ValueId(4)]
+        ));
+
+        for source in [
+            "transform bad(img: Buffer) -> Buffer { for byte, byte in img.bytes { byte = byte }; return img }\n",
+            "transform bad(img: Buffer, offset: i64) -> Buffer { for byte, offset in img.bytes { byte = byte }; return img }\n",
+        ] {
+            let diagnostics = compile("bad-index.tima", source).unwrap_err();
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("different names")
+                    || diagnostic.message.contains("would shadow")
+            }));
+        }
+    }
+
+    #[test]
+    fn u8_scale_requires_u8_and_f32_arguments() {
+        let diagnostics = compile(
+            "bad-scale.tima",
+            "transform bad(value: u8, factor: i64) -> u8 { return u8.scale(value, factor) }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("requires a u8 value and f32 factor")
         }));
     }
 

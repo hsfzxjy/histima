@@ -442,8 +442,8 @@ observed content identities.
 
 Every parameter and result has an explicit native-safe type. Transform names
 and parameter names must be unique in their respective scopes. The names
-`environment_i64`, `buffer_zero`, and `buffer_fill` are reserved inner runtime
-operations.
+`environment_i64`, `buffer_zero`, and `buffer_fill`, plus the namespaced call
+`u8.scale`, are reserved inner runtime operations.
 
 Source-defined Tima transforms, standard transforms, and workspace
 registered-Wasm transforms are one callable concept at the outer-language
@@ -502,6 +502,7 @@ name = expression
 return expression
 if condition { statements } else { statements }
 for byte in buffer.bytes { ... }
+for byte, offset in buffer.bytes { ... }
 ```
 
 Inner local bindings are inferred, immutable, and cannot shadow parameters or
@@ -521,6 +522,12 @@ operations. An inner string literal has type `StringView`.
 Inner arithmetic requires operands of the same type. `f32` uses IEEE-754
 arithmetic. `i64` arithmetic is checked; overflow and division by zero abort
 the invocation with a diagnostic. `u8` arithmetic is unsupported.
+
+`u8.scale(value, factor)` is the one implemented explicit mixed scalar
+operation. It multiplies a `u8` by an `f32` using binary32 arithmetic, truncates
+the result toward zero, and saturates it to `0..=255`; NaN produces zero. It is
+intended for general byte-valued buffers and assigns no channel or image
+meaning to either argument.
 
 Equality supports same-typed `bool`, `u8`, `i64`, and `f32`. Ordering supports
 same-typed `u8`, `i64`, and `f32`. Buffer equality is unsupported.
@@ -580,14 +587,26 @@ for byte in buffer.bytes {
 }
 ```
 
-`buffer` must be a directly named owned `Buffer`. The body must contain exactly
-one assignment to the loop binding and its expression must produce `u8`.
+It may optionally bind the zero-based storage-byte offset:
 
-If the expression does not use `byte`, the loop has the same typed-IR meaning
+```tima
+for byte, offset in buffer.bytes {
+    byte = expression
+}
+```
+
+`buffer` must be a directly named owned `Buffer`. The body must contain exactly
+one assignment to the byte binding and its expression must produce `u8`. The
+byte binding is `u8`; the optional offset binding is `i64`. The offset counts
+all storage bytes in order, including outer-stride padding. Both bindings are
+immutable inputs to the assignment expression and cannot shadow another value.
+
+If the expression uses neither binding, the loop has the same typed-IR meaning
 as `buffer_fill`; this canonicalization makes equivalent source forms share
-Transform identity. If it uses `byte`, the expression is evaluated once per
-storage byte and the result replaces that byte. A byte-loop expression may not
-consume another owned value.
+Transform identity. An unused optional offset also disappears during semantic
+normalization. Otherwise the expression is evaluated once per storage byte and
+the result replaces that byte. A byte-loop expression may not consume another
+owned value.
 
 General loop bodies, nested loops, indexing, `break`, and `continue` are
 unsupported.
@@ -920,8 +939,9 @@ Language-defined normalization removes source-only distinctions such as
 formatting, comments, transform/parameter/local names, declaration order, and
 capability declaration order. It may also equate multiple surface forms when
 Tima explicitly specifies one semantic operation. In particular, the initial
-whole-buffer byte-assignment loop is defined to normalize to `buffer.fill`, so
-it has the same identity as a direct `buffer_fill` call.
+whole-buffer byte-assignment loop whose expression uses neither the byte nor
+optional offset binding is defined to normalize to `buffer.fill`, so it has
+the same identity as a direct `buffer_fill` call.
 
 No other optimizer behavior is implied. Hash IR does not automatically apply
 algebraic identities such as replacing `x + 0` with `x`, reassociate
@@ -1086,6 +1106,7 @@ Current Tima value and operation schemas are:
 | `constant.f32` | `bits` binary32 bits, `type` node |
 | `constant.string` | `value` text, `type` node |
 | `binary.add`, `binary.subtract`, `binary.multiply`, `binary.divide`, `binary.equal`, `binary.not-equal`, `binary.less`, `binary.less-equal`, `binary.greater`, `binary.greater-equal` | `left` node, `right` node, `type` node |
+| `numeric.u8-scale` | `value` node, `factor` node, `type` node |
 | `operation.call` | `arguments` ordered node sequence, `transform` digest, `type` node |
 | `world.environment-i64` | `name` text, `type` node |
 | `world.environment-read` | `name` node, `type` node |
@@ -1095,6 +1116,8 @@ Current Tima value and operation schemas are:
 | `buffer.fill` | `buffer` node, `value` node, `type` node |
 | `buffer.byte-element` | `type` node |
 | `buffer.byte-map` | `buffer` node, `element` node, `instructions` ordered node sequence, `result` node, `type` node |
+| `buffer.byte-index` | `type` node |
+| `buffer.byte-map-indexed` | `buffer` node, `element` node, `index` node, `instructions` ordered node sequence, `result` node, `type` node |
 
 `constant.f32.bits` preserves the exact IEEE-754 bit pattern. Positive and
 negative zero, distinct NaN payloads, and otherwise algebraically equivalent
@@ -1278,8 +1301,8 @@ context, and propagate failure status to the outermost invocation. String and
 byte descriptors currently support identity returns and passthrough call
 chains; they have no native mutation operations yet.
 
-Checked `i64` arithmetic, general string operations, newly allocated native
-Buffers, and `environment_i64` are not compiled. String literals are emitted as
+Checked `i64` arithmetic, `u8.scale`, general string operations, newly
+allocated native Buffers, and `environment_i64` are not compiled. String literals are emitted as
 read-only object data. `env.read`, `file.read`, and `http.get` are therefore
 compiled for both literal keys and keys supplied by native-compatible
 `StringView` values. They call the host through the runtime context, retain
@@ -1311,7 +1334,8 @@ The current language does not include:
 
 - rebinding or mutable outer composites;
 - unary operators, implicit conversions, or general member evaluation;
-- general loops, indexing, or arbitrary inner mutation;
+- general loops, arbitrary indexing, or arbitrary inner mutation (the
+  constrained Buffer byte loop may expose its current storage offset);
 - user-defined composite native types, enums, options, or results;
 - inner named arguments;
 - recursive transforms;
@@ -1337,7 +1361,20 @@ Future support for any item above requires an explicit specification update.
 ```tima
 source = asset("cat.png")
 
-transform copy(buffer: Buffer) -> Buffer {
+transform darken_byte(value: u8, offset: i64, factor: f32) -> u8 {
+    pixel = offset / 4
+    alpha = pixel * 4 + 3
+    if offset == alpha {
+        return value
+    } else {
+        return u8.scale(value, factor)
+    }
+}
+
+transform darken(buffer: Buffer, factor: f32) -> Buffer {
+    for byte, offset in buffer.bytes {
+        byte = darken_byte(byte, offset, factor)
+    }
     return buffer
 }
 
@@ -1345,15 +1382,17 @@ out =
     source
     | read
     | png.decode
-    | copy
+    | darken(0.8)
     | webp.encode(quality=85)
 
 derivation = trace(out)
 replayed = replay(out)
 ```
 
-The source asset remains immutable. `copy` receives unique mutable Buffer
-storage, the returned Buffer is frozen before `webp.encode` sees it, each
+The source asset remains immutable. `darken` receives unique mutable Buffer
+storage, treats the codec's `[height, width, 4]` contract as ordinary byte
+layout rather than a core Tima type, and preserves every fourth alpha byte.
+The returned Buffer is frozen before `webp.encode` sees it, each
 transform result carries semantic lineage, and valid Recipe results may be
 reused without changing that lineage. Future compiled artifacts will remain
 execution details outside semantic lineage.
