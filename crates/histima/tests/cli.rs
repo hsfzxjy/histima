@@ -689,6 +689,7 @@ fn cli_runs_the_repository_site_asset_workflow() {
             "run",
             text(&workspace),
             "pipeline.tima",
+            "--stock-intermediates",
             "--record",
             "hero_buffer",
             "--record",
@@ -711,6 +712,21 @@ fn cli_runs_the_repository_site_asset_workflow() {
     );
     assert_eq!(first["recorded"], Value::Null);
     assert_eq!(first["records"].as_array().unwrap().len(), 5);
+    assert_eq!(first["result_stock_policy"], "reachable-invocations");
+    assert_eq!(first["stocked_results"].as_array().unwrap().len(), 8);
+    let stocked_transforms = first["stocked_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|stocked| stocked["transform"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stocked_transforms
+            .iter()
+            .filter(|name| **name == "ppm.decode")
+            .count(),
+        2
+    );
     let hero_buffer = first["records"]
         .as_array()
         .unwrap()
@@ -741,6 +757,7 @@ fn cli_runs_the_repository_site_asset_workflow() {
             "run",
             text(&workspace),
             "pipeline.tima",
+            "--stock-intermediates",
             "--record",
             "hero_buffer",
             "--record",
@@ -759,8 +776,9 @@ fn cli_runs_the_repository_site_asset_workflow() {
         json_output(&repeated)["result_cache"]["hits"]
             .as_u64()
             .unwrap()
-            >= 5
+            >= 8
     );
+    assert_eq!(json_output(&repeated)["stocked_results"], json!([]));
     assert_eq!(json_output(&repeated)["records"], first["records"]);
 
     let expression = histima_in(&example, ["expression", text(&workspace), &recipe_id]);
@@ -840,6 +858,41 @@ fn cli_runs_the_repository_site_asset_workflow() {
     );
     assert!(!duplicate.status.success());
     assert!(stderr(&duplicate).contains("more than once"));
+}
+
+#[test]
+fn cli_stocks_no_intermediates_when_program_execution_fails() {
+    let test = TestDirectory::new();
+    let workspace = test.path().join("workspace");
+    fs::write(test.path().join("input.bin"), b"input").unwrap();
+    fs::write(
+        test.path().join("failed.tima"),
+        "bytes = asset(\"input.bin\") | read\nfailure = 1 / 0\n",
+    )
+    .unwrap();
+
+    assert_success(&histima_in(test.path(), ["init", text(&workspace)]));
+    assert_success(&histima_in(
+        test.path(),
+        ["import", text(&workspace), "input.bin"],
+    ));
+    let failed = histima_in(
+        test.path(),
+        [
+            "run",
+            text(&workspace),
+            "failed.tima",
+            "--stock-intermediates",
+        ],
+    );
+    assert!(!failed.status.success());
+    assert!(stderr(&failed).contains("division by zero"));
+
+    let stats = histima_in(test.path(), ["stats", text(&workspace), "--json"]);
+    assert_success(&stats);
+    let stats = json_output(&stats);
+    assert_eq!(stats["lineage_invocations"], 0);
+    assert_eq!(stats["recipe_results"], 0);
 }
 
 #[test]

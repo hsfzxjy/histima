@@ -6,7 +6,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use histima::{CATALOG_LIST_LIMIT, ExecutionEngine, ReplayPolicy, RunError, Workspace};
+use histima::{
+    CATALOG_LIST_LIMIT, ExecutionEngine, ReplayPolicy, ResultStockPolicy, RunError, Workspace,
+};
 use tima::backend::cache::ArtifactCacheStatus;
 use tima::identity::{ArtifactIdentity, ContentIdentity, RecipeIdentity, content_identity};
 use tima::lineage::{LineageNode, RecordedValue};
@@ -605,11 +607,14 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let result = workspace
                 .evaluate_pipeline(&compiled)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
-            let stockable =
-                matches!(&result.value.data, ValueData::Bytes(_))
-                    && result.value.lineage.as_ref().is_some_and(|lineage| {
-                        matches!(lineage.node(), LineageNode::Invocation(_))
-                    });
+            let stockable = matches!(
+                &result.value.data,
+                ValueData::Bytes(_) | ValueData::Buffer(_)
+            ) && result
+                .value
+                .lineage
+                .as_ref()
+                .is_some_and(|lineage| matches!(lineage.node(), LineageNode::Invocation(_)));
             let stocked = stockable
                 .then(|| workspace.record_value(&result.value))
                 .transpose()
@@ -639,6 +644,11 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 .map(|value| value.parse::<ExecutionEngine>())
                 .transpose()?
                 .unwrap_or_default();
+            let stock_policy = if take_flag(&mut arguments, "--stock-intermediates")? {
+                ResultStockPolicy::ReachableInvocations
+            } else {
+                ResultStockPolicy::None
+            };
             let record_bindings = take_record_options(&mut arguments)?;
             let workspace_path = workspace_path(&mut arguments, 1)?;
             let script_path = required(&mut arguments, "Tima source path")?;
@@ -657,7 +667,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                     )
                 })?;
             let result = workspace
-                .execute_with_engine(&compiled, engine)
+                .execute_with_engine_and_stocking(&compiled, engine, stock_policy)
                 .map_err(|error| render_run_error(&compiled.source, error))?;
             let recorded = record_bindings
                 .iter()
@@ -675,6 +685,7 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
             let json = cli_json::run(&result, &recorded);
             output.emit(json, || {
                 println!("execution_engine = {}", result.engine.name());
+                println!("result_stock_policy = {}", result.stock_policy.name());
                 println!(
                     "artifact_cache = {}",
                     result.artifact_cache.map_or("none", |status| match status {
@@ -689,6 +700,22 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                 println!("result_cache_hits = {}", result.result_cache.hits);
                 println!("result_cache_misses = {}", result.result_cache.misses);
                 println!("result_cache_stores = {}", result.result_cache.stores);
+                println!("stocked_result_count = {}", result.stocked_results.len());
+                for (index, stocked) in result.stocked_results.iter().enumerate() {
+                    println!("stocked[{index}].transform = {}", stocked.transform_name);
+                    println!(
+                        "stocked[{index}].recipe_id = {}",
+                        stocked.recorded.recipe_id
+                    );
+                    println!(
+                        "stocked[{index}].content_id = {}",
+                        stocked.recorded.content_id
+                    );
+                    println!(
+                        "stocked[{index}].byte_length = {}",
+                        stocked.recorded.byte_len
+                    );
+                }
                 let unbound_trace = result.execution.last_value.as_ref().and_then(|last| {
                     let ValueData::Lineage(lineage) = &last.data else {
                         return None;
@@ -1032,7 +1059,7 @@ fn print_usage() {
     eprintln!("  histima expression [workspace] <recipe-id> [--input <tima-expression>]");
     eprintln!("  histima pipeline [workspace] <tima-expression>");
     eprintln!(
-        "  histima run [workspace] <file.tima> [--engine <interpreter|hybrid-aot>] [--record <binding>]..."
+        "  histima run [workspace] <file.tima> [--engine <interpreter|hybrid-aot>] [--stock-intermediates] [--record <binding>]..."
     );
     eprintln!("  histima replay [workspace] <file.tima> <recipe-id> [--snapshot]");
     eprintln!("  histima trace [workspace] <recipe-id>");

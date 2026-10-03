@@ -1208,6 +1208,16 @@ including padding; loading reconstructs and validates the Buffer layout before
 cache reuse or replay. Its storage encoding is a host persistence detail and
 does not replace or alter the semantic Buffer Content ID.
 
+Durable stocking is Histima host policy, not Tima semantics. By default,
+`histima run` stocks only bindings explicitly selected with `--record`. With
+the explicit `--stock-intermediates` policy, Histima waits for the complete
+program to succeed and then stocks newly produced immutable `Bytes` and
+`Buffer` invocation results reachable through the final outer bindings or
+final expression. Results reachable only from discarded expressions, scalar
+results, and all results from a failed program are not stocked. The policy
+does not affect Transform, Recipe, or Content IDs, lineage, or execution-engine
+selection.
+
 A result-cache hit receives the current semantic invocation lineage. The hit
 does not add an execution-history node. Conflicting content for one Recipe ID
 is a reproducibility error.

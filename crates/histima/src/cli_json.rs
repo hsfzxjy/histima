@@ -3,7 +3,7 @@ use std::path::Path;
 use histima::{
     ArtifactInfo, ArtifactInspection, AssetSummary, CatalogInfo, CatalogPage, CatalogSearch,
     CatalogStats, ContentInspection, DurableTrace, ImportedAsset, PipelineExecution,
-    ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult,
+    ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult, StockedResult,
     WorkspaceSummary, WorkspaceVerification,
 };
 use serde_json::{Map, Value, json};
@@ -333,6 +333,8 @@ pub fn run(result: &ProgramExecution, recorded: &[(String, RecordedResult)]) -> 
     let single_record = (records.len() == 1).then(|| records[0].clone());
     json!({
         "execution_engine": result.engine.name(),
+        "result_stock_policy": result.stock_policy.name(),
+        "stocked_results": result.stocked_results.iter().map(stocked_result).collect::<Vec<_>>(),
         "artifact_cache": result.artifact_cache.map(|status| match status {
             ArtifactCacheStatus::Hit => "hit",
             ArtifactCacheStatus::Miss => "miss",
@@ -343,6 +345,15 @@ pub fn run(result: &ProgramExecution, recorded: &[(String, RecordedResult)]) -> 
         "trace": trace,
         "recorded": single_record,
         "records": records,
+    })
+}
+
+fn stocked_result(stocked: &StockedResult) -> Value {
+    json!({
+        "transform": stocked.transform_name,
+        "recipe_id": stocked.recorded.recipe_id.to_string(),
+        "content_id": stocked.recorded.content_id.to_string(),
+        "byte_length": stocked.recorded.byte_len,
     })
 }
 

@@ -68,6 +68,13 @@ JSON keeps the legacy `recorded`
 object for a single binding and reports every selected result in the `records`
 array; for a multi-record run, `recorded` is null and `records` is authoritative.
 
+Pass `--stock-intermediates` to opt into durable caching of recordable
+transform results reachable from the completed program's outer bindings or
+final expression. Stocking happens only after the whole run succeeds, covers
+immutable `Bytes` and `Buffer` results, and ignores discarded expressions and
+scalar-only results. JSON reports results newly produced and selected by this
+policy in `stocked_results`; subsequent runs can reuse them directly.
+
 `histima summary [workspace]` combines catalog counts with bounded first pages
 of assets and recipes and the callable transform registry. `--limit <1-100>`
 applies independently to each section; asset and recipe cursors can be passed
@@ -110,8 +117,8 @@ workspaces produce a structured report and non-zero exit status; verification
 never repairs or removes data.
 
 `histima pipeline [workspace] <expression>` accepts exactly one outer Tima
-expression. Invocation-derived byte results are automatically recorded in
-workspace stock, so a later process can reuse them. Custom `transform`
+expression. Invocation-derived `Bytes` and `Buffer` results are automatically
+recorded in workspace stock, so a later process can reuse them. Custom `transform`
 declarations remain file-based through `histima run`.
 
 `histima expression [workspace] <recipe-id>` prints one outer-Tima expression

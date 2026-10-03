@@ -11,9 +11,9 @@ use tima::cache::{CacheError, CacheStats, ResultCache, TransformResultCache};
 use tima::capability::World;
 use tima::identity::{ContentIdentity, RecipeIdentity, byte_content_identity};
 use tima::lineage::{Lineage, LineageNode};
-use tima::runtime::{Execution, OuterValue};
+use tima::runtime::{Execution, OuterValue, ValueData};
 
-use crate::{ArtifactInfo, Workspace};
+use crate::{ArtifactInfo, RecordedResult, Workspace};
 
 /// The observable result of one Tima program execution in a Histima workspace.
 ///
@@ -23,9 +23,35 @@ use crate::{ArtifactInfo, Workspace};
 pub struct ProgramExecution {
     pub execution: Execution,
     pub engine: ExecutionEngine,
+    pub stock_policy: ResultStockPolicy,
+    pub stocked_results: Vec<StockedResult>,
     pub artifact: Option<ArtifactInfo>,
     pub artifact_cache: Option<ArtifactCacheStatus>,
     pub result_cache: CacheStats,
+}
+
+/// Host storage policy applied only after a complete successful execution.
+/// It does not participate in Tima semantics, lineage, or identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResultStockPolicy {
+    #[default]
+    None,
+    ReachableInvocations,
+}
+
+impl ResultStockPolicy {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ReachableInvocations => "reachable-invocations",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StockedResult {
+    pub transform_name: String,
+    pub recorded: RecordedResult,
 }
 
 /// Explicit execution policy for source-defined Tima transforms.
@@ -145,6 +171,43 @@ impl Workspace {
         program: &CompiledProgram,
         engine: ExecutionEngine,
     ) -> Result<ProgramExecution, RunError> {
+        self.execute_with_engine_collecting(program, engine)
+            .map(|(execution, _)| execution)
+    }
+
+    /// Executes a program and, after it has completed successfully, applies an
+    /// explicit durable-result stocking policy. Reachability starts at final
+    /// outer bindings and the final expression, so discarded expression
+    /// results are not retained.
+    pub fn execute_with_engine_and_stocking(
+        &mut self,
+        program: &CompiledProgram,
+        engine: ExecutionEngine,
+        policy: ResultStockPolicy,
+    ) -> Result<ProgramExecution, RunError> {
+        let (mut execution, candidates) = self.execute_with_engine_collecting(program, engine)?;
+        execution.stock_policy = policy;
+        if policy == ResultStockPolicy::ReachableInvocations {
+            execution.stocked_results = candidates
+                .into_iter()
+                .map(|candidate| {
+                    self.record_value(&candidate.value)
+                        .map(|recorded| StockedResult {
+                            transform_name: candidate.transform_name,
+                            recorded,
+                        })
+                        .map_err(RunError::Storage)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        Ok(execution)
+    }
+
+    fn execute_with_engine_collecting(
+        &self,
+        program: &CompiledProgram,
+        engine: ExecutionEngine,
+    ) -> Result<(ProgramExecution, Vec<StockCandidate>), RunError> {
         let mut result_cache = WorkspaceResultCache::new(self);
         let (execution, cached_artifact) = match engine {
             ExecutionEngine::Interpreter => (
@@ -176,13 +239,20 @@ impl Workspace {
             .map(cached_artifact_info)
             .transpose()
             .map_err(RunError::Storage)?;
-        Ok(ProgramExecution {
-            execution,
-            engine,
-            artifact,
-            artifact_cache,
-            result_cache: result_cache.stats,
-        })
+        let stats = result_cache.stats;
+        let candidates = result_cache.reachable_candidates(&execution);
+        Ok((
+            ProgramExecution {
+                execution,
+                engine,
+                stock_policy: ResultStockPolicy::None,
+                stocked_results: vec![],
+                artifact,
+                artifact_cache,
+                result_cache: stats,
+            },
+            candidates,
+        ))
     }
 
     /// Replays a durable recipe against current transform definitions and
@@ -331,6 +401,7 @@ fn collect_snapshots(
 struct WorkspaceResultCache<'workspace> {
     workspace: &'workspace Workspace,
     memory: TransformResultCache,
+    produced: BTreeMap<RecipeIdentity, OuterValue>,
     stats: CacheStats,
 }
 
@@ -339,9 +410,81 @@ impl<'workspace> WorkspaceResultCache<'workspace> {
         Self {
             workspace,
             memory: TransformResultCache::default(),
+            produced: BTreeMap::new(),
             stats: CacheStats::default(),
         }
     }
+
+    fn reachable_candidates(&self, execution: &Execution) -> Vec<StockCandidate> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut candidates = Vec::new();
+        for value in execution
+            .bindings
+            .values()
+            .chain(execution.last_value.iter())
+        {
+            collect_value_stock_candidates(value, &self.produced, &mut seen, &mut candidates);
+        }
+        candidates
+    }
+}
+
+struct StockCandidate {
+    transform_name: String,
+    value: OuterValue,
+}
+
+fn collect_value_stock_candidates(
+    value: &OuterValue,
+    produced: &BTreeMap<RecipeIdentity, OuterValue>,
+    seen: &mut std::collections::BTreeSet<RecipeIdentity>,
+    candidates: &mut Vec<StockCandidate>,
+) {
+    if let Some(lineage) = &value.lineage {
+        collect_stock_candidates(lineage, produced, seen, candidates);
+    }
+    match &value.data {
+        ValueData::List(values) => {
+            for value in values.iter() {
+                collect_value_stock_candidates(value, produced, seen, candidates);
+            }
+        }
+        ValueData::Record(values) => {
+            for value in values.values() {
+                collect_value_stock_candidates(value, produced, seen, candidates);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_stock_candidates(
+    lineage: &Lineage,
+    produced: &BTreeMap<RecipeIdentity, OuterValue>,
+    seen: &mut std::collections::BTreeSet<RecipeIdentity>,
+    candidates: &mut Vec<StockCandidate>,
+) {
+    let LineageNode::Invocation(invocation) = lineage.node() else {
+        return;
+    };
+    for argument in invocation.arguments.iter() {
+        if let Some(parent) = &argument.lineage {
+            collect_stock_candidates(parent, produced, seen, candidates);
+        }
+    }
+    if !seen.insert(invocation.recipe_id) {
+        return;
+    }
+    let Some(value) = produced.get(&invocation.recipe_id) else {
+        return;
+    };
+    if !matches!(value.data, ValueData::Bytes(_) | ValueData::Buffer(_)) {
+        return;
+    }
+    candidates.push(StockCandidate {
+        transform_name: invocation.transform_name.to_string(),
+        value: value.clone().with_lineage(lineage.clone()),
+    });
 }
 
 impl ResultCache for WorkspaceResultCache<'_> {
@@ -389,6 +532,9 @@ impl ResultCache for WorkspaceResultCache<'_> {
     ) -> Result<ContentIdentity, CacheError> {
         let before = self.memory.stats().stores;
         let identity = self.memory.store(recipe, value)?;
+        self.produced
+            .entry(recipe)
+            .or_insert_with(|| OuterValue::plain(value.data.clone()));
         self.stats.stores += self.memory.stats().stores.saturating_sub(before);
         Ok(identity)
     }

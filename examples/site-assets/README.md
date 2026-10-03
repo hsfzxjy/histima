@@ -10,13 +10,16 @@ From this directory, create a disposable workspace and run the pipeline:
 ```text
 cargo run --manifest-path ../../Cargo.toml -p histima -- init ../../build/site-assets-work
 cargo run --manifest-path ../../Cargo.toml -p histima -- import --workspace ../../build/site-assets-work inputs --recursive
-cargo run --manifest-path ../../Cargo.toml -p histima -- run ../../build/site-assets-work pipeline.tima --record hero_buffer --record hero_png --record hero_webp --record thumbnail_png --record thumbnail_webp --json
+cargo run --manifest-path ../../Cargo.toml -p histima -- run ../../build/site-assets-work pipeline.tima --stock-intermediates --record hero_buffer --record hero_png --record hero_webp --record thumbnail_png --record thumbnail_webp --json
 ```
 
-The last command prints all five recorded Recipe and Content IDs in one
-`records` array, including the immutable intermediate Buffer. Run it again to
-observe result-cache reuse, or select the optional hybrid engine to exercise
-its interpreter fallback for the Buffer transform:
+The last command prints all five explicitly selected Recipe and Content IDs in
+one `records` array and eagerly stocks every reachable `Bytes`/`Buffer`
+invocation after the successful run. Its `stocked_results` array includes the
+decodes, user Buffer transforms, and encodes; imported source reads already
+refer to durable source content rather than a transform result. Run it again
+to observe reuse across the full transform graph, or select the optional
+hybrid engine to exercise its interpreter fallback for the Buffer transform:
 
 ```text
 cargo run --manifest-path ../../Cargo.toml -p histima -- run ../../build/site-assets-work pipeline.tima --engine hybrid-aot --record hero_webp --json
@@ -38,10 +41,11 @@ cargo run --manifest-path ../../Cargo.toml -p histima -- materialize ../../build
   stocked only one binding, forcing repeated executions. Repeating
   `--record <binding>` now stocks all selected outputs in one execution and
   reports them through the JSON `records` array.
-- **Runtime problem (partially addressed):** selected immutable Buffers can now
-  be stored, validated, replayed, and reused across processes. Unselected
-  siblings and intermediates are still recomputed; eagerly stocking a complete
-  successful build graph needs a deliberate storage-policy design.
+- **Runtime problem (addressed for this workload):** selected immutable Buffers
+  can be stored, validated, replayed, and reused across processes. The explicit
+  `--stock-intermediates` policy now stocks recordable invocation results
+  reachable from successful program outputs without retaining failed or
+  discarded work.
 - **Performance problem:** the indexed Buffer transform intentionally falls
   back to the interpreter under `hybrid-aot`; the current CLI reports the
   engine but does not explain the per-transform fallback decision.

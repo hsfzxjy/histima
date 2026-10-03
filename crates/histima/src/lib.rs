@@ -42,7 +42,8 @@ pub use catalog::{
 };
 pub use error::{Error, Result};
 pub use runner::{
-    ExecutionEngine, PipelineExecution, ProgramExecution, RecipeReplay, ReplayPolicy, RunError,
+    ExecutionEngine, PipelineExecution, ProgramExecution, RecipeReplay, ReplayPolicy,
+    ResultStockPolicy, RunError, StockedResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
