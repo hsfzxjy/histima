@@ -7,12 +7,16 @@ use crate::identity::{
     ArtifactIdentity, ContentIdentity, TransformIdentity, byte_content_identity,
     registered_wasm_artifact_identity, registered_wasm_transform_identity,
 };
+use crate::ir::Type;
 use crate::registered::RegisteredTransform;
 use crate::registered_wasm::{
     PLUGIN_ABI_VERSION, PluginArgument, PluginResult, PluginResultType, RegisteredWasmPlugin,
 };
 use crate::runtime::{OuterValue, ValueData};
 use crate::source::Span;
+use crate::transform::{
+    TransformImplementation, TransformInfo, TransformOrigin, TransformParameterInfo,
+};
 
 /// Value types supported by registered-Wasm ABI v4 manifests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,31 +50,6 @@ impl PluginValueType {
 pub struct PluginParameter {
     pub name: String,
     pub value_type: PluginValueType,
-}
-
-/// Read-only metadata for one configured plugin transform.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PluginTransformInfo {
-    pub name: String,
-    pub semantic_version: u32,
-    pub abi_version: u32,
-    pub parameters: Vec<PluginParameter>,
-    pub result: PluginValueType,
-    pub transform_id: TransformIdentity,
-    pub artifact_id: ArtifactIdentity,
-    pub module_content_id: ContentIdentity,
-}
-
-impl PluginTransformInfo {
-    pub fn signature(&self) -> String {
-        let parameters = self
-            .parameters
-            .iter()
-            .map(|parameter| format!("{}: {}", parameter.name, parameter.value_type.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{}({parameters}) -> {}", self.name, self.result.as_str())
-    }
 }
 
 /// Host-validated data needed to register one workspace-approved Wasm module.
@@ -224,7 +203,7 @@ impl PluginRegistry {
     }
 
     /// Returns configured transforms in stable name order.
-    pub fn transform_infos(&self) -> impl Iterator<Item = PluginTransformInfo> + '_ {
+    pub fn transform_infos(&self) -> impl Iterator<Item = TransformInfo> + '_ {
         self.transforms.iter().map(PluginTransform::info)
     }
 }
@@ -254,16 +233,35 @@ impl PluginTransform {
         self.identity
     }
 
-    fn info(&self) -> PluginTransformInfo {
-        PluginTransformInfo {
+    fn info(&self) -> TransformInfo {
+        TransformInfo {
             name: self.name.clone(),
-            semantic_version: self.semantic_version,
-            abi_version: self.abi_version,
-            parameters: self.parameters.clone(),
-            result: self.result,
+            origin: TransformOrigin::Workspace,
+            implementation: TransformImplementation::RegisteredWasm,
+            semantic_version: Some(self.semantic_version),
+            parameters: self
+                .parameters
+                .iter()
+                .map(|parameter| TransformParameterInfo {
+                    name: parameter.name.clone(),
+                    value_type: match parameter.value_type {
+                        PluginValueType::Bytes => Type::BytesView,
+                        PluginValueType::Buffer => Type::BufferView,
+                        PluginValueType::I64 => Type::I64,
+                    },
+                    default: None,
+                })
+                .collect(),
+            result: match self.result {
+                PluginValueType::Bytes => Type::Bytes,
+                PluginValueType::Buffer => Type::Buffer,
+                PluginValueType::I64 => Type::I64,
+            },
+            capabilities: Vec::new(),
             transform_id: self.identity,
-            artifact_id: self.artifact_identity,
-            module_content_id: self.module_content_identity,
+            abi_version: Some(self.abi_version),
+            artifact_id: Some(self.artifact_identity),
+            module_content_id: Some(self.module_content_identity),
         }
     }
 }

@@ -197,15 +197,18 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                         "transform[{index}].implementation = {}",
                         transform.implementation.as_str()
                     );
+                    println!("transform[{index}].origin = {}", transform.origin.as_str());
                     println!(
                         "transform[{index}].semantic_version = {}",
-                        transform.semantic_version
+                        transform
+                            .semantic_version
+                            .map_or_else(|| "none".to_owned(), |version| version.to_string())
                     );
                     println!(
                         "transform[{index}].transform_id = {}",
                         transform.transform_id
                     );
-                    println!("transform[{index}].signature = {}", transform.signature);
+                    println!("transform[{index}].signature = {}", transform.signature());
                 }
             })?;
         }
@@ -332,14 +335,26 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                     println!("plugin[{index}].name = {}", plugin.name);
                     println!(
                         "plugin[{index}].semantic_version = {}",
-                        plugin.semantic_version
+                        plugin
+                            .semantic_version
+                            .expect("workspace plugins are versioned")
                     );
-                    println!("plugin[{index}].abi_version = {}", plugin.abi_version);
+                    println!(
+                        "plugin[{index}].abi_version = {}",
+                        plugin.abi_version.expect("workspace plugins have an ABI")
+                    );
                     println!("plugin[{index}].transform_id = {}", plugin.transform_id);
-                    println!("plugin[{index}].artifact_id = {}", plugin.artifact_id);
+                    println!(
+                        "plugin[{index}].artifact_id = {}",
+                        plugin
+                            .artifact_id
+                            .expect("workspace plugins have an artifact")
+                    );
                     println!(
                         "plugin[{index}].module_content_id = {}",
-                        plugin.module_content_id
+                        plugin
+                            .module_content_id
+                            .expect("workspace plugins have module content")
                     );
                     println!("plugin[{index}].signature = {}", plugin.signature());
                 }
@@ -358,11 +373,14 @@ fn run(arguments: impl Iterator<Item = String>, output: OutputMode) -> Result<()
                         "transform[{index}].implementation = {}",
                         transform.implementation.as_str()
                     );
+                    println!("transform[{index}].origin = {}", transform.origin.as_str());
                     println!(
                         "transform[{index}].semantic_version = {}",
-                        transform.semantic_version
+                        transform
+                            .semantic_version
+                            .map_or_else(|| "none".to_owned(), |version| version.to_string())
                     );
-                    println!("transform[{index}].signature = {}", transform.signature);
+                    println!("transform[{index}].signature = {}", transform.signature());
                     println!(
                         "transform[{index}].transform_id = {}",
                         transform.transform_id

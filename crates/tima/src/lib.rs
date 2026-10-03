@@ -26,6 +26,7 @@ mod registered_wasm;
 pub mod runtime;
 pub mod semantic;
 pub mod source;
+pub mod transform;
 
 use ast::Program;
 use diagnostic::Diagnostic;
@@ -33,13 +34,21 @@ use identity::{TransformIdentities, TransformIdentity};
 use ir::TypedModule;
 use source::SourceFile;
 
-pub use registered::{
-    BuiltinDefaultValue, BuiltinParameterInfo, BuiltinTransformInfo, BuiltinValueType,
-};
-
 /// Returns the process-wide standard transform registry in stable registry order.
-pub fn builtin_transform_infos() -> impl Iterator<Item = BuiltinTransformInfo> {
+pub fn standard_transform_infos() -> impl Iterator<Item = transform::TransformInfo> {
     registered::RegisteredTransform::infos()
+}
+
+/// Returns every process-wide and configured registered transform in stable
+/// name order.
+pub fn registered_transform_infos(
+    plugins: &plugin::PluginRegistry,
+) -> Vec<transform::TransformInfo> {
+    let mut transforms = standard_transform_infos()
+        .chain(plugins.transform_infos())
+        .collect::<Vec<_>>();
+    transforms.sort_by(|left, right| left.name.cmp(&right.name));
+    transforms
 }
 
 /// A parsed and statically checked Tima program.
@@ -50,6 +59,51 @@ pub struct CompiledProgram {
     pub transforms: TypedModule,
     pub identities: TransformIdentities,
     pub plugins: Arc<plugin::PluginRegistry>,
+}
+
+impl CompiledProgram {
+    /// Describes the effective callable namespace. Source definitions shadow
+    /// registered definitions exactly as they do during invocation.
+    pub fn transform_infos(&self) -> Vec<transform::TransformInfo> {
+        let mut names = BTreeSet::new();
+        let mut transforms = self
+            .transforms
+            .transforms
+            .iter()
+            .enumerate()
+            .map(|(index, definition)| {
+                names.insert(definition.name.clone());
+                transform::TransformInfo {
+                    name: definition.name.clone(),
+                    origin: transform::TransformOrigin::Source,
+                    implementation: transform::TransformImplementation::Tima,
+                    semantic_version: None,
+                    parameters: definition
+                        .parameters
+                        .iter()
+                        .map(|parameter| transform::TransformParameterInfo {
+                            name: parameter.name.clone(),
+                            value_type: parameter.ty,
+                            default: None,
+                        })
+                        .collect(),
+                    result: definition.return_type,
+                    capabilities: definition.capabilities.clone(),
+                    transform_id: self.identities.get(ir::TransformId(index as u32)),
+                    abi_version: None,
+                    artifact_id: None,
+                    module_content_id: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        transforms.extend(
+            registered_transform_infos(&self.plugins)
+                .into_iter()
+                .filter(|transform| names.insert(transform.name.clone())),
+        );
+        transforms.sort_by(|left, right| left.name.cmp(&right.name));
+        transforms
+    }
 }
 
 /// Runs the shared frontend and the inner-transform semantic pass.
@@ -202,6 +256,39 @@ fn callable_name(program: &Program, expression: ast::ExprId) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transform::{TransformImplementation, TransformOrigin};
+
+    #[test]
+    fn one_metadata_contract_describes_source_and_registered_transforms() {
+        let program = compile(
+            "metadata.tima",
+            "transform keep(value: i64) -> i64 { return value }\n",
+        )
+        .unwrap();
+        let transforms = program.transform_infos();
+        let source = transforms
+            .iter()
+            .find(|transform| transform.name == "keep")
+            .unwrap();
+        let standard = transforms
+            .iter()
+            .find(|transform| transform.name == "ppm.decode")
+            .unwrap();
+
+        assert_eq!(source.origin, TransformOrigin::Source);
+        assert_eq!(source.implementation, TransformImplementation::Tima);
+        assert_eq!(source.semantic_version, None);
+        assert_eq!(source.signature(), "keep(value: i64) -> i64");
+        assert_eq!(standard.origin, TransformOrigin::Standard);
+        assert_eq!(
+            standard.implementation,
+            TransformImplementation::RegisteredWasm
+        );
+        assert_eq!(
+            standard.signature(),
+            "ppm.decode(bytes: BytesView) -> Buffer"
+        );
+    }
 
     #[test]
     fn semantic_identity_prefixes_pin_outer_and_inner_transform_references() {

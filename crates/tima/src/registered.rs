@@ -2,8 +2,13 @@ use std::sync::Arc;
 
 use crate::diagnostic::Diagnostic;
 use crate::identity::{TransformIdentity, registered_transform_identity};
+use crate::ir::Type;
 use crate::runtime::{BufferValue, OuterValue, ValueData};
 use crate::source::Span;
+use crate::transform::{
+    TransformDefaultValue, TransformImplementation, TransformInfo, TransformOrigin,
+    TransformParameterInfo,
+};
 
 const PPM_DECODE_TRANSFORM_VERSION: u32 = 3;
 const PPM_ENCODE_TRANSFORM_VERSION: u32 = 3;
@@ -14,61 +19,22 @@ const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 3;
 const WEBP_DEFAULT_QUALITY: i64 = 85;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BuiltinDefaultValue {
+pub(crate) enum BuiltinDefaultValue {
     Integer(i64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BuiltinValueType {
+pub(crate) enum BuiltinValueType {
     Bytes,
     Buffer,
     I64,
 }
 
-impl BuiltinValueType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Bytes => "bytes",
-            Self::Buffer => "buffer",
-            Self::I64 => "i64",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BuiltinParameterInfo {
+pub(crate) struct BuiltinParameterInfo {
     pub name: &'static str,
     pub value_type: BuiltinValueType,
     pub default: Option<BuiltinDefaultValue>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BuiltinTransformInfo {
-    pub name: &'static str,
-    pub semantic_version: u32,
-    pub parameters: &'static [BuiltinParameterInfo],
-    pub result: BuiltinValueType,
-    pub transform_id: TransformIdentity,
-}
-
-impl BuiltinTransformInfo {
-    pub fn signature(self) -> String {
-        let parameters = self
-            .parameters
-            .iter()
-            .map(|parameter| {
-                let value_type = parameter.value_type.as_str();
-                match parameter.default {
-                    Some(BuiltinDefaultValue::Integer(value)) => {
-                        format!("{}: {value_type} = {value}", parameter.name)
-                    }
-                    None => format!("{}: {value_type}", parameter.name),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{}({parameters}) -> {}", self.name, self.result.as_str())
-    }
 }
 
 type Validator = fn(&[(OuterValue, Span)], Span) -> Result<(), Diagnostic>;
@@ -184,17 +150,43 @@ impl RegisteredTransform {
         registered_transform_identity(self.name, self.semantic_version)
     }
 
-    fn info(&self) -> BuiltinTransformInfo {
-        BuiltinTransformInfo {
-            name: self.name,
-            semantic_version: self.semantic_version,
-            parameters: self.parameters,
-            result: self.result,
+    fn info(&self) -> TransformInfo {
+        TransformInfo {
+            name: self.name.to_owned(),
+            origin: TransformOrigin::Standard,
+            implementation: TransformImplementation::RegisteredWasm,
+            semantic_version: Some(self.semantic_version),
+            parameters: self
+                .parameters
+                .iter()
+                .map(|parameter| TransformParameterInfo {
+                    name: parameter.name.to_owned(),
+                    value_type: match parameter.value_type {
+                        BuiltinValueType::Bytes => Type::BytesView,
+                        BuiltinValueType::Buffer => Type::BufferView,
+                        BuiltinValueType::I64 => Type::I64,
+                    },
+                    default: parameter.default.map(|default| match default {
+                        BuiltinDefaultValue::Integer(value) => {
+                            TransformDefaultValue::Integer(value)
+                        }
+                    }),
+                })
+                .collect(),
+            result: match self.result {
+                BuiltinValueType::Bytes => Type::Bytes,
+                BuiltinValueType::Buffer => Type::Buffer,
+                BuiltinValueType::I64 => Type::I64,
+            },
+            capabilities: Vec::new(),
             transform_id: self.identity(),
+            abi_version: None,
+            artifact_id: None,
+            module_content_id: None,
         }
     }
 
-    pub(crate) fn infos() -> impl Iterator<Item = BuiltinTransformInfo> {
+    pub(crate) fn infos() -> impl Iterator<Item = TransformInfo> {
         REGISTERED_TRANSFORMS.iter().map(Self::info)
     }
 }
@@ -387,7 +379,7 @@ mod tests {
         assert_eq!(transforms[0].name, "ppm.decode");
         assert_eq!(
             transforms[0].signature(),
-            "ppm.decode(bytes: bytes) -> buffer"
+            "ppm.decode(bytes: BytesView) -> Buffer"
         );
         assert_eq!(
             transforms[0].transform_id,
@@ -395,11 +387,11 @@ mod tests {
         );
         assert_eq!(
             transforms[3].signature(),
-            "png.encode(buffer: buffer, compression: i64 = 6) -> bytes"
+            "png.encode(buffer: BufferView, compression: i64 = 6) -> Bytes"
         );
         assert_eq!(
             transforms[4].signature(),
-            "webp.encode(buffer: buffer, quality: i64 = 85) -> bytes"
+            "webp.encode(buffer: BufferView, quality: i64 = 85) -> Bytes"
         );
     }
 

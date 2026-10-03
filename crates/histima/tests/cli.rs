@@ -1088,13 +1088,15 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
     assert_eq!(plugin["transform_id"], transform_id.to_string());
     assert_eq!(plugin["artifact_id"], artifact_id.to_string());
     assert_eq!(plugin["module_content_id"], module_content.to_string());
+    assert_eq!(plugin["origin"], "workspace");
+    assert_eq!(plugin["implementation"], "registered-wasm");
     assert_eq!(
         plugin["signature"],
-        "fixture.encode(buffer: buffer) -> bytes"
+        "fixture.encode(buffer: BufferView) -> Bytes"
     );
     assert_eq!(plugin["parameters"][0]["name"], "buffer");
-    assert_eq!(plugin["parameters"][0]["type"], "buffer");
-    assert_eq!(plugin["result"], "bytes");
+    assert_eq!(plugin["parameters"][0]["type"], "BufferView");
+    assert_eq!(plugin["result"], "Bytes");
 
     let transforms = histima(["transforms", text(&workspace), "--json"]);
     assert_success(&transforms);
@@ -1105,9 +1107,13 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
         .iter()
         .find(|transform| transform["name"] == "ppm.decode")
         .unwrap();
-    assert_eq!(builtin["implementation"], "builtin-registered-wasm");
+    assert_eq!(builtin["origin"], "standard");
+    assert_eq!(builtin["implementation"], "registered-wasm");
     assert_eq!(builtin["semantic_version"], 3);
-    assert_eq!(builtin["signature"], "ppm.decode(bytes: bytes) -> buffer");
+    assert_eq!(
+        builtin["signature"],
+        "ppm.decode(bytes: BytesView) -> Buffer"
+    );
     assert_eq!(
         builtin["transform_id"],
         tima::identity::registered_transform_identity("ppm.decode", 3).to_string()
@@ -1117,7 +1123,8 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
         .iter()
         .find(|transform| transform["name"] == "fixture.encode")
         .unwrap();
-    assert_eq!(external["implementation"], "workspace-registered-wasm");
+    assert_eq!(external["origin"], "workspace");
+    assert_eq!(external["implementation"], "registered-wasm");
     assert_eq!(external["signature"], plugin["signature"]);
     assert_eq!(external["transform_id"], transform_id.to_string());
     assert_eq!(external["artifact_id"], artifact_id.to_string());
@@ -1128,7 +1135,7 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
     assert_eq!(field(&human_plugins, "count"), "1");
     assert_eq!(
         field(&human_plugins, "plugin[0].signature"),
-        "fixture.encode(buffer: buffer) -> bytes"
+        "fixture.encode(buffer: BufferView) -> Bytes"
     );
     fs::write(
         &script,

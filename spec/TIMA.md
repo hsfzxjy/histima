@@ -459,6 +459,16 @@ source-defined transforms that declare capabilities. This direct interface
 applies standard default arguments and attaches the same invocation lineage as
 an outer Tima call; it does not implicitly provide a result cache.
 
+Rust inspection uses one `TransformInfo` contract for every implementation.
+It reports the transform's origin (`source`, `standard`, or `workspace`), its
+implementation family (`tima` or `registered-wasm`), ordered parameters and
+defaults, exact Tima boundary types, result, capabilities, Transform ID, and
+optional version, ABI, Artifact ID, and module Content ID. Thus a Wasm
+manifest's `buffer` input is inspected as `BufferView`, while its `buffer`
+result is inspected as owned `Buffer`. `CompiledProgram::transform_infos`
+includes source and registered definitions; `registered_transform_infos`
+provides the process-wide standard and workspace-configured subset.
+
 ### 7.1 Types
 
 The implemented inner types are:
@@ -727,10 +737,10 @@ not implemented.
 
 `histima transforms [workspace]` lists the callable standard transforms and
 workspace-configured plugins in stable name order. Each entry reports its
-implementation kind, semantic version, normalized signature, and Transform
-ID. Workspace plugins additionally report their ABI, Artifact, and module
-Content IDs. Transforms declared inside a Tima source file belong to that
-compilation and are intentionally not a workspace registry.
+origin, implementation family, semantic version, exact boundary signature,
+and Transform ID. Workspace plugins additionally report their ABI, Artifact,
+and module Content IDs. Transforms declared inside a Tima source file belong
+to that compilation and are intentionally not a workspace registry.
 
 ### 11.1 Registered-Wasm ABI v4
 

@@ -14,7 +14,8 @@ The repository currently provides:
 - a production typed-IR interpreter with owned mutable inner values,
   read-only aliasable views, and freeze-on-return;
 - one call/lineage/replay path for source Tima, standard, and registered-Wasm
-  transforms, also exposed to Rust hosts as `runtime::invoke_transform`;
+  transforms, also exposed to Rust hosts as `runtime::invoke_transform`, plus
+  one `TransformInfo` inspection contract for all three origins;
 - a capability-controlled `World` boundary for observable external state;
 - a SQLite catalog at `.histima.sql3` plus a filesystem content-addressed
   store for durable assets, lineage, recipes, and results;

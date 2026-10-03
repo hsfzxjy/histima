@@ -1,17 +1,17 @@
 use std::path::Path;
 
 use histima::{
-    ArtifactInfo, ArtifactInspection, AssetSummary, AvailableTransformInfo, CatalogInfo,
-    CatalogPage, CatalogSearch, CatalogStats, ContentInspection, DurableTrace, ImportedAsset,
-    PipelineExecution, ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary,
-    RecordedResult, WorkspaceSummary, WorkspaceVerification,
+    ArtifactInfo, ArtifactInspection, AssetSummary, CatalogInfo, CatalogPage, CatalogSearch,
+    CatalogStats, ContentInspection, DurableTrace, ImportedAsset, PipelineExecution,
+    ProgramExecution, RecipeInspection, RecipeReplay, RecipeSummary, RecordedResult,
+    WorkspaceSummary, WorkspaceVerification,
 };
 use serde_json::{Map, Value, json};
 use tima::cache::CacheStats;
 use tima::identity::SemanticValueIdentity;
 use tima::lineage::{LineageNode, RecordedValue};
-use tima::plugin::PluginTransformInfo;
 use tima::runtime::{OuterValue, ValueData};
+use tima::transform::TransformInfo;
 
 pub fn init(workspace: &Path, info: &CatalogInfo) -> Value {
     json!({
@@ -137,34 +137,37 @@ pub fn summary(value: &WorkspaceSummary) -> Value {
     })
 }
 
-pub fn plugins(plugins: &[PluginTransformInfo]) -> Value {
+pub fn plugins(plugins: &[TransformInfo]) -> Value {
     json!({
         "count": plugins.len(),
         "plugins": plugins.iter().map(|plugin| json!({
             "name": plugin.name,
             "semantic_version": plugin.semantic_version,
             "abi_version": plugin.abi_version,
+            "origin": plugin.origin.as_str(),
+            "implementation": plugin.implementation.as_str(),
             "transform_id": plugin.transform_id.to_string(),
-            "artifact_id": plugin.artifact_id.to_string(),
-            "module_content_id": plugin.module_content_id.to_string(),
+            "artifact_id": plugin.artifact_id.map(|identity| identity.to_string()),
+            "module_content_id": plugin.module_content_id.map(|identity| identity.to_string()),
             "signature": plugin.signature(),
             "parameters": plugin.parameters.iter().map(|parameter| json!({
                 "name": parameter.name,
-                "type": parameter.value_type.as_str(),
+                "type": parameter.value_type.name(),
             })).collect::<Vec<_>>(),
-            "result": plugin.result.as_str(),
+            "result": plugin.result.name(),
         })).collect::<Vec<_>>(),
     })
 }
 
-pub fn transforms(transforms: &[AvailableTransformInfo]) -> Value {
+pub fn transforms(transforms: &[TransformInfo]) -> Value {
     json!({
         "count": transforms.len(),
         "transforms": transforms.iter().map(|transform| json!({
             "name": transform.name,
+            "origin": transform.origin.as_str(),
             "implementation": transform.implementation.as_str(),
             "semantic_version": transform.semantic_version,
-            "signature": transform.signature,
+            "signature": transform.signature(),
             "transform_id": transform.transform_id.to_string(),
             "abi_version": transform.abi_version,
             "artifact_id": transform.artifact_id.map(|identity| identity.to_string()),
