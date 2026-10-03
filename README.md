@@ -266,7 +266,9 @@ references, and legacy/future artifact metadata. CAS publication and output
 materialization are atomic, and materialization refuses to replace an existing
 file.
 
-Tima keeps distinct hash domains for Transform ID, Recipe ID, Content ID,
+Tima derives Transform IDs through an explicitly unstable hash-only IR rather
+than serializing compiler data structures directly. Tima keeps distinct hash
+domains for Transform ID, Recipe ID, Content ID,
 Source ID, Dependency ID, and Artifact ID. Backend choice, cache hits, and
 execution timestamps never alter semantic derivation lineage. The Cranelift
 artifact cache remains independent from the existing Recipe-ID result cache.

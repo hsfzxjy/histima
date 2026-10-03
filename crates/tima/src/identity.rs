@@ -1,17 +1,14 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::ast::BinaryOp;
 use crate::diagnostic::Diagnostic;
-use crate::ir::{
-    Capability, Constant, RuntimeCall, Terminator, TransformId, Type, TypedModule, ValueKind,
-};
+use crate::hash_ir;
+use crate::ir::{TransformId, TypedModule, ValueKind};
 use crate::runtime::{OuterValue, ValueData};
 
 /// Version of Tima's canonical semantic encoding. Incrementing this does not
 /// change the native ABI version; it deliberately invalidates semantic IDs.
 pub const SEMANTIC_ID_VERSION: u32 = 1;
-const TRANSFORM_ID_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Digest([u8; 32]);
@@ -230,11 +227,11 @@ pub fn transform_identities(module: &TypedModule) -> Result<TransformIdentities,
 /// Semantic identity for a registered transform whose implementation is
 /// versioned independently from user-authored typed IR.
 pub fn registered_transform_identity(name: &str, semantic_version: u32) -> TransformIdentity {
-    let mut hasher = CanonicalHasher::new(b"tima.registered-transform");
-    hasher.u32(SEMANTIC_ID_VERSION);
-    hasher.bytes(name.as_bytes());
-    hasher.u32(semantic_version);
-    TransformIdentity(Digest::from_hasher(hasher))
+    hash_transform_definition(&hash_ir::external(
+        "histima.standard-transform",
+        name,
+        semantic_version,
+    ))
 }
 
 /// Semantic identity for an explicitly registered Wasm transform contract.
@@ -249,17 +246,18 @@ pub fn registered_wasm_transform_identity(
     parameters: &[(&str, u8)],
     result: u8,
 ) -> TransformIdentity {
-    let mut hasher = CanonicalHasher::new(b"tima.registered-wasm-transform");
-    hasher.u32(SEMANTIC_ID_VERSION);
-    hasher.bytes(name.as_bytes());
-    hasher.u32(semantic_version);
-    hasher.u32(abi_version);
-    hasher.u64(parameters.len() as u64);
-    for (parameter_name, parameter_type) in parameters {
-        hasher.bytes(parameter_name.as_bytes());
-        hasher.u8(*parameter_type);
-    }
-    hasher.u8(result);
+    hash_transform_definition(&hash_ir::registered_wasm_external(
+        name,
+        semantic_version,
+        abi_version,
+        parameters,
+        result,
+    ))
+}
+
+fn hash_transform_definition(definition: &hash_ir::Definition) -> TransformIdentity {
+    let mut hasher = CanonicalHasher::new(b"tima.hash-ir.transform");
+    hasher.raw(&definition.canonical_bytes());
     TransformIdentity(Digest::from_hasher(hasher))
 }
 
@@ -295,127 +293,8 @@ impl TransformIdentityResolver<'_> {
             referenced.push(identity);
         }
 
-        let mut hasher = CanonicalHasher::new(b"tima.transform");
-        hasher.u32(TRANSFORM_ID_VERSION);
-        hasher.u32(transform.capabilities.len() as u32);
-        for capability in &transform.capabilities {
-            hasher.u8(match capability {
-                Capability::EnvironmentRead => 1,
-                Capability::FileRead => 2,
-                Capability::HttpGet => 3,
-            });
-        }
-        hasher.u32(transform.parameters.len() as u32);
-        for parameter in &transform.parameters {
-            encode_type(&mut hasher, parameter.ty);
-        }
-        encode_type(&mut hasher, transform.return_type);
-        hasher.u32(transform.values.len() as u32);
-        for (value, referenced_identity) in transform.values.iter().zip(referenced) {
-            encode_type(&mut hasher, value.ty);
-            match &value.kind {
-                ValueKind::Parameter { index } => {
-                    hasher.u8(0);
-                    hasher.u32(*index);
-                }
-                ValueKind::Constant(constant) => {
-                    hasher.u8(1);
-                    encode_constant(&mut hasher, constant);
-                }
-                ValueKind::Binary { op, left, right } => {
-                    hasher.u8(2);
-                    encode_binary_op(&mut hasher, *op);
-                    hasher.u32(left.0);
-                    hasher.u32(right.0);
-                }
-                ValueKind::Call { arguments, .. } => {
-                    hasher.u8(3);
-                    hasher.raw(
-                        referenced_identity
-                            .expect("call values have referenced identity")
-                            .as_bytes(),
-                    );
-                    hasher.u32(arguments.len() as u32);
-                    for argument in arguments {
-                        hasher.u32(argument.0);
-                    }
-                }
-                ValueKind::BufferZero { buffer } => {
-                    hasher.u8(5);
-                    hasher.u32(buffer.0);
-                }
-                ValueKind::BufferFill { buffer, value } => {
-                    hasher.u8(6);
-                    hasher.u32(buffer.0);
-                    hasher.u32(value.0);
-                }
-                ValueKind::BufferByteElement => hasher.u8(7),
-                ValueKind::BufferByteMap {
-                    buffer,
-                    element,
-                    instructions,
-                    result,
-                } => {
-                    hasher.u8(8);
-                    hasher.u32(buffer.0);
-                    hasher.u32(element.0);
-                    hasher.u32(instructions.len() as u32);
-                    for instruction in instructions {
-                        hasher.u32(instruction.0);
-                    }
-                    hasher.u32(result.0);
-                }
-                ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
-                    hasher.u8(4);
-                    hasher.u8(0);
-                    hasher.bytes(name.as_bytes());
-                }
-                ValueKind::RuntimeCall(RuntimeCall::EnvironmentRead { name }) => {
-                    hasher.u8(4);
-                    hasher.u8(1);
-                    hasher.u32(name.0);
-                }
-                ValueKind::RuntimeCall(RuntimeCall::FileRead { path }) => {
-                    hasher.u8(4);
-                    hasher.u8(2);
-                    hasher.u32(path.0);
-                }
-                ValueKind::RuntimeCall(RuntimeCall::HttpGet { url }) => {
-                    hasher.u8(4);
-                    hasher.u8(3);
-                    hasher.u32(url.0);
-                }
-            }
-        }
-        hasher.u32(transform.blocks.len() as u32);
-        hasher.u32(transform.entry.0);
-        for block in &transform.blocks {
-            hasher.u32(block.instructions.len() as u32);
-            for instruction in &block.instructions {
-                hasher.u32(instruction.0);
-            }
-            match block.terminator {
-                Terminator::Return(value) => {
-                    hasher.u8(0);
-                    hasher.u32(value.0);
-                }
-                Terminator::Jump(target) => {
-                    hasher.u8(2);
-                    hasher.u32(target.0);
-                }
-                Terminator::Branch {
-                    condition,
-                    then_block,
-                    else_block,
-                } => {
-                    hasher.u8(1);
-                    hasher.u32(condition.0);
-                    hasher.u32(then_block.0);
-                    hasher.u32(else_block.0);
-                }
-            }
-        }
-        let identity = TransformIdentity(Digest::from_hasher(hasher));
+        let definition = hash_ir::lower_tima(transform, &referenced);
+        let identity = hash_transform_definition(&definition);
         self.visiting[id.0 as usize] = false;
         self.values[id.0 as usize] = Some(identity);
         Ok(identity)
@@ -661,59 +540,6 @@ impl fmt::Display for IdentityError {
 }
 
 impl Error for IdentityError {}
-
-fn encode_type(hasher: &mut CanonicalHasher, ty: Type) {
-    hasher.u8(match ty {
-        Type::Bool => 0,
-        Type::I64 => 1,
-        Type::F32 => 2,
-        // Keep the retired Image/ImageView tags unavailable. Buffer has
-        // different semantics and therefore must not reuse their identities.
-        Type::Buffer => 10,
-        Type::BufferView => 11,
-        Type::U8 => 5,
-        Type::String => 6,
-        Type::StringView => 7,
-        Type::Bytes => 8,
-        Type::BytesView => 9,
-    });
-}
-
-fn encode_constant(hasher: &mut CanonicalHasher, constant: &Constant) {
-    match constant {
-        Constant::Bool(value) => {
-            hasher.u8(0);
-            hasher.u8(u8::from(*value));
-        }
-        Constant::I64(value) => {
-            hasher.u8(1);
-            hasher.i64(*value);
-        }
-        Constant::F32(value) => {
-            hasher.u8(2);
-            hasher.u32(value.to_bits());
-        }
-        Constant::String(value) => {
-            hasher.u8(3);
-            hasher.bytes(value.as_bytes());
-        }
-    }
-}
-
-fn encode_binary_op(hasher: &mut CanonicalHasher, op: BinaryOp) {
-    hasher.u8(match op {
-        BinaryOp::Add => 0,
-        BinaryOp::Subtract => 1,
-        BinaryOp::Multiply => 2,
-        BinaryOp::Divide => 3,
-        BinaryOp::Equal => 4,
-        BinaryOp::NotEqual => 5,
-        BinaryOp::Less => 6,
-        BinaryOp::LessEqual => 7,
-        BinaryOp::Greater => 8,
-        BinaryOp::GreaterEqual => 9,
-    });
-}
 
 struct CanonicalHasher {
     hash: Sha256,

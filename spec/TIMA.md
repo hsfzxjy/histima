@@ -876,8 +876,8 @@ All public identities have the canonical text form of exactly 64 lowercase
 hexadecimal characters. Each identity kind has a distinct hash domain.
 
 - **Transform ID** identifies semantic transform behavior. It is derived from
-  canonical typed IR and referenced Transform IDs. Formatting, comments, local
-  names, transform names, declaration order, backend, and target do not
+  canonical Hash IR and referenced Transform IDs. Formatting, comments, local
+  names, source transform names, declaration order, backend, and target do not
   normally affect it.
 - **Recipe ID** identifies one semantic invocation. It includes Transform ID,
   ordered semantic argument identities, and sorted/deduplicated observed
@@ -895,6 +895,28 @@ hexadecimal characters. Each identity kind has a distinct hash domain.
 
 Source text itself is not a semantic identity. Recipe ID and Content ID are
 not interchangeable: distinct recipes may produce identical content.
+
+#### Draft Hash IR
+
+Transform identity no longer serializes the compiler's typed-IR structs
+directly. Typed Tima transforms lower to a hash-only representation containing
+only their ordered boundary types, capability set, typed semantic values,
+referenced Transform IDs, control-flow blocks, and entry block. Source spans,
+source-facing transform/local/parameter names, backend choices, and artifact
+configuration are absent.
+
+Non-Tima transforms use an external semantic-operation node containing a
+scheme, semantic operation name and version, and (when the scheme requires it)
+an interface version plus ordered named parameter/result type codes. Exact
+Wasm module bytes and Artifact IDs remain outside Hash IR.
+
+The current public Rust module is `tima::hash_ir`, and its encoding starts with
+`TIMA-HASH-IR\0` and draft format version `0`. Version 0 is explicitly
+unstable: it exists to decouple identity from compiler representation and to
+build an equivalence/distinction corpus. It is not yet a persistence or
+cross-implementation contract. This section will specify a complete node/tag
+table, canonical byte grammar, domain separator, and golden hashes only when
+Hash IR v1 is frozen.
 
 ### 12.3 Result and artifact caches
 
