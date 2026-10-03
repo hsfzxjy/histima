@@ -698,16 +698,13 @@ fn cli_runs_the_repository_site_asset_workflow() {
             "import",
             "--workspace",
             text(&workspace),
-            "inputs",
-            "--recursive",
+            "inputs/hero.ppm",
             "--json",
         ],
     );
     assert_success(&imported);
     let imported = json_output(&imported);
-    assert_eq!(imported["count"], 2);
-    assert_eq!(imported["assets"][0]["locator"], "inputs/hero.ppm");
-    assert_eq!(imported["assets"][1]["locator"], "inputs/thumbnail.ppm");
+    assert_eq!(imported["locator"], "inputs/hero.ppm");
 
     let first = histima_in(
         &example,
@@ -736,7 +733,7 @@ fn cli_runs_the_repository_site_asset_workflow() {
     assert_eq!(first["bindings"]["hero_buffer"]["shape"], json!([2, 4, 4]));
     assert_eq!(
         first["bindings"]["thumbnail_buffer"]["shape"],
-        json!([2, 2, 4])
+        json!([1, 2, 4])
     );
     assert_eq!(first["recorded"], Value::Null);
     assert_eq!(first["records"].as_array().unwrap().len(), 5);
@@ -753,7 +750,14 @@ fn cli_runs_the_repository_site_asset_workflow() {
             .iter()
             .filter(|name| **name == "ppm.decode")
             .count(),
-        2
+        1
+    );
+    assert_eq!(
+        stocked_transforms
+            .iter()
+            .filter(|name| **name == "rgba.resize_nearest")
+            .count(),
+        1
     );
     let hero_buffer = first["records"]
         .as_array()
@@ -771,7 +775,21 @@ fn cli_runs_the_repository_site_asset_workflow() {
         .unwrap();
     let recipe_id = json_string(hero_webp, "recipe_id").to_owned();
     let content_id = json_string(hero_webp, "content_id").to_owned();
+    let thumbnail_png = first["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["binding"] == "thumbnail_png")
+        .unwrap();
+    let thumbnail_recipe_id = json_string(thumbnail_png, "recipe_id").to_owned();
+    let thumbnail_content_id = json_string(thumbnail_png, "content_id").to_owned();
     assert!(first["trace"].as_str().unwrap().contains("invoke darken"));
+    assert!(
+        first["trace"]
+            .as_str()
+            .unwrap()
+            .contains("invoke rgba.resize_nearest")
+    );
     assert!(
         first["trace"]
             .as_str()
@@ -844,6 +862,29 @@ fn cli_runs_the_repository_site_asset_workflow() {
     );
     assert_success(&replay);
     assert_eq!(json_output(&replay)["content_id"], content_id);
+
+    let thumbnail_expression = histima_in(
+        &example,
+        ["expression", text(&workspace), &thumbnail_recipe_id],
+    );
+    assert_success(&thumbnail_expression);
+    assert!(stdout(&thumbnail_expression).contains("rgba.resize_nearest#"));
+
+    let thumbnail_replay = histima_in(
+        &example,
+        [
+            "replay",
+            text(&workspace),
+            "pipeline.tima",
+            &thumbnail_recipe_id,
+            "--json",
+        ],
+    );
+    assert_success(&thumbnail_replay);
+    assert_eq!(
+        json_output(&thumbnail_replay)["content_id"],
+        thumbnail_content_id
+    );
 
     let buffer_replay = histima_in(
         &example,
@@ -1512,7 +1553,7 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
     let transforms = histima(["transforms", text(&workspace), "--json"]);
     assert_success(&transforms);
     let transforms = json_output(&transforms);
-    assert_eq!(transforms["count"], 6);
+    assert_eq!(transforms["count"], 7);
     let transforms = transforms["transforms"].as_array().unwrap();
     let builtin = transforms
         .iter()
@@ -1530,6 +1571,15 @@ fn cli_loads_hashes_caches_and_replays_a_workspace_wasm_plugin() {
         tima::identity::registered_transform_identity("ppm.decode", 3).to_string()
     );
     assert_eq!(builtin["artifact_id"], Value::Null);
+    let resize = transforms
+        .iter()
+        .find(|transform| transform["name"] == "rgba.resize_nearest")
+        .unwrap();
+    assert_eq!(
+        resize["signature"],
+        "rgba.resize_nearest(buffer: BufferView, width: i64, height: i64) -> Buffer"
+    );
+    assert_eq!(resize["semantic_version"], 1);
     let external = transforms
         .iter()
         .find(|transform| transform["name"] == "fixture.encode")

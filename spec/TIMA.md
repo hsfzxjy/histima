@@ -738,9 +738,9 @@ asset capability. Tima code has no ambient OS access outside the World.
 
 Registered transforms use normal outer call and pipeline syntax. They have
 versioned semantic identities and use the same normalized arguments, lineage,
-result cache, and replay machinery as user transforms. The PPM, PNG, and WebP
-implementations are registered-Wasm plugins behind the same registry. The
-registry is not general native-library FFI.
+result cache, and replay machinery as user transforms. The PPM, PNG, WebP, and
+RGBA resize implementations are registered-Wasm plugins behind the same
+registry. The registry is not general native-library FFI.
 
 | Transform | Parameters | Result | Contract |
 | --- | --- | --- | --- |
@@ -749,6 +749,13 @@ registry is not general native-library FFI.
 | `png.decode` | `bytes` | `Buffer` | Still PNG; returns RGBA8 bytes with shape `[height, width, 4]`; APNG rejected |
 | `png.encode` | `buffer`, `compression=6` | bytes | Requires shape `[height, width, 4]` interpreted as RGBA8; compression 1 through 9 |
 | `webp.encode` | `buffer`, `quality=85` | bytes | Requires shape `[height, width, 4]` interpreted as RGBA8; quality 0 through 100 |
+| `rgba.resize_nearest` | `buffer`, `width`, `height` | `Buffer` | Requires shape `[height, width, 4]` interpreted as RGBA8; positive `i64` dimensions up to `u32::MAX`; returns a dense Buffer |
+
+`rgba.resize_nearest` maps each destination coordinate to
+`floor(destination_coordinate * source_size / destination_size)`. It copies
+all four channels exactly and ignores input row padding. The operation is a
+standard-library transform over the ordinary `Buffer` boundary; RGBA8 remains
+a transform contract rather than a Tima core type.
 
 Omitting a default and spelling its canonical value produce identical lineage
 arguments and Recipe IDs. A registered-transform implementation change that
@@ -765,10 +772,11 @@ to that compilation and are intentionally not a workspace registry.
 ### 11.1 Registered-Wasm ABI v4
 
 The current ABI is intentionally the exact slice required by the registered
-PPM, PNG, and WebP codecs: immutable Bytes and Buffer inputs, signed integer
-configuration, and owned Bytes and Buffer results. The ABI attaches only
-generic shape and stride metadata to Buffer values; codec-specific RGBA8
-interpretation is not a Tima type or descriptor tag. A module:
+PPM, PNG, and WebP codecs and the RGBA resize operation: immutable Bytes and
+Buffer inputs, signed integer configuration, and owned Bytes and Buffer
+results. The ABI attaches only generic shape and stride metadata to Buffer
+values; codec-specific RGBA8 interpretation is not a Tima type or descriptor
+tag. A module:
 
 - is Wasm32 and imports nothing (in particular, it has no WASI);
 - exports `memory`;

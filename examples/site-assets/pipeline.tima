@@ -20,9 +20,8 @@ hero_buffer = hero_source | read | ppm.decode | darken(0.72)
 hero_png = hero_buffer | png.encode(compression=6)
 hero_webp = hero_buffer | webp.encode(quality=84)
 
-thumbnail_source = asset("inputs/thumbnail.ppm")
-thumbnail_buffer = thumbnail_source | read | ppm.decode | darken(0.82)
+thumbnail_buffer = hero_buffer | rgba.resize_nearest(2, 1) | darken(0.82)
 thumbnail_png = thumbnail_buffer | png.encode(compression=6)
 thumbnail_webp = thumbnail_buffer | webp.encode(quality=78)
 
-trace(hero_webp)
+trace(thumbnail_webp)

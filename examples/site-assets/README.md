@@ -1,15 +1,16 @@
 # Website asset workflow
 
 This example exercises Histima as a small website-asset build rather than as a
-language fixture. Two imported PPM sources are decoded into generic
-`[height, width, 4]` Buffers, changed by the user-defined `darken` transform,
+language fixture. One imported PPM source is decoded into a generic
+`[height, width, 4]` Buffer, changed by the user-defined `darken` transform,
+resized to a thumbnail by the registered `rgba.resize_nearest` Wasm transform,
 and encoded independently as PNG and WebP.
 
 From this directory, create a disposable workspace and run the pipeline:
 
 ```text
 cargo run --manifest-path ../../Cargo.toml -p histima -- init ../../build/site-assets-work
-cargo run --manifest-path ../../Cargo.toml -p histima -- import --workspace ../../build/site-assets-work inputs --recursive
+cargo run --manifest-path ../../Cargo.toml -p histima -- import --workspace ../../build/site-assets-work inputs/hero.ppm
 cargo run --manifest-path ../../Cargo.toml -p histima -- run ../../build/site-assets-work pipeline.tima --stock-intermediates --record hero_buffer --record hero_png --record hero_webp --record thumbnail_png --record thumbnail_webp --json
 ```
 
@@ -51,9 +52,10 @@ cargo run --manifest-path ../../Cargo.toml -p histima -- materialize ../../build
   result's `aot_plan` now identifies `darken` by Transform ID and reports that
   its Buffer boundary is outside the current native subset, so backend work can
   be prioritized from an observed workflow rather than guessed.
-- **Missing transform/library problem:** there is no general resize transform,
-  so this workload uses separate hero and thumbnail sources rather than
-  deriving multiple sizes from one Buffer.
+- **Missing transform/library problem (addressed narrowly):** the first run
+  required a separate thumbnail source. `rgba.resize_nearest` now derives it
+  from the hero through a precise rank-3 RGBA8 library contract without adding
+  an image type or general loop/indexing system to Tima.
 - **Language problem:** the constrained byte loop is sufficient, but expressing
   "preserve every fourth alpha byte" through storage-offset arithmetic is
   low-level. This is not yet enough evidence for general indexing or image

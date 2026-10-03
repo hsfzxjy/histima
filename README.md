@@ -168,9 +168,10 @@ representations.
 
 `Buffer` is general rank-1-through-rank-3 shaped `u8` storage with dense inner
 dimensions and an explicit outer stride. It has no image format in the Tima
-type system. Registered deterministic codecs currently include PPM and PNG
-decode/encode and WebP encode; their ordinary transform contracts interpret
-`[height, width, 4]` buffers as RGBA8. They use the same
+type system. Registered deterministic transforms currently include PPM and
+PNG decode/encode, WebP encode, and nearest-neighbor RGBA8 resize; their
+ordinary transform contracts interpret `[height, width, 4]` buffers as RGBA8.
+They use the same
 Transform/Recipe/Content identity, lineage, cache, and replay model as user
 transforms and run as fuel- and memory-bounded registered-Wasm plugins.
 

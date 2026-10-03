@@ -17,6 +17,7 @@ const PNG_ENCODE_TRANSFORM_VERSION: u32 = 4;
 const PNG_DEFAULT_COMPRESSION: i64 = 6;
 const WEBP_ENCODE_TRANSFORM_VERSION: u32 = 3;
 const WEBP_DEFAULT_QUALITY: i64 = 85;
+const RGBA_RESIZE_NEAREST_TRANSFORM_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BuiltinDefaultValue {
@@ -73,6 +74,16 @@ const QUALITY_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
     value_type: BuiltinValueType::I64,
     default: Some(BuiltinDefaultValue::Integer(WEBP_DEFAULT_QUALITY)),
 };
+const WIDTH_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
+    name: "width",
+    value_type: BuiltinValueType::I64,
+    default: None,
+};
+const HEIGHT_PARAMETER: BuiltinParameterInfo = BuiltinParameterInfo {
+    name: "height",
+    value_type: BuiltinValueType::I64,
+    default: None,
+};
 
 const REGISTERED_TRANSFORMS: &[RegisteredTransform] = &[
     RegisteredTransform {
@@ -114,6 +125,14 @@ const REGISTERED_TRANSFORMS: &[RegisteredTransform] = &[
         result: BuiltinValueType::Bytes,
         validate: validate_webp_encode,
         execute: execute_encode_webp,
+    },
+    RegisteredTransform {
+        name: "rgba.resize_nearest",
+        semantic_version: RGBA_RESIZE_NEAREST_TRANSFORM_VERSION,
+        parameters: &[BUFFER_PARAMETER, WIDTH_PARAMETER, HEIGHT_PARAMETER],
+        result: BuiltinValueType::Buffer,
+        validate: validate_rgba_resize,
+        execute: execute_rgba_resize,
     },
 ];
 
@@ -287,6 +306,36 @@ fn validate_webp_encode(arguments: &[(OuterValue, Span)], span: Span) -> Result<
     Ok(())
 }
 
+fn validate_rgba_resize(arguments: &[(OuterValue, Span)], _span: Span) -> Result<(), Diagnostic> {
+    let ValueData::Buffer(buffer) = &arguments[0].0.data else {
+        return Err(Diagnostic::error(
+            "rgba.resize_nearest expects a Buffer value",
+            arguments[0].1,
+        ));
+    };
+    if buffer.shape().len() != 3 || buffer.shape()[2] != 4 {
+        return Err(Diagnostic::error(
+            "rgba.resize_nearest requires a rank-3 byte Buffer shaped [height, width, 4]",
+            arguments[0].1,
+        ));
+    }
+    for (index, name) in [(1, "width"), (2, "height")] {
+        let ValueData::Integer(value) = arguments[index].0.data else {
+            return Err(Diagnostic::error(
+                format!("rgba.resize_nearest {name} must be an integer from 1 through 4294967295"),
+                arguments[index].1,
+            ));
+        };
+        if !(1..=i64::from(u32::MAX)).contains(&value) {
+            return Err(Diagnostic::error(
+                format!("rgba.resize_nearest {name} must be an integer from 1 through 4294967295"),
+                arguments[index].1,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn execute_decode_ppm(
     arguments: &[(OuterValue, Span)],
     _span: Span,
@@ -346,6 +395,22 @@ fn execute_encode_webp(
         .map(|bytes| OuterValue::plain(ValueData::Bytes(Arc::new(bytes))))
 }
 
+fn execute_rgba_resize(
+    arguments: &[(OuterValue, Span)],
+    span: Span,
+) -> Result<OuterValue, Diagnostic> {
+    let ValueData::Buffer(image) = &arguments[0].0.data else {
+        unreachable!()
+    };
+    let ValueData::Integer(width) = arguments[1].0.data else {
+        unreachable!()
+    };
+    let ValueData::Integer(height) = arguments[2].0.data else {
+        unreachable!()
+    };
+    resize_rgba_nearest(image, width, height, span).map(OuterValue::buffer)
+}
+
 fn decode_ppm(bytes: &[u8], span: Span) -> Result<BufferValue, Diagnostic> {
     crate::registered_wasm::decode_ppm(bytes, span)
 }
@@ -364,6 +429,15 @@ fn encode_png(image: &BufferValue, compression: u8, span: Span) -> Result<Vec<u8
 
 fn encode_webp(image: &BufferValue, quality: u8, span: Span) -> Result<Vec<u8>, Diagnostic> {
     crate::registered_wasm::encode_webp(image, i64::from(quality), span)
+}
+
+fn resize_rgba_nearest(
+    image: &BufferValue,
+    width: i64,
+    height: i64,
+    span: Span,
+) -> Result<BufferValue, Diagnostic> {
+    crate::registered_wasm::resize_rgba_nearest(image, width, height, span)
 }
 
 #[cfg(test)]
@@ -392,6 +466,10 @@ mod tests {
         assert_eq!(
             transforms[4].signature(),
             "webp.encode(buffer: BufferView, quality: i64 = 85) -> Bytes"
+        );
+        assert_eq!(
+            transforms[5].signature(),
+            "rgba.resize_nearest(buffer: BufferView, width: i64, height: i64) -> Buffer"
         );
     }
 
@@ -564,6 +642,46 @@ mod tests {
         };
         assert_eq!(diagnostic.labels[0].span, quality_span);
         assert!(diagnostic.message.contains("integer from 0 through 100"));
+    }
+
+    #[test]
+    fn rgba_resize_dimensions_are_source_spanned_and_range_checked() {
+        let image =
+            OuterValue::buffer(BufferValue::new(vec![1, 1, 4], 4, vec![1, 2, 3, 4]).unwrap());
+        let width_span = Span::new(17, 18);
+        let height_span = Span::new(20, 23);
+
+        for width in [0, -1, i64::from(u32::MAX) + 1] {
+            let diagnostic = match prepare_registered_invocation(
+                RegisteredTransform::find("rgba.resize_nearest").unwrap(),
+                vec![
+                    (image.clone(), Span::new(0, 5)),
+                    (OuterValue::plain(ValueData::Integer(width)), width_span),
+                    (OuterValue::plain(ValueData::Integer(1)), height_span),
+                ],
+                Span::new(0, 23),
+            ) {
+                Err(diagnostic) => diagnostic,
+                Ok(_) => panic!("invalid resize width was accepted"),
+            };
+            assert_eq!(diagnostic.labels[0].span, width_span);
+            assert!(diagnostic.message.contains("width must be an integer"));
+        }
+
+        let diagnostic = match prepare_registered_invocation(
+            RegisteredTransform::find("rgba.resize_nearest").unwrap(),
+            vec![
+                (image, Span::new(0, 5)),
+                (OuterValue::plain(ValueData::Integer(1)), width_span),
+                (OuterValue::plain(ValueData::Float(2.0)), height_span),
+            ],
+            Span::new(0, 23),
+        ) {
+            Err(diagnostic) => diagnostic,
+            Ok(_) => panic!("non-integer resize height was accepted"),
+        };
+        assert_eq!(diagnostic.labels[0].span, height_span);
+        assert!(diagnostic.message.contains("height must be an integer"));
     }
 
     #[test]

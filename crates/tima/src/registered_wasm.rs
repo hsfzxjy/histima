@@ -29,6 +29,8 @@ const PPM_ENCODE_WASM: &[u8] = include_bytes!("../../../plugins/ppm-encode/ppm_e
 const PNG_DECODE_WASM: &[u8] = include_bytes!("../../../plugins/png-decode/png_decode.wasm");
 const PNG_ENCODE_WASM: &[u8] = include_bytes!("../../../plugins/png-encode/png_encode.wasm");
 const WEBP_ENCODE_WASM: &[u8] = include_bytes!("../../../plugins/webp-encode/webp_encode.wasm");
+const RGBA_RESIZE_NEAREST_WASM: &[u8] =
+    include_bytes!("../../../plugins/rgba-resize-nearest/rgba_resize_nearest.wasm");
 
 struct PluginState {
     limits: StoreLimits,
@@ -481,6 +483,7 @@ static PPM_ENCODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::n
 static PNG_DECODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
 static PNG_ENCODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
 static WEBP_ENCODER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
+static RGBA_RESIZER: OnceLock<Result<RegisteredWasmPlugin, String>> = OnceLock::new();
 
 fn ppm_decoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
     PPM_DECODER
@@ -513,6 +516,15 @@ fn png_decoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
 fn webp_encoder() -> Result<&'static RegisteredWasmPlugin, &'static str> {
     WEBP_ENCODER
         .get_or_init(|| RegisteredWasmPlugin::compile("webp.encode", WEBP_ENCODE_WASM))
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn rgba_resizer() -> Result<&'static RegisteredWasmPlugin, &'static str> {
+    RGBA_RESIZER
+        .get_or_init(|| {
+            RegisteredWasmPlugin::compile("rgba.resize_nearest", RGBA_RESIZE_NEAREST_WASM)
+        })
         .as_ref()
         .map_err(String::as_str)
 }
@@ -596,6 +608,29 @@ pub(crate) fn encode_webp(
     }
 }
 
+pub(crate) fn resize_rgba_nearest(
+    image: &BufferValue,
+    width: i64,
+    height: i64,
+    span: Span,
+) -> Result<BufferValue, Diagnostic> {
+    let plugin = rgba_resizer().map_err(|error| {
+        Diagnostic::error(format!("rgba.resize_nearest Wasm plugin: {error}"), span)
+    })?;
+    match plugin.invoke(
+        &[
+            PluginArgument::BufferView(image),
+            PluginArgument::I64(width),
+            PluginArgument::I64(height),
+        ],
+        PluginResultType::Buffer,
+        span,
+    )? {
+        PluginResult::Buffer(image) => Ok(image),
+        PluginResult::Bytes(_) => unreachable!(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,11 +643,13 @@ mod tests {
         let png_decoder = png_decoder().unwrap();
         let png_encoder = png_encoder().unwrap();
         let webp_encoder = webp_encoder().unwrap();
+        let rgba_resizer = rgba_resizer().unwrap();
         assert_eq!(decoder.module.imports().count(), 0);
         assert_eq!(encoder.module.imports().count(), 0);
         assert_eq!(png_decoder.module.imports().count(), 0);
         assert_eq!(png_encoder.module.imports().count(), 0);
         assert_eq!(webp_encoder.module.imports().count(), 0);
+        assert_eq!(rgba_resizer.module.imports().count(), 0);
 
         let semantic = registered_transform_identity("ppm.decode", 3);
         let artifact =
@@ -642,6 +679,31 @@ mod tests {
         assert_eq!(
             encode_ppm(&padded, Span::default()).unwrap(),
             b"P3\n1 2\n255\n1 2 3\n4 5 6\n"
+        );
+    }
+
+    #[test]
+    fn embedded_rgba_resizer_is_deterministic_and_ignores_row_padding() {
+        let source = BufferValue::new(
+            vec![2, 2, 4],
+            10,
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 99, 100, 9, 10, 11, 12, 13, 14, 15, 16, 101, 102,
+            ],
+        )
+        .unwrap();
+
+        let resized = resize_rgba_nearest(&source, 4, 4, Span::default()).unwrap();
+
+        assert_eq!(resized.shape(), &[4, 4, 4]);
+        assert_eq!(resized.outer_stride(), 16);
+        assert_eq!(
+            resized.bytes(),
+            [
+                1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 8, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8,
+                5, 6, 7, 8, 9, 10, 11, 12, 9, 10, 11, 12, 13, 14, 15, 16, 13, 14, 15, 16, 9, 10,
+                11, 12, 9, 10, 11, 12, 13, 14, 15, 16, 13, 14, 15, 16,
+            ]
         );
     }
 }
