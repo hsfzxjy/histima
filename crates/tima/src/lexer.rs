@@ -14,6 +14,7 @@ pub enum TokenKind {
     Float(f64),
     Fraction(i64, i64),
     String(String),
+    Struct,
     Transform,
     Uses,
     Return,
@@ -172,6 +173,7 @@ impl Lexer<'_> {
         }
         let text = &self.text[start..self.position];
         let kind = match text {
+            "struct" => TokenKind::Struct,
             "transform" => TokenKind::Transform,
             "uses" => TokenKind::Uses,
             "return" => TokenKind::Return,

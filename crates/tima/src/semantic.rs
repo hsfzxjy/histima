@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ast::{self, ExprId, ExprKind, InnerStmt, Item};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    BasicBlock, BlockId, Capability, Constant, Parameter, RuntimeCall, Terminator, Transform,
-    TransformId, Type, TypedModule, Value, ValueId, ValueKind,
+    BasicBlock, BlockId, Capability, Constant, Parameter, RuntimeCall, StructField, StructId,
+    StructType, Terminator, Transform, TransformId, Type, TypedModule, Value, ValueId, ValueKind,
 };
 
 pub fn check(program: &ast::Program) -> Result<TypedModule, Vec<Diagnostic>> {
@@ -20,6 +20,8 @@ struct Signature {
 
 struct Checker<'a> {
     program: &'a ast::Program,
+    struct_ids: BTreeMap<String, StructId>,
+    structs: Vec<StructType>,
     signatures: BTreeMap<String, Signature>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -28,12 +30,15 @@ impl<'a> Checker<'a> {
     fn new(program: &'a ast::Program) -> Self {
         Self {
             program,
+            struct_ids: BTreeMap::new(),
+            structs: Vec::new(),
             signatures: BTreeMap::new(),
             diagnostics: Vec::new(),
         }
     }
 
     fn run(mut self) -> Result<TypedModule, Vec<Diagnostic>> {
+        self.collect_structs();
         self.collect_signatures();
         if !self.diagnostics.is_empty() {
             return Err(self.diagnostics);
@@ -42,16 +47,120 @@ impl<'a> Checker<'a> {
         let mut transforms = Vec::new();
         for item in &self.program.items {
             if let Item::Transform(declaration) = item {
-                match Lowerer::new(self.program, &self.signatures, declaration).lower() {
+                match Lowerer::new(
+                    self.program,
+                    &self.struct_ids,
+                    &self.structs,
+                    &self.signatures,
+                    declaration,
+                )
+                .lower()
+                {
                     Ok(transform) => transforms.push(transform),
                     Err(mut diagnostics) => self.diagnostics.append(&mut diagnostics),
                 }
             }
         }
         if self.diagnostics.is_empty() {
-            Ok(TypedModule { transforms })
+            Ok(TypedModule {
+                structs: self.structs,
+                transforms,
+            })
         } else {
             Err(self.diagnostics)
+        }
+    }
+
+    fn collect_structs(&mut self) {
+        for item in &self.program.items {
+            let Item::Struct(declaration) = item else {
+                continue;
+            };
+            if builtin_type(&declaration.name).is_some()
+                || reserved_constructor_name(&declaration.name)
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "struct name `{}` conflicts with a built-in type or callable",
+                        declaration.name
+                    ),
+                    declaration.name_span,
+                ));
+                continue;
+            }
+            if let Some(previous) = self.struct_ids.get(&declaration.name) {
+                let earlier = self.structs[previous.0 as usize].span;
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("struct `{}` is declared more than once", declaration.name),
+                        declaration.name_span,
+                    )
+                    .with_label(earlier, "first declaration is here"),
+                );
+                continue;
+            }
+            let mut names = BTreeMap::new();
+            let mut fields = Vec::new();
+            let mut valid = true;
+            for field in &declaration.fields {
+                if let Some(previous_span) = names.insert(field.name.clone(), field.name_span) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!("struct field `{}` is declared more than once", field.name),
+                            field.name_span,
+                        )
+                        .with_label(previous_span, "first field is here"),
+                    );
+                    valid = false;
+                }
+                let Some(ty) = builtin_type(&field.ty.name) else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "struct field `{}` has unsupported type `{}`",
+                                field.name, field.ty.name
+                            ),
+                            field.ty.span,
+                        )
+                        .with_note(
+                            "the initial immutable struct slice permits bool, u8, i64, and f32 fields",
+                        ),
+                    );
+                    valid = false;
+                    continue;
+                };
+                if !matches!(ty, Type::Bool | Type::U8 | Type::I64 | Type::F32) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "struct field `{}` cannot have owned or view type {}",
+                                field.name,
+                                ty.name()
+                            ),
+                            field.ty.span,
+                        )
+                        .with_note(
+                            "the initial immutable struct slice permits bool, u8, i64, and f32 fields",
+                        ),
+                    );
+                    valid = false;
+                    continue;
+                }
+                fields.push(StructField {
+                    name: field.name.clone(),
+                    ty,
+                    span: field.span,
+                });
+            }
+            if valid {
+                let id = StructId(self.structs.len() as u32);
+                self.struct_ids.insert(declaration.name.clone(), id);
+                self.structs.push(StructType {
+                    name: declaration.name.clone(),
+                    fields,
+                    span: declaration.span,
+                });
+            }
         }
     }
 
@@ -60,6 +169,16 @@ impl<'a> Checker<'a> {
             let Item::Transform(declaration) = item else {
                 continue;
             };
+            if self.struct_ids.contains_key(&declaration.name) {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "transform name `{}` conflicts with a struct type",
+                        declaration.name
+                    ),
+                    declaration.name_span,
+                ));
+                continue;
+            }
             if matches!(
                 declaration.name.as_str(),
                 "environment_i64" | "buffer_zero" | "buffer_fill"
@@ -142,36 +261,72 @@ impl<'a> Checker<'a> {
     }
 
     fn resolve_type(&mut self, reference: &ast::TypeRef) -> Option<Type> {
-        let ty = match reference.name.as_str() {
-            "bool" => Type::Bool,
-            "u8" => Type::U8,
-            "i64" => Type::I64,
-            "f32" => Type::F32,
-            "String" => Type::String,
-            "StringView" => Type::StringView,
-            "Bytes" => Type::Bytes,
-            "BytesView" => Type::BytesView,
-            "Buffer" => Type::Buffer,
-            "BufferView" => Type::BufferView,
-            _ => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!("unknown inner transform type `{}`", reference.name),
-                        reference.span,
-                    )
-                    .with_note(
-                        "the native-safe types are bool, u8, i64, f32, String, StringView, Bytes, BytesView, Buffer, and BufferView",
+        if self.struct_ids.contains_key(&reference.name) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "struct type `{}` cannot cross a transform boundary yet",
+                        reference.name
                     ),
-                );
-                return None;
-            }
-        };
-        Some(ty)
+                    reference.span,
+                )
+                .with_note(
+                    "struct values are currently transform-local; outer value and ABI support are reserved for a later extension",
+                ),
+            );
+            return None;
+        }
+        if let Some(ty) = builtin_type(&reference.name) {
+            return Some(ty);
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!("unknown inner transform type `{}`", reference.name),
+                reference.span,
+            )
+            .with_note(
+                "the boundary types are bool, u8, i64, f32, String, StringView, Bytes, BytesView, Buffer, and BufferView",
+            ),
+        );
+        None
     }
+}
+
+fn builtin_type(name: &str) -> Option<Type> {
+    Some(match name {
+        "bool" => Type::Bool,
+        "u8" => Type::U8,
+        "i64" => Type::I64,
+        "f32" => Type::F32,
+        "String" => Type::String,
+        "StringView" => Type::StringView,
+        "Bytes" => Type::Bytes,
+        "BytesView" => Type::BytesView,
+        "Buffer" => Type::Buffer,
+        "BufferView" => Type::BufferView,
+        _ => return None,
+    })
+}
+
+fn reserved_constructor_name(name: &str) -> bool {
+    matches!(
+        name,
+        "asset"
+            | "fraction"
+            | "read"
+            | "trace"
+            | "replay"
+            | "save"
+            | "environment_i64"
+            | "buffer_zero"
+            | "buffer_fill"
+    )
 }
 
 struct Lowerer<'a> {
     program: &'a ast::Program,
+    struct_ids: &'a BTreeMap<String, StructId>,
+    structs: &'a [StructType],
     signatures: &'a BTreeMap<String, Signature>,
     declaration: &'a ast::TransformDecl,
     environment: BTreeMap<String, (ValueId, crate::source::Span)>,
@@ -191,11 +346,15 @@ struct PendingBlock {
 impl<'a> Lowerer<'a> {
     fn new(
         program: &'a ast::Program,
+        struct_ids: &'a BTreeMap<String, StructId>,
+        structs: &'a [StructType],
         signatures: &'a BTreeMap<String, Signature>,
         declaration: &'a ast::TransformDecl,
     ) -> Self {
         Self {
             program,
+            struct_ids,
+            structs,
             signatures,
             declaration,
             environment: BTreeMap::new(),
@@ -341,10 +500,10 @@ impl<'a> Lowerer<'a> {
                     body,
                     *span,
                 ),
-                InnerStmt::Assignment { span, .. } => self.diagnostics.push(Diagnostic::error(
-                    "inner field assignment is not implemented",
-                    *span,
-                )),
+                InnerStmt::Assignment { span, .. } => self.diagnostics.push(
+                    Diagnostic::error("transform-local struct fields are immutable", *span)
+                        .with_note("construct a new struct value instead of assigning a field"),
+                ),
             }
         }
         terminated
@@ -822,6 +981,16 @@ impl<'a> Lowerer<'a> {
                     ));
                     return None;
                 };
+                if let Some(struct_id) = self.struct_ids.get(&name).copied() {
+                    if asserted {
+                        self.diagnostics.push(Diagnostic::error(
+                            "struct constructors cannot use semantic identity assertions",
+                            self.program.expr(*callee).span,
+                        ));
+                        return None;
+                    }
+                    return self.struct_construct(struct_id, arguments, expression.span);
+                }
                 if name == "environment_i64" {
                     if asserted {
                         self.diagnostics.push(Diagnostic::error(
@@ -927,11 +1096,51 @@ impl<'a> Lowerer<'a> {
                     true,
                 ))
             }
+            ExprKind::Member {
+                receiver,
+                name,
+                name_span,
+            } => {
+                let receiver = self.expression(*receiver)?;
+                let Type::Struct(struct_id) = self.values[receiver.0 as usize].ty else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "inner member access requires a transform-local struct value",
+                            expression.span,
+                        )
+                        .with_note(
+                            "Buffer iteration and namespaced runtime operations are valid only in their dedicated syntax",
+                        ),
+                    );
+                    return None;
+                };
+                let definition = &self.structs[struct_id.0 as usize];
+                let Some((field, field_definition)) = definition
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, field)| field.name == *name)
+                else {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("struct `{}` has no field `{name}`", definition.name),
+                        *name_span,
+                    ));
+                    return None;
+                };
+                Some(self.alloc(
+                    field_definition.ty,
+                    ValueKind::StructField {
+                        value: receiver,
+                        field: field as u32,
+                    },
+                    expression.span,
+                    true,
+                ))
+            }
             ExprKind::Null
             | ExprKind::Fraction(_, _)
             | ExprKind::List(_)
             | ExprKind::Record(_)
-            | ExprKind::Member { .. }
             | ExprKind::IdentityAsserted { .. }
             | ExprKind::Pipeline { .. } => {
                 self.diagnostics.push(
@@ -961,6 +1170,106 @@ impl<'a> Lowerer<'a> {
                 .push(id);
         }
         id
+    }
+
+    fn struct_construct(
+        &mut self,
+        struct_id: StructId,
+        arguments: &[ast::Argument],
+        span: crate::source::Span,
+    ) -> Option<ValueId> {
+        let definition = self.structs[struct_id.0 as usize].clone();
+        let mut ordered = vec![None; definition.fields.len()];
+        let mut source_order = Vec::with_capacity(arguments.len());
+        let mut next_positional = 0;
+        for argument in arguments {
+            let index = if let Some((name, name_span)) = &argument.name {
+                let Some(index) = definition
+                    .fields
+                    .iter()
+                    .position(|field| field.name == *name)
+                else {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("struct `{}` has no field `{name}`", definition.name),
+                        *name_span,
+                    ));
+                    return None;
+                };
+                index
+            } else {
+                while next_positional < ordered.len() && ordered[next_positional].is_some() {
+                    next_positional += 1;
+                }
+                if next_positional == ordered.len() {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!(
+                            "struct `{}` expects {} fields, but too many values were supplied",
+                            definition.name,
+                            definition.fields.len()
+                        ),
+                        argument.span,
+                    ));
+                    return None;
+                }
+                let index = next_positional;
+                next_positional += 1;
+                index
+            };
+            if ordered[index].replace(argument).is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "struct field `{}` was initialized more than once",
+                        definition.fields[index].name
+                    ),
+                    argument.span,
+                ));
+                return None;
+            }
+            source_order.push((index, argument));
+        }
+        if let Some((index, _)) = ordered
+            .iter()
+            .enumerate()
+            .find(|(_, value)| value.is_none())
+        {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "struct `{}` is missing field `{}`",
+                    definition.name, definition.fields[index].name
+                ),
+                span,
+            ));
+            return None;
+        }
+        let mut fields = vec![None; ordered.len()];
+        for (index, argument) in source_order {
+            let field = &definition.fields[index];
+            let value = self.expression(argument.value)?;
+            let actual = self.values[value.0 as usize].ty;
+            if actual != field.ty {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "struct field `{}` requires {}, not {}",
+                        field.name,
+                        field.ty.name(),
+                        actual.name()
+                    ),
+                    argument.span,
+                ));
+                return None;
+            }
+            fields[index] = Some(value);
+        }
+        let fields = fields
+            .into_iter()
+            .map(|value| value.expect("all struct fields were checked above"))
+            .collect();
+        Some(self.alloc(
+            Type::Struct(struct_id),
+            ValueKind::StructConstruct { struct_id, fields },
+            span,
+            true,
+        ))
     }
 
     fn environment_i64(
@@ -1296,6 +1605,131 @@ mod tests {
             transform.blocks[0].terminator,
             ir::Terminator::Return(ir::ValueId(4))
         ));
+    }
+
+    #[test]
+    fn lowers_immutable_scalar_struct_construction_and_field_access() {
+        let compiled = compile(
+            "structs.tima",
+            "struct Pair { left: i64, right: i64 }\n\
+             transform delta(a: i64, b: i64) -> i64 {\n\
+                 pair = Pair(right=b, left=a)\n\
+                 return pair.left - pair.right\n\
+             }\n",
+        )
+        .unwrap();
+        let definition = &compiled.transforms.structs[0];
+        assert_eq!(definition.name, "Pair");
+        assert_eq!(
+            definition
+                .fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.ty))
+                .collect::<Vec<_>>(),
+            [("left", ir::Type::I64), ("right", ir::Type::I64)]
+        );
+        let transform = &compiled.transforms.transforms[0];
+        assert!(matches!(
+            &transform.values[2].kind,
+            ir::ValueKind::StructConstruct { struct_id: ir::StructId(0), fields }
+                if fields == &[ir::ValueId(0), ir::ValueId(1)]
+        ));
+        assert!(matches!(
+            transform.values[3].kind,
+            ir::ValueKind::StructField {
+                value: ir::ValueId(2),
+                field: 0,
+            }
+        ));
+        assert!(matches!(
+            transform.values[4].kind,
+            ir::ValueKind::StructField {
+                value: ir::ValueId(2),
+                field: 1,
+            }
+        ));
+
+        let compiled = compile(
+            "order.tima",
+            "struct Pair { left: i64, right: i64 }\n\
+             transform difference() -> i64 {\n\
+                 pair = Pair(right=2, left=1)\n\
+                 return pair.left - pair.right\n\
+             }\n",
+        )
+        .unwrap();
+        let transform = &compiled.transforms.transforms[0];
+        assert!(matches!(
+            transform.values[0].kind,
+            ir::ValueKind::Constant(ir::Constant::I64(2))
+        ));
+        assert!(matches!(
+            transform.values[1].kind,
+            ir::ValueKind::Constant(ir::Constant::I64(1))
+        ));
+        assert!(matches!(
+            &transform.values[2].kind,
+            ir::ValueKind::StructConstruct { fields, .. }
+                if fields == &[ir::ValueId(1), ir::ValueId(0)]
+        ));
+    }
+
+    #[test]
+    fn rejects_struct_boundaries_owned_fields_and_incomplete_construction() {
+        let diagnostics = compile(
+            "boundary.tima",
+            "struct Pair { left: i64, right: i64 }\n\
+             transform expose(value: Pair) -> i64 { return 0 }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("struct type `Pair` cannot cross a transform boundary yet")
+        }));
+
+        let diagnostics = compile(
+            "owned.tima",
+            "struct Payload { bytes: Bytes }\n\
+             transform keep(value: i64) -> i64 { return value }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot have owned or view type Bytes")
+        }));
+
+        let diagnostics = compile(
+            "missing.tima",
+            "struct Pair { left: i64, right: i64 }\n\
+             transform bad(value: i64) -> i64 {\n\
+                 pair = Pair(left=value)\n\
+                 return pair.left\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("is missing field `right`") })
+        );
+
+        let diagnostics = compile(
+            "mutation.tima",
+            "struct Pair { left: i64, right: i64 }\n\
+             transform bad(value: i64) -> i64 {\n\
+                 pair = Pair(value, value)\n\
+                 pair.left = value\n\
+                 return pair.left\n\
+             }\n",
+        )
+        .unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("transform-local struct fields are immutable")
+        }));
     }
 
     #[test]

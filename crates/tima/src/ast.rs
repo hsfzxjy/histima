@@ -18,8 +18,25 @@ impl Program {
 #[derive(Clone, Debug)]
 pub enum Item {
     Binding(Binding),
+    Struct(StructDecl),
     Transform(TransformDecl),
     Expression(ExprId),
+}
+
+#[derive(Clone, Debug)]
+pub struct StructDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub fields: Vec<StructField>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct StructField {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: TypeRef,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]

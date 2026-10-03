@@ -25,7 +25,9 @@ impl Parser {
         let mut items = Vec::new();
         self.separators();
         while !self.at(|kind| matches!(kind, TokenKind::Eof)) {
-            let item = if self.at(|kind| matches!(kind, TokenKind::Transform)) {
+            let item = if self.at(|kind| matches!(kind, TokenKind::Struct)) {
+                Item::Struct(self.struct_decl()?)
+            } else if self.at(|kind| matches!(kind, TokenKind::Transform)) {
                 Item::Transform(self.transform()?)
             } else if self.at_binding() {
                 Item::Binding(self.binding()?)
@@ -68,6 +70,39 @@ impl Parser {
             name_span,
             value,
             span,
+        })
+    }
+
+    fn struct_decl(&mut self) -> Result<StructDecl, Diagnostic> {
+        let start = self.bump().span;
+        let (name, name_span) = self.identifier("a struct name")?;
+        self.expect(|kind| matches!(kind, TokenKind::LeftBrace), "`{`")?;
+        self.separators();
+        let mut fields = Vec::new();
+        while !self.at(|kind| matches!(kind, TokenKind::RightBrace | TokenKind::Eof)) {
+            let (field_name, field_name_span) = self.identifier("a struct field name")?;
+            self.expect(|kind| matches!(kind, TokenKind::Colon), "`:`")?;
+            let ty = self.type_ref()?;
+            fields.push(StructField {
+                name: field_name,
+                name_span: field_name_span,
+                span: field_name_span.join(ty.span),
+                ty,
+            });
+            self.inline_newlines();
+            if !self.eat(|kind| matches!(kind, TokenKind::Comma)) {
+                break;
+            }
+            self.separators();
+        }
+        let end = self
+            .expect(|kind| matches!(kind, TokenKind::RightBrace), "`}`")?
+            .span;
+        Ok(StructDecl {
+            name,
+            name_span,
+            fields,
+            span: start.join(end),
         })
     }
 
@@ -546,6 +581,43 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_shared_struct_declarations_and_constructor_syntax() {
+        let source = SourceFile::new(
+            "test.tima",
+            "struct Scale {\n factor: f32,\n bias: f32,\n}\n\
+             transform apply(value: f32) -> f32 {\n\
+                 options = Scale(bias=1.0, factor=0.5)\n\
+                 return value * options.factor + options.bias\n\
+             }\n",
+        );
+        let program = parse(&source).unwrap();
+        let Item::Struct(definition) = &program.items[0] else {
+            panic!("expected struct declaration")
+        };
+        assert_eq!(definition.name, "Scale");
+        assert_eq!(
+            definition
+                .fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.ty.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("factor", "f32"), ("bias", "f32")]
+        );
+        let Item::Transform(transform) = &program.items[1] else {
+            panic!("expected transform declaration")
+        };
+        let InnerStmt::Binding(options) = &transform.body[0] else {
+            panic!("expected struct-valued local")
+        };
+        assert!(matches!(
+            &program.expr(options.value).kind,
+            ExprKind::Call { callee, arguments }
+                if arguments.len() == 2
+                    && matches!(&program.expr(*callee).kind, ExprKind::Name(name) if name == "Scale")
+        ));
+    }
 
     #[test]
     fn shares_expression_arena_between_outer_and_inner_code() {

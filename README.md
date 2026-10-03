@@ -11,6 +11,8 @@ The repository currently provides:
 - immutable outer values, calls, pipelines, registered codecs, lineage, replay,
   and Recipe-ID result caching;
 - statically checked transforms lowered to backend-neutral typed Tima IR;
+- immutable scalar structs for grouping transform-local values without
+  prematurely introducing an outer object model or native layout;
 - a reference/default typed-IR interpreter with owned mutable inner values,
   read-only aliasable views, and freeze-on-return;
 - one call/lineage/replay path for source Tima, standard, and registered-Wasm
@@ -33,7 +35,8 @@ String, Bytes, and ownership-safe Buffer transforms with `cargo run -p tima --
 run-native program.tima`. The latter is a hybrid path: checked integer
 arithmetic and indexed Buffer byte maps preserve the interpreter's exact
 failure behavior in native code, while other unsupported operations remain
-interpreted. Supported inner transform calls
+interpreted. Transform-local structs currently use that explicit interpreter
+fallback. Supported inner transform calls
 are linked in the same artifact; a caller falls back to the interpreter when
 any transitive callee is unsupported. Normal Histima execution defaults to the
 reference interpreter and accepts `run ... --engine hybrid-aot` as an explicit

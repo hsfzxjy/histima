@@ -1033,7 +1033,7 @@ impl Interpreter<'_, '_, '_, '_> {
     fn run(mut self) -> Result<Execution, Diagnostic> {
         for item in &self.program.syntax.items {
             match item {
-                Item::Transform(_) => {}
+                Item::Struct(_) | Item::Transform(_) => {}
                 Item::Binding(binding) => {
                     if self.execution.bindings.contains_key(&binding.name) {
                         return Err(Diagnostic::error(
@@ -1305,6 +1305,15 @@ impl Interpreter<'_, '_, '_, '_> {
                 prefix,
                 *prefix_span,
             )?;
+        }
+        if self.program.transforms.find_struct(&name).is_some() {
+            return Err(Diagnostic::error(
+                format!("struct constructor `{name}` is currently inner-only"),
+                callee_expression.span,
+            )
+            .with_note(
+                "outer immutable struct values are reserved for a later language extension",
+            ));
         }
         let mut evaluated = Vec::new();
         if let Some(input) = pipeline_input {
@@ -1927,6 +1936,7 @@ enum NativeScalar {
 
 enum InterpretedValue {
     Scalar(NativeScalar),
+    Struct(Vec<NativeScalar>),
     String(String),
     StringView(Arc<String>),
     Bytes(Vec<u8>),
@@ -1939,7 +1949,8 @@ impl InterpretedValue {
     fn scalar(&self) -> NativeScalar {
         match self {
             Self::Scalar(value) => *value,
-            Self::String(_)
+            Self::Struct(_)
+            | Self::String(_)
             | Self::StringView(_)
             | Self::Bytes(_)
             | Self::BytesView(_)
@@ -2369,6 +2380,23 @@ impl IrInterpreter<'_> {
                 }
                 InterpretedValue::Buffer(buffer)
             }
+            ValueKind::StructConstruct { fields, .. } => InterpretedValue::Struct(
+                fields
+                    .iter()
+                    .map(|field| values[field.0 as usize].as_ref().unwrap().scalar())
+                    .collect(),
+            ),
+            ValueKind::StructField {
+                value: receiver,
+                field,
+            } => {
+                let InterpretedValue::Struct(fields) =
+                    values[receiver.0 as usize].as_ref().unwrap()
+                else {
+                    unreachable!("typed struct field projection receives a struct value")
+                };
+                InterpretedValue::Scalar(fields[*field as usize])
+            }
             ValueKind::RuntimeCall(RuntimeCall::EnvironmentI64 { name }) => {
                 InterpretedValue::Scalar(NativeScalar::I64(
                     capabilities.environment_i64(name, value.span)?,
@@ -2529,6 +2557,9 @@ fn transfer_interpreted_argument(
 fn freeze_interpreted_value(value: InterpretedValue) -> OuterValue {
     match value {
         InterpretedValue::Scalar(value) => freeze_scalar(value),
+        InterpretedValue::Struct(_) => {
+            unreachable!("transform-local structs cannot cross into outer values")
+        }
         InterpretedValue::String(value) => OuterValue::plain(ValueData::String(Arc::new(value))),
         InterpretedValue::StringView(value) => OuterValue::plain(ValueData::String(value)),
         InterpretedValue::Bytes(value) => OuterValue::plain(ValueData::Bytes(Arc::new(value))),
@@ -3066,6 +3097,44 @@ mod tests {
         .unwrap();
         let execution = execute(&compiled).unwrap();
         assert_eq!(execution.bindings["out"].data, ValueData::Float(2.0));
+    }
+
+    #[test]
+    fn interpreter_and_hybrid_execute_transform_local_struct_values() {
+        let world = FixedWorld::empty();
+        let executions = assert_successful_engine_conformance(
+            "structs",
+            "struct Scale { factor: f32, bias: f32 }\n\
+             transform adjust(value: f32, factor: f32) -> f32 {\n\
+                 options = Scale(bias=1.0, factor=factor)\n\
+                 return value * options.factor + options.bias\n\
+             }\n\
+             out = adjust(8.0, 0.25)\n",
+            BTreeMap::new(),
+            &world,
+            &[],
+            &["adjust"],
+        );
+        assert_eq!(
+            executions.interpreted.bindings["out"].data,
+            ValueData::Float(3.0)
+        );
+    }
+
+    #[test]
+    fn outer_struct_construction_is_reserved_but_not_yet_enabled() {
+        let compiled = crate::compile(
+            "outer-struct.tima",
+            "struct Pair { left: i64, right: i64 }\n\
+             value = Pair(left=1, right=2)\n",
+        )
+        .unwrap();
+        let diagnostics = execute(&compiled).unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("struct constructor `Pair` is currently inner-only")
+        }));
     }
 
     #[test]

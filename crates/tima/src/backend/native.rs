@@ -402,6 +402,7 @@ impl NativeModule {
             native_ids[*original_index] = Some(TransformId(native_index as u32));
         }
         let selected_module = TypedModule {
+            structs: module.structs.clone(),
             transforms: selected
                 .iter()
                 .map(|(_, transform)| {

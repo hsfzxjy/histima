@@ -383,6 +383,13 @@ fn validate_transform(transform: &Transform) -> Vec<Diagnostic> {
             | ValueKind::BufferByteElement
             | ValueKind::BufferByteIndex => {}
             ValueKind::BufferByteMap { .. } => {}
+            ValueKind::StructConstruct { .. } | ValueKind::StructField { .. } => diagnostics.push(
+                Diagnostic::error(
+                    "transform-local structs are outside the current Cranelift AOT subset",
+                    value.span,
+                )
+                .with_note("the typed-IR interpreter defines current struct semantics"),
+            ),
             ValueKind::RuntimeCall(
                 RuntimeCall::EnvironmentRead { .. }
                 | RuntimeCall::FileRead { .. }
@@ -549,6 +556,9 @@ fn lower_transform(
                     ),
                     ValueKind::BufferByteElement | ValueKind::BufferByteIndex => {
                         unreachable!("marker values are nested")
+                    }
+                    ValueKind::StructConstruct { .. } | ValueKind::StructField { .. } => {
+                        unreachable!("validation rejects transform-local structs")
                     }
                     ValueKind::RuntimeCall(call) => emit_world_call(
                         &mut builder,
@@ -881,7 +891,9 @@ fn emit_buffer_byte_map(
             | ValueKind::BufferFill { .. }
             | ValueKind::BufferByteElement
             | ValueKind::BufferByteIndex
-            | ValueKind::BufferByteMap { .. } => {
+            | ValueKind::BufferByteMap { .. }
+            | ValueKind::StructConstruct { .. }
+            | ValueKind::StructField { .. } => {
                 unreachable!("typed byte-map instructions contain scalar expressions")
             }
         };
@@ -1338,6 +1350,28 @@ mod tests {
             diagnostics[0]
                 .message
                 .contains("outside the initial Cranelift AOT subset")
+        );
+    }
+
+    #[test]
+    fn plans_transform_local_structs_for_interpreter_fallback() {
+        let compiled = crate::compile(
+            "structs.tima",
+            "struct Pair { left: i64, right: i64 }\n\
+             transform sum(left: i64, right: i64) -> i64 {\n\
+                 pair = Pair(left, right)\n\
+                 return pair.left + pair.right\n\
+             }\n",
+        )
+        .unwrap();
+        let plan = CraneliftBackend::transform_plan(&compiled.transforms);
+        assert_eq!(plan.len(), 1);
+        assert!(!plan[0].native_compatible);
+        assert!(
+            plan[0]
+                .fallback_reasons
+                .iter()
+                .any(|reason| reason.contains("transform-local structs"))
         );
     }
 

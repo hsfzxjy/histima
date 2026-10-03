@@ -137,7 +137,9 @@ and `\\`. A string cannot contain an unescaped newline.
 
 List elements and record fields are comma-separated. Record field names are
 identifiers. Duplicate record fields are rejected when outer code executes.
-Trailing commas are not currently accepted.
+Trailing commas are not currently accepted in these expression literals.
+Struct declaration fields are also comma-separated and may use one trailing
+comma before `}`.
 
 ### 3.4 Separators
 
@@ -148,7 +150,7 @@ Newlines are accepted:
 
 - after `=` in a binding;
 - before and after a pipeline `|`;
-- inside parameter, argument, list, and record delimiters.
+- inside parameter, argument, list, record, and struct-field delimiters.
 
 ### 3.5 Semantic identity assertions
 
@@ -209,6 +211,7 @@ A source file is a sequence of:
 
 ```text
 top-level binding
+struct declaration
 transform declaration
 top-level expression
 ```
@@ -226,9 +229,9 @@ result = 4.0 | scale(0.5)
 trace(result)
 ```
 
-Transform declarations are collected and checked before outer execution, so a
-transform may be called regardless of its source order. Recursive transform
-definitions are rejected in v0.
+Struct and transform declarations are collected and checked before outer
+execution, so either may be referenced regardless of source order. Recursive
+transform definitions are rejected in v0.
 
 ## 5. Expressions
 
@@ -276,8 +279,10 @@ An outer callee must be either a direct name or a one-level callable namespace
 such as `webp.encode`, optionally followed by a semantic identity assertion.
 Member access is not otherwise executable in outer code.
 
-Inner calls must use a directly named transform, optionally identity-asserted,
-and positional arguments only.
+Inner transform calls must use a directly named transform, optionally
+identity-asserted, and positional arguments only. Inner struct constructors
+also use a directly named type but associate positional and named arguments
+with fields as specified in section 7.2.
 
 ### 5.2 Pipeline expressions
 
@@ -486,6 +491,7 @@ The implemented inner types are:
 | `BytesView` | Read-only, aliasable byte storage |
 | `Buffer` | Uniquely owned, mutable shaped `u8` storage |
 | `BufferView` | Read-only, aliasable shaped `u8` storage |
+| user-declared struct | Immutable transform-local scalar aggregate |
 
 `u8` has no literal suffix. Integer literals are `i64`; a `u8` normally enters
 through a parameter or byte-loop element. An outer integer crosses a `u8`
@@ -494,7 +500,52 @@ integer.
 
 There are no implicit conversions.
 
-### 7.2 Statements and scope
+### 7.2 Struct declarations and values
+
+The initial user-defined struct form is:
+
+```tima
+struct Scale {
+    factor: f32,
+    bias: f32,
+}
+```
+
+Struct names and field names must be unique in their scopes. Fields are ordered
+and currently permit only `bool`, `u8`, `i64`, and `f32`. Nested structs,
+owned resources, and read-only views are deferred so this first value model has
+no hidden aliasing or lifetime behavior.
+
+Inside a transform, a struct is constructed by calling its type name. The
+ordinary argument-association rules apply: fields may be supplied positionally,
+by name, or in a non-duplicating mixture. Every field must be supplied exactly
+once. Constructor arguments are evaluated in source order and then associated
+with declaration-ordered fields.
+
+```tima
+options = Scale(bias=1.0, factor=factor)
+adjusted = value * options.factor + options.bias
+```
+
+Struct values and fields are immutable. Field access is read-only; field
+assignment and struct equality are unsupported. A struct can currently be used
+only as an inferred local value inside one transform. It cannot appear in a
+transform parameter or result, cross an inner call, enter the native ABI, or
+become an outer value.
+
+The declaration, constructor-call, and member-access syntax is shared by the
+one frontend. Outer struct construction is intentionally reserved but rejected
+at execution until immutable outer representation, identity, lineage, and
+boundary rules are specified. This restriction avoids committing the outer
+language to the current interpreter storage representation.
+
+Struct type and field source names do not enter Transform identity when all
+uses are renamed consistently. Field order and types are semantic. Constructor
+field association is normalized into declaration order, field access lowers to
+the corresponding semantic field index, and argument evaluation order remains
+semantic.
+
+### 7.3 Statements and scope
 
 Transform bodies support:
 
@@ -514,11 +565,12 @@ An `if` condition must be `bool` and an `else` arm is mandatory. A transform
 must return a value of its declared type on every path. A statement after a
 `return` or fully returning `if` is an error.
 
-### 7.3 Inner expressions
+### 7.4 Inner expressions
 
 Inner expressions support `bool`, integer, float, and string literals; names;
-scalar binary operators; direct transform calls; and reserved runtime
-operations. An inner string literal has type `StringView`.
+scalar binary operators; transform-local struct construction and field access;
+direct transform calls; and reserved runtime operations. An inner string
+literal has type `StringView`.
 
 Inner arithmetic requires operands of the same type. `f32` uses IEEE-754
 arithmetic. `i64` arithmetic is checked; overflow and division by zero abort
@@ -531,13 +583,13 @@ intended for general byte-valued buffers and assigns no channel or image
 meaning to either argument.
 
 Equality supports same-typed `bool`, `u8`, `i64`, and `f32`. Ordering supports
-same-typed `u8`, `i64`, and `f32`. Buffer equality is unsupported.
+same-typed `u8`, `i64`, and `f32`. Buffer and struct equality are unsupported.
 
-Outer-only syntax and values—including `null`, lists, records, general member
-access outside World calls or the constrained Buffer byte loop, and pipelines—are
-rejected inside transforms.
+Outer-only syntax and values—including `null`, lists, records, member access
+other than a struct field, World call, or constrained Buffer byte loop, and
+pipelines—are rejected inside transforms.
 
-### 7.4 Calls and ownership
+### 7.5 Calls and ownership
 
 Calling another transform requires an exact argument count and exact types.
 Passing an owned `String`, `Bytes`, or `Buffer` consumes that inner value. Using
@@ -647,6 +699,10 @@ interpreted. `bool`, `u8`, `i64`, and `f32` use word 0 with the scalar encoding
 defined by their type. Status zero means success. Status 2 reports a host
 callback failure; the host retains the source-spanned diagnostic rather than
 placing diagnostic objects in the ABI. Other nonzero statuses are reserved.
+
+Transform-local structs do not cross this ABI. Their future by-value layout is
+intentionally unspecified, so the current interpreter representation does not
+become an accidental outer or native contract.
 
 `String`, `StringView`, `Bytes`, and `BytesView` use words 0 through 2 for data
 pointer, byte length, and capacity. Views have zero capacity. String bytes are
@@ -1121,6 +1177,10 @@ namespace `tima` at schema version 1 with no fields. Capability schemas are
 `capability.env.read`, `capability.file.read`, and `capability.http.get` under
 the same namespace and version.
 
+An immutable user struct uses `tima:type.struct@1` with `fields`, an ordered
+sequence of field type nodes. Source type and field names are deliberately
+absent; field order and field types define the current semantic layout.
+
 Declared capabilities are transform semantics and therefore appear in Hash IR
 and Transform ID. Precise runtime observations do not: for example, declaring
 `uses file.read` affects Transform ID, while observing `font.ttf` with a
@@ -1138,6 +1198,8 @@ Current Tima value and operation schemas are:
 | `binary.add`, `binary.subtract`, `binary.multiply`, `binary.divide`, `binary.equal`, `binary.not-equal`, `binary.less`, `binary.less-equal`, `binary.greater`, `binary.greater-equal` | `left` node, `right` node, `type` node |
 | `numeric.u8-scale` | `value` node, `factor` node, `type` node |
 | `operation.call` | `arguments` ordered node sequence, `transform` digest, `type` node |
+| `struct.construct` | `fields` declaration-ordered node sequence, `type` node |
+| `struct.field` | `index` unsigned, `value` node, `type` node |
 | `world.environment-i64` | `name` text, `type` node |
 | `world.environment-read` | `name` node, `type` node |
 | `world.file-read` | `path` node, `type` node |
@@ -1362,7 +1424,9 @@ native mutation operations yet. Buffer mutation preserves the input allocation
 and layout, including padding, and the host adopts it without a copy on return.
 
 General string operations, newly allocated native Buffers, and
-`environment_i64` are not compiled. String literals are emitted as read-only
+`environment_i64` are not compiled. Transform-local struct construction and
+field access also remain interpreter-only until a native by-value layout is
+specified. String literals are emitted as read-only
 object data. `env.read`, `file.read`, and `http.get` are therefore compiled for
 both literal keys and keys supplied by native-compatible `StringView` values.
 They call the host through the runtime context, retain precise observations,

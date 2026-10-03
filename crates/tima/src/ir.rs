@@ -10,7 +10,10 @@ pub struct ValueId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u32);
 
-/// Types admitted by the inner transform boundary in the first milestone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StructId(pub u32);
+
+/// Types represented by the backend-neutral inner semantic IR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Bool,
@@ -29,6 +32,8 @@ pub enum Type {
     Buffer,
     /// Read-only shaped byte storage, permitted to alias other views.
     BufferView,
+    /// Immutable transform-local value with a statically declared field layout.
+    Struct(StructId),
 }
 
 impl Type {
@@ -44,6 +49,7 @@ impl Type {
             Self::BytesView => "BytesView",
             Self::Buffer => "Buffer",
             Self::BufferView => "BufferView",
+            Self::Struct(_) => "struct",
         }
     }
 
@@ -58,6 +64,7 @@ impl Type {
 
 #[derive(Clone, Debug, Default)]
 pub struct TypedModule {
+    pub structs: Vec<StructType>,
     pub transforms: Vec<Transform>,
 }
 
@@ -73,6 +80,32 @@ impl TypedModule {
             .find(|(_, transform)| transform.name == name)
             .map(|(index, transform)| (TransformId(index as u32), transform))
     }
+
+    pub fn struct_type(&self, id: StructId) -> &StructType {
+        &self.structs[id.0 as usize]
+    }
+
+    pub fn find_struct(&self, name: &str) -> Option<(StructId, &StructType)> {
+        self.structs
+            .iter()
+            .enumerate()
+            .find(|(_, definition)| definition.name == name)
+            .map(|(index, definition)| (StructId(index as u32), definition))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StructType {
+    pub name: String,
+    pub fields: Vec<StructField>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct StructField {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +207,17 @@ pub enum ValueKind {
         index: Option<ValueId>,
         instructions: Vec<ValueId>,
         result: ValueId,
+    },
+    /// Constructs an immutable struct value. Field values are in declaration
+    /// order, independent of source constructor argument order.
+    StructConstruct {
+        struct_id: StructId,
+        fields: Vec<ValueId>,
+    },
+    /// Projects one field by declaration-order index.
+    StructField {
+        value: ValueId,
+        field: u32,
     },
     RuntimeCall(RuntimeCall),
 }

@@ -29,7 +29,8 @@ use crate::ast::BinaryOp as AstBinaryOp;
 use crate::identity::TransformIdentity;
 use crate::ir::{
     Capability as IrCapability, Constant as IrConstant, RuntimeCall as IrRuntimeCall,
-    Terminator as IrTerminator, Transform as IrTransform, Type as IrType, ValueKind as IrValueKind,
+    Terminator as IrTerminator, Transform as IrTransform, Type as IrType, TypedModule as IrModule,
+    ValueKind as IrValueKind,
 };
 
 pub const FORMAT_VERSION: u32 = 1;
@@ -319,12 +320,13 @@ fn encode_data(data: &Data, canonical_ids: &[Option<u32>], encoder: &mut Encoder
 /// `references` is parallel to the typed value arena and contains resolved
 /// semantic Transform IDs for call nodes.
 pub(crate) fn lower_tima(
+    module: &IrModule,
     transform: &IrTransform,
     references: &[Option<TransformIdentity>],
 ) -> Definition {
     assert_eq!(transform.values.len(), references.len());
     let mut builder = Builder::default();
-    let types = TypeNodes::new(&mut builder);
+    let types = TypeNodes::new(&mut builder, module);
 
     let value_nodes: Vec<_> = transform.values.iter().map(|_| builder.reserve()).collect();
     let block_nodes: Vec<_> = transform.blocks.iter().map(|_| builder.reserve()).collect();
@@ -630,6 +632,23 @@ fn lower_value(
                 field("result", node_data(values[result.0 as usize])),
             ]),
         ),
+        IrValueKind::StructConstruct { fields, .. } => Node::new(
+            tima("struct.construct"),
+            typed(vec![field(
+                "fields",
+                nodes_data(fields.iter().map(|value| values[value.0 as usize])),
+            )]),
+        ),
+        IrValueKind::StructField {
+            value,
+            field: index,
+        } => Node::new(
+            tima("struct.field"),
+            typed(vec![
+                field("index", Data::UInt(u64::from(*index))),
+                field("value", node_data(values[value.0 as usize])),
+            ]),
+        ),
         IrValueKind::BufferByteMap {
             buffer,
             element,
@@ -678,11 +697,12 @@ struct TypeNodes {
     bytes_view: NodeId,
     buffer: NodeId,
     buffer_view: NodeId,
+    structs: Vec<NodeId>,
 }
 
 impl TypeNodes {
-    fn new(builder: &mut Builder) -> Self {
-        Self {
+    fn new(builder: &mut Builder, module: &IrModule) -> Self {
+        let mut types = Self {
             bool_: builder.node(tima("type.bool"), Vec::new()),
             u8_: builder.node(tima("type.u8"), Vec::new()),
             i64_: builder.node(tima("type.i64"), Vec::new()),
@@ -693,7 +713,20 @@ impl TypeNodes {
             bytes_view: builder.node(tima("type.bytes-view"), Vec::new()),
             buffer: builder.node(tima("type.buffer"), Vec::new()),
             buffer_view: builder.node(tima("type.buffer-view"), Vec::new()),
+            structs: Vec::with_capacity(module.structs.len()),
+        };
+        for definition in &module.structs {
+            let fields = definition
+                .fields
+                .iter()
+                .map(|field| types.get(field.ty))
+                .collect::<Vec<_>>();
+            types.structs.push(builder.node(
+                tima("type.struct"),
+                vec![field("fields", nodes_data(fields))],
+            ));
         }
+        types
     }
 
     fn get(&self, ty: IrType) -> NodeId {
@@ -708,6 +741,7 @@ impl TypeNodes {
             IrType::BytesView => self.bytes_view,
             IrType::Buffer => self.buffer,
             IrType::BufferView => self.buffer_view,
+            IrType::Struct(id) => self.structs[id.0 as usize],
         }
     }
 }
@@ -810,6 +844,40 @@ fn length(value: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tima_structs_use_additive_v1_semantic_schemas() {
+        let compiled = crate::compile(
+            "structs.tima",
+            "struct Pair { left: i64, right: i64 }\n\
+             transform first(left: i64, right: i64) -> i64 {\n\
+                 pair = Pair(left, right)\n\
+                 return pair.left\n\
+             }\n",
+        )
+        .unwrap();
+        let transform = &compiled.transforms.transforms[0];
+        let definition = lower_tima(
+            &compiled.transforms,
+            transform,
+            &vec![None; transform.values.len()],
+        );
+        let schemas = definition
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.schema.namespace.as_str(),
+                    node.schema.name.as_str(),
+                    node.schema.version,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(FORMAT_VERSION, 1);
+        assert!(schemas.contains(&("tima", "type.struct", 1)));
+        assert!(schemas.contains(&("tima", "struct.construct", 1)));
+        assert!(schemas.contains(&("tima", "struct.field", 1)));
+    }
 
     #[test]
     fn canonical_graph_ignores_arena_and_field_order() {

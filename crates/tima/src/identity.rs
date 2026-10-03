@@ -320,7 +320,7 @@ impl TransformIdentityResolver<'_> {
             referenced.push(identity);
         }
 
-        let definition = hash_ir::lower_tima(transform, &referenced);
+        let definition = hash_ir::lower_tima(self.module, transform, &referenced);
         let identity = hash_transform_definition(&definition);
         self.visiting[id.0 as usize] = false;
         self.values[id.0 as usize] = Some(identity);
@@ -942,6 +942,21 @@ mod tests {
                 "transform f(data: Buffer, byte: u8) -> Buffer { return buffer_fill(data, byte) }\n",
                 "transform g(data: Buffer, byte: u8) -> Buffer { for item in data.bytes { item = byte }; return data }\n",
             ),
+            (
+                "struct and field source names plus constructor argument order",
+                "struct Pair { left: i64, right: i64 }\ntransform f(a: i64, b: i64) -> i64 { pair = Pair(left=a, right=b); return pair.left - pair.right }\n",
+                "struct Renamed { first: i64, second: i64 }\ntransform g(x: i64, y: i64) -> i64 { value = Renamed(second=y, first=x); return value.first - value.second }\n",
+            ),
+            (
+                "unused struct declaration",
+                "transform f(value: i64) -> i64 { return value }\n",
+                "struct Unused { flag: bool }\ntransform g(value: i64) -> i64 { return value }\n",
+            ),
+            (
+                "struct declaration order",
+                "struct Unused { flag: bool }\nstruct Pair { left: i64, right: i64 }\ntransform f(a: i64, b: i64) -> i64 { pair = Pair(a, b); return pair.left }\n",
+                "struct Pair { left: i64, right: i64 }\nstruct Unused { flag: bool }\ntransform g(a: i64, b: i64) -> i64 { pair = Pair(a, b); return pair.left }\n",
+            ),
         ];
 
         for (label, first, second) in cases {
@@ -1025,6 +1040,11 @@ mod tests {
                 "owned buffer primitive",
                 "transform f(data: Buffer) -> Buffer { return data }\n",
                 "transform f(data: Buffer) -> Buffer { return buffer_zero(data) }\n",
+            ),
+            (
+                "struct field projection",
+                "struct Pair { left: i64, right: i64 }\ntransform f(a: i64, b: i64) -> i64 { pair = Pair(a, b); return pair.left }\n",
+                "struct Pair { left: i64, right: i64 }\ntransform f(a: i64, b: i64) -> i64 { pair = Pair(a, b); return pair.right }\n",
             ),
             (
                 "no algebraic identity normalization",
@@ -1542,18 +1562,25 @@ mod tests {
     fn f32_constant_transform_id(bits: u32) -> TransformIdentity {
         let mut compiled =
             crate::compile("f32-bits.tima", "transform value() -> f32 { return 0.0 }\n").unwrap();
-        let transform = &mut compiled.transforms.transforms[0];
-        let constant = transform
-            .values
-            .iter_mut()
-            .find_map(|value| match &mut value.kind {
-                ValueKind::Constant(crate::ir::Constant::F32(value)) => Some(value),
-                _ => None,
-            })
-            .expect("fixture contains one f32 constant");
-        *constant = f32::from_bits(bits);
+        {
+            let transform = &mut compiled.transforms.transforms[0];
+            let constant = transform
+                .values
+                .iter_mut()
+                .find_map(|value| match &mut value.kind {
+                    ValueKind::Constant(crate::ir::Constant::F32(value)) => Some(value),
+                    _ => None,
+                })
+                .expect("fixture contains one f32 constant");
+            *constant = f32::from_bits(bits);
+        }
+        let transform = &compiled.transforms.transforms[0];
         let references = vec![None; transform.values.len()];
-        hash_transform_definition(&hash_ir::lower_tima(transform, &references))
+        hash_transform_definition(&hash_ir::lower_tima(
+            &compiled.transforms,
+            transform,
+            &references,
+        ))
     }
 
     fn named_transform_id(source: &str, name: &str) -> TransformIdentity {

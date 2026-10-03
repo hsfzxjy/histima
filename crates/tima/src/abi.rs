@@ -84,6 +84,9 @@ pub const fn abi_callsite(transform: u32, value: u32) -> u64 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ownership {
     Scalar,
+    /// Reserved for immutable by-value aggregates once the native layout is
+    /// specified. Transform-local structs do not cross ABI v3.
+    Aggregate,
     Owned,
     ReadOnlyView,
 }
@@ -112,6 +115,9 @@ pub fn lower_type(ty: Type) -> AbiType {
         },
         Type::StringView | Type::BytesView | Type::BufferView => AbiType {
             ownership: Ownership::ReadOnlyView,
+        },
+        Type::Struct(_) => AbiType {
+            ownership: Ownership::Aggregate,
         },
     }
 }
