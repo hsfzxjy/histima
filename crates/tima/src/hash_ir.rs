@@ -1,10 +1,21 @@
-//! Canonical semantic graph used only to derive Transform IDs.
+//! Canonical semantic identity graph used only to derive Transform IDs.
 //!
-//! Hash IR v1 deliberately fixes a small, language-neutral graph grammar
-//! instead of fixing Tima's current type and operation enums. Semantic nodes
-//! carry schema-qualified names and independent schema versions. Future Tima
-//! constructs, or another language entirely, can therefore add schemas without
-//! changing the Hash IR wire format or reassigning an encoding tag.
+//! Hash IR is the boundary between Tima's language-defined semantic
+//! normalization and any execution/optimization IR. It is not interpreter or
+//! backend IR, and compiler optimizations occur after or independently of this
+//! representation. Hash IR deliberately does not attempt general program
+//! equivalence, algebraic simplification, CSE, inlining, or dead-code
+//! elimination. Omitting nodes unreachable from the semantic root removes
+//! arena garbage; it is not an optimization pass.
+//!
+//! The v1 wire grammar and structural tags are frozen. Semantic nodes carry
+//! schema-qualified names and independent schema versions, so language
+//! semantics evolve through schemas without changing the structural format.
+//! Node sharing is itself semantic: lowering creates one node per semantic
+//! computation/value and reuses it for multiple uses. Distinct computations
+//! remain distinct nodes even when structurally identical. The language
+//! lowering must produce that sharing deterministically before execution
+//! optimization can influence it.
 //!
 //! Backend details, artifacts, source locations, and source-facing names do
 //! not belong in this graph. A lowering is responsible for choosing schemas
@@ -28,7 +39,8 @@ pub const FORMAT_VERSION: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
 
-/// One finite, rooted semantic graph.
+/// One finite, rooted semantic graph. Sharing between reachable nodes is part
+/// of the graph's meaning; only arena allocation order is canonicalized away.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Definition {
     pub root: NodeId,
@@ -302,8 +314,10 @@ fn encode_data(data: &Data, canonical_ids: &[Option<u32>], encoder: &mut Encoder
     }
 }
 
-/// Lowers typed Tima IR into the open Hash IR graph. `references` is parallel
-/// to the typed value arena and contains resolved IDs for call nodes.
+/// Lowers Tima's pre-optimization, language-normalized typed structure into
+/// the open Hash IR graph. This must never consume backend-optimized IR.
+/// `references` is parallel to the typed value arena and contains resolved
+/// semantic Transform IDs for call nodes.
 pub(crate) fn lower_tima(
     transform: &IrTransform,
     references: &[Option<TransformIdentity>],
@@ -513,6 +527,8 @@ fn lower_value(
                 ),
                 field(
                     "transform",
+                    // Calls cross the identity boundary by semantic digest,
+                    // never by source name, declaration order, or IR index.
                     Data::Digest(
                         *reference
                             .expect("call values have a resolved Transform ID")
@@ -774,6 +790,88 @@ mod tests {
         };
 
         assert_eq!(first.canonical_bytes(), second.canonical_bytes());
+    }
+
+    #[test]
+    fn canonical_graph_preserves_the_same_sharing_across_arena_layouts() {
+        let root_first = Definition {
+            root: NodeId(0),
+            nodes: vec![
+                Node::new(
+                    Schema::new("example", "pair", 1),
+                    vec![
+                        Field::new("right", Data::Node(NodeId(1))),
+                        Field::new("left", Data::Node(NodeId(1))),
+                    ],
+                ),
+                Node::new(
+                    Schema::new("example", "integer", 1),
+                    vec![Field::new("value", Data::SInt(7))],
+                ),
+            ],
+        };
+        let child_first = Definition {
+            root: NodeId(1),
+            nodes: vec![
+                Node::new(
+                    Schema::new("example", "integer", 1),
+                    vec![Field::new("value", Data::SInt(7))],
+                ),
+                Node::new(
+                    Schema::new("example", "pair", 1),
+                    vec![
+                        Field::new("left", Data::Node(NodeId(0))),
+                        Field::new("right", Data::Node(NodeId(0))),
+                    ],
+                ),
+            ],
+        };
+
+        assert_eq!(root_first.canonical_bytes(), child_first.canonical_bytes());
+    }
+
+    #[test]
+    fn node_sharing_is_an_intentional_normative_semantic_distinction() {
+        let shared = Definition {
+            root: NodeId(0),
+            nodes: vec![
+                Node::new(
+                    Schema::new("example", "pair", 1),
+                    vec![
+                        Field::new("left", Data::Node(NodeId(1))),
+                        Field::new("right", Data::Node(NodeId(1))),
+                    ],
+                ),
+                Node::new(
+                    Schema::new("example", "computation", 1),
+                    vec![Field::new("value", Data::SInt(7))],
+                ),
+            ],
+        };
+        let recomputed = Definition {
+            root: NodeId(0),
+            nodes: vec![
+                Node::new(
+                    Schema::new("example", "pair", 1),
+                    vec![
+                        Field::new("left", Data::Node(NodeId(1))),
+                        Field::new("right", Data::Node(NodeId(2))),
+                    ],
+                ),
+                Node::new(
+                    Schema::new("example", "computation", 1),
+                    vec![Field::new("value", Data::SInt(7))],
+                ),
+                Node::new(
+                    Schema::new("example", "computation", 1),
+                    vec![Field::new("value", Data::SInt(7))],
+                ),
+            ],
+        };
+
+        // Hash IR does not perform structural hash-consing: one computation
+        // used twice and two identical computations are different semantics.
+        assert_ne!(shared.canonical_bytes(), recomputed.canonical_bytes());
     }
 
     #[test]

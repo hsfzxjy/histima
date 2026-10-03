@@ -206,6 +206,9 @@ impl TransformIdentities {
     }
 }
 
+/// Computes identities from Tima's language-normalized, pre-optimization
+/// semantic structure. Backend lowering and execution optimization must happen
+/// after this boundary and must never feed back into Transform identity.
 pub fn transform_identities(module: &TypedModule) -> Result<TransformIdentities, Vec<Diagnostic>> {
     let mut resolver = TransformIdentityResolver {
         module,
@@ -894,6 +897,11 @@ mod tests {
                 "transform f(first: f32, second: i64) -> i64 { return second }\n",
             ),
             (
+                "result type",
+                "transform f() -> i64 { return 1 }\n",
+                "transform f() -> f32 { return 1.0 }\n",
+            ),
+            (
                 "constant value",
                 "transform f() -> f32 { return 0.0 }\n",
                 "transform f() -> f32 { return 1.0 }\n",
@@ -904,9 +912,24 @@ mod tests {
                 "transform f(a: i64, b: i64) -> i64 { return a - b }\n",
             ),
             (
+                "binary operand order",
+                "transform f(a: i64, b: i64) -> i64 { return a - b }\n",
+                "transform f(a: i64, b: i64) -> i64 { return b - a }\n",
+            ),
+            (
                 "call argument order",
                 "transform subtract(a: i64, b: i64) -> i64 { return a - b }\ntransform f(a: i64, b: i64) -> i64 { return subtract(a, b) }\n",
                 "transform subtract(a: i64, b: i64) -> i64 { return a - b }\ntransform f(a: i64, b: i64) -> i64 { return subtract(b, a) }\n",
+            ),
+            (
+                "referenced Transform ID",
+                "transform helper(x: i64) -> i64 { return x + 1 }\ntransform f(x: i64) -> i64 { return helper(x) }\n",
+                "transform helper(x: i64) -> i64 { return x + 2 }\ntransform f(x: i64) -> i64 { return helper(x) }\n",
+            ),
+            (
+                "no call inlining normalization",
+                "transform helper(x: i64) -> i64 { return x + 1 }\ntransform f(x: i64) -> i64 { return helper(x) }\n",
+                "transform f(x: i64) -> i64 { return x + 1 }\n",
             ),
             (
                 "control flow",
@@ -933,6 +956,26 @@ mod tests {
                 "transform f(data: Buffer) -> Buffer { return data }\n",
                 "transform f(data: Buffer) -> Buffer { return buffer_zero(data) }\n",
             ),
+            (
+                "no algebraic identity normalization",
+                "transform f(x: i64) -> i64 { return x }\n",
+                "transform f(x: i64) -> i64 { return x + 0 }\n",
+            ),
+            (
+                "no floating-point identity normalization",
+                "transform f(x: f32) -> f32 { return x }\n",
+                "transform f(x: f32) -> f32 { return x + 0.0 }\n",
+            ),
+            (
+                "no floating-point reassociation",
+                "transform f(a: f32, b: f32, c: f32) -> f32 { return (a + b) + c }\n",
+                "transform f(a: f32, b: f32, c: f32) -> f32 { return a + (b + c) }\n",
+            ),
+            (
+                "shared subcomputation versus recomputation",
+                "transform f(x: i64) -> i64 { doubled = x * 2; return doubled + doubled }\n",
+                "transform f(x: i64) -> i64 { return (x * 2) + (x * 2) }\n",
+            ),
         ];
 
         for (label, first, second) in cases {
@@ -943,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_ir_v1_golden_transform_ids() {
+    fn hash_ir_v1_archival_golden_transform_ids_must_survive_refactors() {
         let leaf = single_transform_id("transform keep(value: i64) -> i64 { return value }\n");
         let caller = named_transform_id(
             "transform keep(value: i64) -> i64 { return value }\n\
@@ -959,6 +1002,10 @@ mod tests {
             1,
         );
 
+        // ARCHIVAL COMPATIBILITY VECTORS. Do not update these expected IDs
+        // after a Rust/compiler/backend refactor. An intentional change to a
+        // schema or the structural format must use the appropriate schema or
+        // format version rather than silently rewriting these values.
         assert_eq!(
             leaf.to_string(),
             "ee7691ec5931fd0275c2bab44a630077922ccbc60215caf1d75f8f07a6475c35"
@@ -978,7 +1025,23 @@ mod tests {
     }
 
     #[test]
+    fn tima_hash_ir_preserves_every_raw_f32_literal_bit() {
+        assert_ne!(
+            f32_constant_transform_id(0x0000_0000),
+            f32_constant_transform_id(0x8000_0000),
+            "positive and negative zero remain distinct in Hash IR"
+        );
+        assert_ne!(
+            f32_constant_transform_id(0x7fc0_0001),
+            f32_constant_transform_id(0x7fc0_1234),
+            "NaN payloads remain distinct in Hash IR"
+        );
+    }
+
+    #[test]
     fn transform_identity_ignores_formatting_names_and_definition_order() {
+        // In particular, the caller remains stable because Hash IR records the
+        // callee's Transform ID rather than its name or module-local index.
         let first = crate::compile(
             "first.tima",
             "transform helper(value: f32) -> f32 { return value * 2.0 }\n\
@@ -1340,6 +1403,23 @@ mod tests {
         let compiled = crate::compile("corpus.tima", source).unwrap();
         assert_eq!(compiled.transforms.transforms.len(), 1);
         compiled.identities.get(TransformId(0))
+    }
+
+    fn f32_constant_transform_id(bits: u32) -> TransformIdentity {
+        let mut compiled =
+            crate::compile("f32-bits.tima", "transform value() -> f32 { return 0.0 }\n").unwrap();
+        let transform = &mut compiled.transforms.transforms[0];
+        let constant = transform
+            .values
+            .iter_mut()
+            .find_map(|value| match &mut value.kind {
+                ValueKind::Constant(crate::ir::Constant::F32(value)) => Some(value),
+                _ => None,
+            })
+            .expect("fixture contains one f32 constant");
+        *constant = f32::from_bits(bits);
+        let references = vec![None; transform.values.len()];
+        hash_transform_definition(&hash_ir::lower_tima(transform, &references))
     }
 
     fn named_transform_id(source: &str, name: &str) -> TransformIdentity {

@@ -896,6 +896,48 @@ hexadecimal characters. Each identity kind has a distinct hash domain.
 Source text itself is not a semantic identity. Recipe ID and Content ID are
 not interchangeable: distinct recipes may produce identical content.
 
+#### Transform identity boundary
+
+Transform identity is established at an explicit semantic boundary:
+
+```text
+Tima source
+    -> parse / typecheck
+    -> language-defined semantic normalization
+    -> Hash IR                         [Transform identity boundary]
+    -> execution / optimization IR
+    -> interpreter / Cranelift / future backend
+```
+
+Two transforms have the same Transform ID when they lower to the same
+canonical operational semantics under Tima's explicitly defined normalization
+rules. This is deliberately narrower than arbitrary extensional program
+equivalence. Hash IR is a semantic identity representation, not an optimizer
+IR and not a proof that every pair of programs producing the same mathematical
+result has one identity.
+
+Language-defined normalization removes source-only distinctions such as
+formatting, comments, transform/parameter/local names, declaration order, and
+capability declaration order. It may also equate multiple surface forms when
+Tima explicitly specifies one semantic operation. In particular, the initial
+whole-buffer byte-assignment loop is defined to normalize to `buffer.fill`, so
+it has the same identity as a direct `buffer_fill` call.
+
+No other optimizer behavior is implied. Hash IR does not automatically apply
+algebraic identities such as replacing `x + 0` with `x`, reassociate
+expressions, simplify floating-point operations, canonicalize NaNs or signed
+zero, perform CSE, inline calls, eliminate semantic computations, or otherwise
+optimize code. Such a normalization may be added only as an explicit Tima
+language rule. Optimizations performed for interpretation or native code
+generation occur after or independently of the identity boundary and cannot
+change the Hash IR of an unchanged transform.
+
+The current compiler's backend-neutral typed structures may help implement
+both sides of this boundary, but their Rust layout is not the identity
+contract. A replacement parser, semantic analyzer, execution IR, interpreter,
+Cranelift lowering, optimizer, or backend must reproduce the same
+language-normalized Hash IR for the same transform semantics.
+
 #### Hash IR v1
 
 Hash IR v1 is a frozen, language-neutral semantic graph grammar. Transform
@@ -912,12 +954,61 @@ meaning requires a new schema version. Unknown schemas can still be validated,
 canonically encoded, and hashed; interpreting or executing them requires an
 implementation of that schema.
 
+The two versioning layers have separate purposes:
+
+```text
+Hash IR format version
+    controls the structural graph encoding
+
+(namespace, schema-name, schema-version)
+    controls the semantic meaning of one node schema
+```
+
+Adding a Tima construct should normally add a schema under the existing v1
+graph grammar. Changing an existing schema's meaning, including adding a field
+that changes its semantic contract, requires a new schema version. Existing
+`tima:*@1` and `histima:*@1` meanings must never silently change. A new Hash IR
+format version is reserved for a structural requirement that truly cannot be
+represented by v1's nodes, fields, data atoms, references, and sequences; a
+new operation alone is not such a requirement. Execution backends may evolve
+without changing either Hash IR or semantic schema versions.
+
 A definition is one finite rooted directed graph. Graphs may share nodes and
 contain cycles, which admits ordinary expression graphs, SSA/CFG forms with
 block arguments, nested-region encodings, recursive type descriptions, and
 future language-specific semantic nodes. Source spans, source-facing names,
 backend choices, artifact configuration, and other non-semantic data remain
 excluded.
+
+Node sharing is an intentional semantic property. Tima lowering creates one
+Hash IR node for each semantic computation or value and reuses that node for
+every use of the same value. Distinct semantic computations remain distinct
+nodes even when their schemas and fields happen to be structurally identical.
+Therefore a root referencing one computation twice differs from a root
+referencing two separately recomputed but structurally identical computations.
+Likewise, absent a future explicit normalization rule, these transforms need
+not have the same Transform ID:
+
+```tima
+a = x * 2
+return a + a
+```
+
+```tima
+return (x * 2) + (x * 2)
+```
+
+Hash IR v1 performs neither graph isomorphism nor structural hash-consing.
+Producer arena order is irrelevant, but the producer must construct sharing
+deterministically from pre-optimization Tima semantics. CSE or another
+execution optimization must never change identity-layer sharing.
+
+Hash IR excludes source spans, diagnostics, compiler-generated names, backend
+configuration, target architecture and CPU features, optimization levels,
+backend-only allocation/lifetime metadata, cache state, profiling data,
+Artifact IDs, and all other execution-only details. A later execution IR may
+introduce SSA values, phi nodes, inlining, CSE, vector operations, or other
+backend forms without changing Hash IR for the original Tima semantics.
 
 The canonical byte primitives are:
 
@@ -942,6 +1033,10 @@ assigning each newly encountered node the next ID before traversing that node.
 Encode nodes in that discovery order and replace node references with their
 canonical IDs. Repeated references and cycles reuse the first assigned ID.
 Unreachable arena nodes are not part of the definition and are omitted.
+This last rule removes producer arena garbage; it is not permission for the
+encoder to perform semantic dead-code elimination. Language lowering remains
+responsible for connecting every semantically ordered computation to the
+rooted graph.
 
 The fixed structural data tags are:
 
@@ -976,6 +1071,11 @@ namespace `tima` at schema version 1 with no fields. Capability schemas are
 `capability.env.read`, `capability.file.read`, and `capability.http.get` under
 the same namespace and version.
 
+Declared capabilities are transform semantics and therefore appear in Hash IR
+and Transform ID. Precise runtime observations do not: for example, declaring
+`uses file.read` affects Transform ID, while observing `font.ttf` with a
+particular Content ID belongs to dependency lineage and Recipe ID.
+
 Current Tima value and operation schemas are:
 
 | `tima` schema at version 1 | Fields |
@@ -995,6 +1095,16 @@ Current Tima value and operation schemas are:
 | `buffer.fill` | `buffer` node, `value` node, `type` node |
 | `buffer.byte-element` | `type` node |
 | `buffer.byte-map` | `buffer` node, `element` node, `instructions` ordered node sequence, `result` node, `type` node |
+
+`constant.f32.bits` preserves the exact IEEE-754 bit pattern. Positive and
+negative zero, distinct NaN payloads, and otherwise algebraically equivalent
+floating-point expressions are not canonicalized together.
+
+The `transform` digest in `operation.call` is the callee's semantic Transform
+ID. A call never refers to a source name, source declaration order, local
+`TransformId`, compiler index, or backend artifact. This keeps callers stable
+across callee renaming and source reordering while still changing caller
+identity when the referenced callee semantics change.
 
 `tima:cfg.block@1` has `arguments` (an ordered node sequence, empty for the
 current typed IR), `instructions` (evaluation-order node sequence), and
@@ -1018,6 +1128,13 @@ SHA-256("tima.transform-id.hash-ir-v1\0" || canonical_hash_ir_v1_bytes)
 ```
 
 The following golden vectors are normative:
+
+> **Archival compatibility warning:** Do not update these expected IDs after
+> an implementation refactor merely to make tests pass. Rust representation,
+> arena allocation, parser/sema implementation, execution IR, optimization,
+> Cranelift changes, new backends, source spans, and diagnostics must not alter
+> them. An intentional semantic-schema or structural compatibility break must
+> use the appropriate schema or format version before publishing new vectors.
 
 | Definition | Transform ID |
 | --- | --- |
