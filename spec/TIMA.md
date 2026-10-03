@@ -896,27 +896,104 @@ hexadecimal characters. Each identity kind has a distinct hash domain.
 Source text itself is not a semantic identity. Recipe ID and Content ID are
 not interchangeable: distinct recipes may produce identical content.
 
-#### Draft Hash IR
+#### Hash IR v1
 
-Transform identity no longer serializes the compiler's typed-IR structs
-directly. Typed Tima transforms lower to a hash-only representation containing
-only their ordered boundary types, capability set, typed semantic values,
-referenced Transform IDs, control-flow blocks, and entry block. Source spans,
-source-facing transform/local/parameter names, backend choices, and artifact
-configuration are absent.
+Hash IR v1 is frozen. Transform identity does not serialize compiler typed-IR
+structs directly. Typed Tima transforms lower to a hash-only representation
+containing ordered boundary types, a canonical capability set, typed semantic
+values, referenced Transform IDs, control-flow blocks, and the entry block.
+Source spans, source-facing transform/local/parameter names, backend choices,
+and artifact configuration are absent. An incompatible semantic encoding must
+introduce a new Hash IR version; v1 tags must not be repurposed.
 
 Non-Tima transforms use an external semantic-operation node containing a
-scheme, semantic operation name and version, and (when the scheme requires it)
-an interface version plus ordered named parameter/result type codes. Exact
-Wasm module bytes and Artifact IDs remain outside Hash IR.
+scheme, semantic operation name and version, and optionally an interface
+version plus ordered named parameter/result type codes. Type codes inside an
+external contract are interpreted by its scheme. Exact Wasm module bytes and
+Artifact IDs remain outside Hash IR.
 
-The current public Rust module is `tima::hash_ir`, and its encoding starts with
-`TIMA-HASH-IR\0` and draft format version `0`. Version 0 is explicitly
-unstable: it exists to decouple identity from compiler representation and to
-build an equivalence/distinction corpus. It is not yet a persistence or
-cross-implementation contract. This section will specify a complete node/tag
-table, canonical byte grammar, domain separator, and golden hashes only when
-Hash IR v1 is frozen.
+The canonical byte primitives are:
+
+- `u8`, `u32`, and `i64` are fixed-width little-endian integers;
+- `data` is `u32 byte_length` followed by those bytes;
+- `text` is `data` whose bytes are UTF-8;
+- `sequence<T>` is `u32 element_count` followed by each encoded element;
+- `option<T>` is tag `0` for absent or tag `1` followed by `T`;
+- a referenced Transform ID is its raw 32 digest bytes.
+
+Every definition begins with the 13 bytes `TIMA-HASH-IR\0`, `u32(1)`, then a
+definition tag:
+
+| Tag | Definition payload |
+| --- | --- |
+| `0` | Tima: `sequence<capability>`, `sequence<parameter type>`, result type, `sequence<value>`, `sequence<block>`, `u32 entry_block` |
+| `1` | External: `text scheme`, `text name`, `u32 semantic_version`, `option<u32> interface_version`, `sequence<external parameter>`, `option<u8> result_type` |
+
+An external parameter is `text name` followed by its scheme-defined `u8` type
+code. Tima type and capability tags are:
+
+| Type | Tag | Capability | Tag |
+| --- | ---: | --- | ---: |
+| `bool` | 0 | `env.read` | 0 |
+| `u8` | 1 | `file.read` | 1 |
+| `i64` | 2 | `http.get` | 2 |
+| `f32` | 3 |  |  |
+| `String` | 4 |  |  |
+| `StringView` | 5 |  |  |
+| `Bytes` | 6 |  |  |
+| `BytesView` | 7 |  |  |
+| `Buffer` | 8 |  |  |
+| `BufferView` | 9 |  |  |
+
+The capability sequence is a set encoding: entries are unique and sorted by
+ascending tag. Other sequences retain their stated semantic order.
+
+A value is its type tag, value-kind tag, then the listed payload:
+
+| Tag | Value kind and payload |
+| ---: | --- |
+| 0 | parameter: `u32 parameter_index` |
+| 1 | constant |
+| 2 | binary: binary-op tag, `u32 left`, `u32 right` |
+| 3 | call: referenced Transform ID, `sequence<u32> arguments` |
+| 4 | runtime call |
+| 5 | buffer zero: `u32 buffer` |
+| 6 | buffer fill: `u32 buffer`, `u32 value` |
+| 7 | buffer-byte element: no payload |
+| 8 | buffer-byte map: `u32 buffer`, `u32 element`, `sequence<u32> instructions`, `u32 result` |
+
+Constant tags are bool `0` (`u8` 0 or 1), i64 `1`, raw IEEE-754 f32 bits `2`
+(`u32`), and String `3` (`text`). Binary tags in order from 0 through 9 are
+add, subtract, multiply, divide, equal, not-equal, less, less-equal, greater,
+and greater-equal. Runtime-call tags are legacy environment-i64 `0` (`text`
+key), environment-read `1` (`u32` key value), file-read `2` (`u32` path
+value), and HTTP-get `3` (`u32` URL value).
+
+A block is `sequence<u32> instructions` followed by a terminator: return tag
+`0` plus `u32 value`; branch tag `1` plus `u32 condition`, `u32 then_block`,
+and `u32 else_block`; or jump tag `2` plus `u32 target`.
+
+Transform ID is:
+
+```text
+SHA-256("tima.transform-id.hash-ir-v1\0" || canonical_hash_ir_v1_bytes)
+```
+
+The following golden vectors are normative:
+
+| Definition | Transform ID |
+| --- | --- |
+| `transform keep(value: i64) -> i64 { return value }` | `37e94b33d07f169a97f6c3c1f23d3cf87aaf5ee7763c435a03c37735966e7ef4` |
+| the preceding `keep` called by `transform apply(value: i64) -> i64 { return keep(value) }` | `0254f51ba1a9d63cb061bd340fff76d37795e63a9b3cfc033f228586989aa4a6` |
+| standard operation `ppm.decode`, semantic version 3 | `b5f2bcf1f240773d2827e46938b5c921eac4932c80de5913c2bdd5a971894c45` |
+| registered-Wasm `fixture.encode`, semantic version 1, ABI 4, parameters `buffer:2, quality:3`, result 1 | `775718252dfde609e71caa09550e261f8acd22125280febbe71b704da24452eb` |
+
+For an encoding-level vector, external scheme `a`, name `bc`, semantic version
+1, with no interface, parameters, or result, encodes as hexadecimal:
+
+```text
+54494d412d484153482d4952000100000001010000006102000000626301000000000000000000
+```
 
 ### 12.3 Result and artifact caches
 

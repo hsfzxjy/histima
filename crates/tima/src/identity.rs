@@ -256,9 +256,10 @@ pub fn registered_wasm_transform_identity(
 }
 
 fn hash_transform_definition(definition: &hash_ir::Definition) -> TransformIdentity {
-    let mut hasher = CanonicalHasher::new(b"tima.hash-ir.transform");
-    hasher.raw(&definition.canonical_bytes());
-    TransformIdentity(Digest::from_hasher(hasher))
+    let mut hasher = Sha256::new();
+    hasher.update(b"tima.transform-id.hash-ir-v1\0");
+    hasher.update(&definition.canonical_bytes());
+    TransformIdentity(Digest(hasher.finish()))
 }
 
 struct TransformIdentityResolver<'a> {
@@ -939,6 +940,41 @@ mod tests {
             let second = named_transform_id(second, "f");
             assert_ne!(first, second, "{label}");
         }
+    }
+
+    #[test]
+    fn hash_ir_v1_golden_transform_ids() {
+        let leaf = single_transform_id("transform keep(value: i64) -> i64 { return value }\n");
+        let caller = named_transform_id(
+            "transform keep(value: i64) -> i64 { return value }\n\
+             transform apply(value: i64) -> i64 { return keep(value) }\n",
+            "apply",
+        );
+        let standard = registered_transform_identity("ppm.decode", 3);
+        let registered_wasm = registered_wasm_transform_identity(
+            "fixture.encode",
+            1,
+            4,
+            &[("buffer", 2), ("quality", 3)],
+            1,
+        );
+
+        assert_eq!(
+            leaf.to_string(),
+            "37e94b33d07f169a97f6c3c1f23d3cf87aaf5ee7763c435a03c37735966e7ef4"
+        );
+        assert_eq!(
+            caller.to_string(),
+            "0254f51ba1a9d63cb061bd340fff76d37795e63a9b3cfc033f228586989aa4a6"
+        );
+        assert_eq!(
+            standard.to_string(),
+            "b5f2bcf1f240773d2827e46938b5c921eac4932c80de5913c2bdd5a971894c45"
+        );
+        assert_eq!(
+            registered_wasm.to_string(),
+            "775718252dfde609e71caa09550e261f8acd22125280febbe71b704da24452eb"
+        );
     }
 
     #[test]

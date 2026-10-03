@@ -1,10 +1,9 @@
 //! Canonical semantic IR used only to derive Transform IDs.
 //!
-//! This initial format is deliberately **unstable**. It separates semantic
-//! identity from the compiler's mutable typed-IR layout, but its node set and
-//! byte encoding may still change while the equivalence corpus is assembled.
-//! Artifact/backend details and source-facing names or spans do not belong
-//! here.
+//! Version 1 is frozen. Its node tags and canonical byte encoding are part of
+//! Tima's Transform-ID compatibility contract. Incompatible semantic changes
+//! require a new format version; artifact/backend details and source-facing
+//! names or spans do not belong here.
 
 use crate::ast::BinaryOp as AstBinaryOp;
 use crate::identity::TransformIdentity;
@@ -13,7 +12,7 @@ use crate::ir::{
     Terminator as IrTerminator, Transform as IrTransform, Type as IrType, ValueKind as IrValueKind,
 };
 
-pub const UNSTABLE_FORMAT_VERSION: u32 = 0;
+pub const FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Definition {
@@ -51,7 +50,7 @@ pub struct ExternalParameter {
     pub type_code: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Capability {
     EnvironmentRead,
     FileRead,
@@ -154,12 +153,11 @@ pub enum Terminator {
 }
 
 impl Definition {
-    /// Returns the draft canonical encoding. Do not persist or independently
-    /// implement format version zero as a compatibility contract.
+    /// Returns the canonical Hash IR v1 encoding.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut encoder = Encoder::default();
         encoder.raw(b"TIMA-HASH-IR\0");
-        encoder.u32(UNSTABLE_FORMAT_VERSION);
+        encoder.u32(FORMAT_VERSION);
         match self {
             Self::Tima(transform) => {
                 encoder.u8(0);
@@ -176,7 +174,10 @@ impl Definition {
 
 impl TimaTransform {
     fn encode(&self, encoder: &mut Encoder) {
-        encoder.sequence(&self.capabilities, |encoder, capability| {
+        let mut capabilities = self.capabilities.clone();
+        capabilities.sort_unstable();
+        capabilities.dedup();
+        encoder.sequence(&capabilities, |encoder, capability| {
             encoder.u8(match capability {
                 Capability::EnvironmentRead => 0,
                 Capability::FileRead => 1,
@@ -221,17 +222,15 @@ impl Type {
     fn encode(self, encoder: &mut Encoder) {
         encoder.u8(match self {
             Self::Bool => 0,
-            Self::I64 => 1,
-            Self::F32 => 2,
-            // Tags 3 and 4 belonged to retired Image types in the pre-Hash-IR
-            // identity encoding and remain unused during the draft transition.
-            Self::U8 => 5,
-            Self::String => 6,
-            Self::StringView => 7,
-            Self::Bytes => 8,
-            Self::BytesView => 9,
-            Self::Buffer => 10,
-            Self::BufferView => 11,
+            Self::U8 => 1,
+            Self::I64 => 2,
+            Self::F32 => 3,
+            Self::String => 4,
+            Self::StringView => 5,
+            Self::Bytes => 6,
+            Self::BytesView => 7,
+            Self::Buffer => 8,
+            Self::BufferView => 9,
         });
     }
 }
@@ -597,11 +596,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn draft_encoding_is_self_identifying_and_length_delimited() {
+    fn v1_encoding_is_self_identifying_and_length_delimited() {
         let first = external("a", "bc", 1);
         let second = external("ab", "c", 1);
 
         assert_ne!(first.canonical_bytes(), second.canonical_bytes());
         assert!(first.canonical_bytes().starts_with(b"TIMA-HASH-IR\0"));
+        assert_eq!(
+            first
+                .canonical_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "54494d412d484153482d4952000100000001010000006102000000626301000000000000000000"
+        );
     }
 }
